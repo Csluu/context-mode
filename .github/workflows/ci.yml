@@ -82,6 +82,10 @@ jobs:
             exit $VITEST_EXIT
           fi
 
+      - name: Live benchmark regression gate
+        if: runner.os == 'Linux'
+        run: npm run benchmark:check
+
       - name: Doctor (verify server starts)
         run: npx tsx src/cli.ts doctor
         continue-on-error: true

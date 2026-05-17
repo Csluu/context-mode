@@ -27,6 +27,10 @@ export interface DoctorDeps {
   readonly getDiagnosticAdapter: () => Promise<HookAdapter | null>;
 }
 
+interface DoctorInput {
+  json?: boolean;
+}
+
 const description =
   "Diagnose context-mode installation. Runs all checks server-side and " +
   "returns a plain-text status report with [OK]/[FAIL]/[WARN] prefixes " +
@@ -37,16 +41,40 @@ const IDLE_AFFECTED_HOSTS: ReadonlySet<string> = new Set([
   "vscode-copilot", "jetbrains-copilot", "antigravity", "zed",
 ]);
 
-export function makeCtxDoctor(deps: DoctorDeps): ToolDefinition {
+/**
+ * Structured repair action emitted alongside the human-readable status
+ * report. Hosts that surface MCP tool errors to humans (Insight UI,
+ * slash-command panels) can render these as one-click "Fix" buttons
+ * without parsing the [WARN] lines.
+ */
+export interface DoctorAction {
+  /** Which check produced this action (e.g. "idle-shutdown"). */
+  readonly check: string;
+  /** Severity, mirrors the [OK]/[WARN]/[FAIL] prefix in the text report. */
+  readonly severity: "warn" | "fail";
+  /** Short reason — what's wrong. */
+  readonly reason: string;
+  /** Shell command the user can run to apply the fix. May be empty for non-actionable warnings. */
+  readonly command: string;
+  /** Platform the command targets ("win32" | "posix" | "any"). */
+  readonly platform: "win32" | "posix" | "any";
+}
+
+export function makeCtxDoctor(deps: DoctorDeps): ToolDefinition<DoctorInput, { content: Array<{ type: "text"; text: string }>; _meta?: { actions: DoctorAction[] } }> {
   return {
     name: "ctx_doctor",
     config: {
       title: "Run Diagnostics",
-      description,
-      inputSchema: z.object({}),
+      description: description + " Pass json:true for a machine-readable report.",
+      inputSchema: z.object({
+        json: z.boolean().optional().describe(
+          "Return machine-readable JSON with checks and actions instead of the plain-text report.",
+        ),
+      }),
     },
-    handler: async (_input: unknown, ctx: ToolContext): Promise<{ content: Array<{ type: "text"; text: string }> }> => {
+    handler: async (input: DoctorInput, ctx: ToolContext): Promise<{ content: Array<{ type: "text"; text: string }>; _meta?: { actions: DoctorAction[] } }> => {
       const lines: string[] = ["context-mode doctor", ""];
+      const actions: DoctorAction[] = [];
       const pluginRoot = ctx.pluginRoot;
 
       // Runtimes — recompute here (cheap; idempotent).
@@ -156,15 +184,76 @@ export function makeCtxDoctor(deps: DoctorDeps): ToolDefinition {
             `this host does not auto-respawn the MCP child (issue #592). ` +
             `Fix: ${setCmd}`,
           );
+          actions.push({
+            check: "idle-shutdown",
+            severity: "warn",
+            reason: `CONTEXT_MODE_IDLE_TIMEOUT_MS=${raw} on host '${detectedHost}' will strand MCP tools after idle exit (issue #592)`,
+            command: setCmd,
+            platform: process.platform === "win32" ? "win32" : "posix",
+          });
         } else {
           lines.push(`[OK] Idle shutdown: safe (host=${detectedHost || "unknown"}, idle=${raw ?? "default"})`);
         }
       }
 
+      // Bun missing → suggest install for 3-5x perf
+      if (!hasBunRuntime()) {
+        actions.push({
+          check: "performance",
+          severity: "warn",
+          reason: "Bun not installed — JS/TS sandbox runs 3-5x slower than possible",
+          command: process.platform === "win32"
+            ? "powershell -c \"irm bun.com/install.ps1 | iex\""
+            : "curl -fsSL https://bun.sh/install | bash",
+          platform: process.platform === "win32" ? "win32" : "posix",
+        });
+      }
+
       // Version
       lines.push(`[OK] Version: v${deps.VERSION}`);
 
-      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+      if (input?.json) {
+        const checks = lines
+          .map((line) => {
+            const match = line.match(/^\[(OK|WARN|FAIL)\]\s+([^:]+):\s*(.*)$/);
+            if (!match) return null;
+            return {
+              status: match[1].toLowerCase(),
+              check: match[2],
+              message: match[3],
+            };
+          })
+          .filter((check): check is { status: string; check: string; message: string } => check !== null);
+        const counts = checks.reduce(
+          (acc, check) => {
+            if (check.status === "ok") acc.ok++;
+            else if (check.status === "warn") acc.warn++;
+            else if (check.status === "fail") acc.fail++;
+            return acc;
+          },
+          { ok: 0, warn: 0, fail: 0 },
+        );
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              tool: "ctx_doctor",
+              version: deps.VERSION,
+              ok: counts.fail === 0,
+              counts,
+              checks,
+              actions,
+              text: lines.join("\n"),
+            }, null, 2),
+          }],
+          _meta: { actions },
+        };
+      }
+
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+        _meta: { actions },
+      };
     },
   };
 }

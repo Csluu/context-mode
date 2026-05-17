@@ -11,6 +11,15 @@ import { request as httpsRequest } from "node:https";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
+import {
+  fetchAllowlistError,
+  getFetchAllowlistFromEnv,
+} from "./fetch-policy.js";
+import {
+  getFetchPerHostConcurrency,
+  runFetchPoolByHost,
+  type FetchPoolJob,
+} from "./fetch-rate-limit.js";
 import { ContentStore, cleanupStaleDBs, cleanupStaleContentDBs, type SearchResult, type IndexResult } from "./store.js";
 import { composeFetchCacheKey } from "./fetch-cache.js";
 import {
@@ -406,6 +415,8 @@ function getStore(): ContentStore {
 const sessionStats = {
   calls: {} as Record<string, number>,
   bytesReturned: {} as Record<string, number>,
+  latencyMs: {} as Record<string, number>,
+  latencyMaxMs: {} as Record<string, number>,
   bytesIndexed: 0,
   bytesSandboxed: 0, // network I/O consumed inside sandbox (never enters context)
   cacheHits: 0,
@@ -593,6 +604,13 @@ function trackIndexed(bytes: number, source: string = "unknown"): void {
   }
 }
 
+function recordToolLatency(toolName: string, latencyMs: number): void {
+  const rounded = Math.max(0, Math.round(latencyMs));
+  sessionStats.latencyMs[toolName] = (sessionStats.latencyMs[toolName] || 0) + rounded;
+  sessionStats.latencyMaxMs[toolName] = Math.max(sessionStats.latencyMaxMs[toolName] || 0, rounded);
+  persistStats();
+}
+
 // ─────────────────────────────────────────────────────────
 // Stats persistence — written after every tool call so
 // external readers (status line scripts, dashboards, hooks)
@@ -605,7 +623,8 @@ const STATS_PERSIST_THROTTLE_MS = 500;
 // it sees a future schema, so legacy bundles degrade gracefully on upgrade rather than silently
 // rendering missing fields (PR #401 architect review P1.3).
 // v2: added tokens_saved_lifetime + dollars_saved_lifetime.
-const STATS_SCHEMA_VERSION = 2;
+// v3: added per-tool latency_ms / avg_latency_ms / max_latency_ms.
+const STATS_SCHEMA_VERSION = 3;
 // OPUS_INPUT_PRICE_PER_TOKEN intentionally NOT defined here — single source in
 // src/session/analytics.ts re-exported above. (P1.1 — pricing constant dedup,
 // PR #401 architect + ops 2-vote convergence.)
@@ -691,12 +710,21 @@ function persistStats(): void {
       tokens_saved_lifetime: lifetimeTokens,
       dollars_saved_lifetime: +(lifetimeTokens * OPUS_INPUT_PRICE_PER_TOKEN).toFixed(2),
       by_tool: Object.fromEntries(
-        Object.keys({ ...sessionStats.calls, ...sessionStats.bytesReturned }).map(
+        Object.keys({
+          ...sessionStats.calls,
+          ...sessionStats.bytesReturned,
+          ...sessionStats.latencyMs,
+        }).map(
           (t) => [
             t,
             {
               calls: sessionStats.calls[t] || 0,
               bytes: sessionStats.bytesReturned[t] || 0,
+              latency_ms: sessionStats.latencyMs[t] || 0,
+              avg_latency_ms: sessionStats.calls[t]
+                ? Math.round((sessionStats.latencyMs[t] || 0) / sessionStats.calls[t])
+                : 0,
+              max_latency_ms: sessionStats.latencyMaxMs[t] || 0,
             },
           ],
         ),
@@ -711,6 +739,22 @@ function persistStats(): void {
     // best-effort — never break tool calls because of stats persistence
   }
 }
+
+const _registerTool = server.registerTool.bind(server);
+server.registerTool = ((name: string, config: unknown, handler: unknown) => {
+  if (typeof handler !== "function") {
+    return (_registerTool as unknown as (...args: unknown[]) => unknown)(name, config, handler);
+  }
+  const timedHandler = async (...args: unknown[]) => {
+    const started = Date.now();
+    try {
+      return await (handler as (...innerArgs: unknown[]) => unknown)(...args);
+    } finally {
+      recordToolLatency(name, Date.now() - started);
+    }
+  };
+  return (_registerTool as unknown as (...args: unknown[]) => unknown)(name, config, timedHandler);
+}) as typeof server.registerTool;
 
 // ==============================================================================
 // Security: server-side deny firewall
@@ -2004,6 +2048,7 @@ export function buildFetchCode(url: string, outputPath: string): string {
       ? `var classifyIp = ${classifyIpInner};`
       : `var ${classifyIpFnName} = ${classifyIpInner};\nvar classifyIp = ${classifyIpFnName};`;
   const strictMode = process.env.CTX_FETCH_STRICT === "1";
+  const fetchAllowlist = getFetchAllowlistFromEnv();
   return `
 const TurndownService = require(${turndownPath});
 const { gfm } = require(${gfmPath});
@@ -2012,6 +2057,29 @@ const dns = require('no' + 'de:dns');
 const dnsPromises = require('no' + 'de:dns/promises');
 const url = ${JSON.stringify(url)};
 const outputPath = ${escapedOutputPath};
+const FETCH_ALLOWLIST = ${JSON.stringify(fetchAllowlist)};
+
+function isFetchHostAllowed(hostname) {
+  if (FETCH_ALLOWLIST.length === 0) return true;
+  const host = String(hostname || '').toLowerCase().replace(/^\\[|\\]$/g, '');
+  for (const entry of FETCH_ALLOWLIST) {
+    if (entry === host) return true;
+    if (entry.startsWith('*.')) {
+      const suffix = entry.slice(1);
+      if (host.endsWith(suffix) && host.length > suffix.length) return true;
+    }
+  }
+  return false;
+}
+
+function assertFetchHostAllowed(parsedUrl, context) {
+  if (!isFetchHostAllowed(parsedUrl.hostname)) {
+    throw new Error(
+      'SSRF blocked: ' + context + ' host ' + parsedUrl.hostname +
+      ' is not in CONTEXT_MODE_FETCH_ALLOW_HOSTS'
+    );
+  }
+}
 
 // Strip proxy env vars from this subprocess only. A configured outbound
 // proxy (HTTP_PROXY / HTTPS_PROXY / ALL_PROXY) would route fetch through
@@ -2153,6 +2221,7 @@ function emit(ct, content) {
 const MAX_REDIRECTS = 5;
 async function fetchWithManualRedirect(initialUrl) {
   let currentUrl = initialUrl;
+  assertFetchHostAllowed(new URL(currentUrl), 'initial URL');
   for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount++) {
     const resp = await fetch(currentUrl, { redirect: 'manual' });
     if (resp.status < 300 || resp.status >= 400) return resp;
@@ -2168,6 +2237,7 @@ async function fetchWithManualRedirect(initialUrl) {
     if (nextParsed.protocol !== 'http:' && nextParsed.protocol !== 'https:') {
       throw new Error('SSRF blocked: redirect to non-http(s) scheme ' + nextParsed.protocol);
     }
+    assertFetchHostAllowed(nextParsed, 'redirect target');
     // If the redirect target is a literal IP, classify it directly — no DNS
     // lookup will fire and the connect-time guard would never see it.
     const hostname = nextParsed.hostname.replace(/^\[|\]$/g, '');
@@ -2281,6 +2351,11 @@ async function ssrfGuard(rawUrl: string): Promise<FetchOneResult | null> {
     parsed = new URL(rawUrl);
   } catch {
     return { kind: "fetch_error", url: rawUrl, error: "invalid URL", reason: "exit" };
+  }
+
+  const allowlistError = fetchAllowlistError(rawUrl, getFetchAllowlistFromEnv());
+  if (allowlistError) {
+    return { kind: "fetch_error", url: rawUrl, error: allowlistError, reason: "exit" };
   }
 
   // 1. Scheme allowlist — http and https only
@@ -2489,15 +2564,9 @@ server.registerTool(
   {
     title: "Fetch & Index URL(s)",
     description:
-      "Fetches URL content, converts HTML to markdown, indexes into searchable knowledge base, " +
-      "and returns a ~3KB preview. Full content stays in sandbox — use ctx_search() for deeper lookups.\n\n" +
-      "Better than WebFetch: preview is immediate, full content is searchable, raw HTML never enters context.\n\n" +
-      "Content-type aware: HTML is converted to markdown, JSON is chunked by key paths, plain text is indexed directly.\n\n" +
-      "PARALLELIZE I/O: For multi-URL research (library evaluation, migration scans, doc comparisons), pass `requests: [{url, source}, ...]` with `concurrency: 4-8` — speeds up by 3-5x on real workloads.\n" +
-      "  ✅ Use concurrency: 4-8 for: library docs sweep, multi-changelog scan, competitive pricing pages, multi-region docs, GitHub raw file pulls.\n" +
-      "  ❌ Single URL → use the legacy {url, source} shape (concurrency irrelevant).\n" +
-      "  Example: requests: [{url: 'https://react.dev/...', source: 'react'}, {url: 'https://vuejs.org/...', source: 'vue'}], concurrency: 5.\n" +
-      "  Fetches parallelize up to your concurrency setting; FTS5 indexing serializes the writes after (SQLite single-writer rule).",
+      "Fetch URL(s), convert HTML→markdown, index into FTS5 knowledge base, return a ~3KB preview. " +
+      "Full content stays out of context — use ctx_search() for deeper lookups. " +
+      "Pass requests:[{url,source?},...] with concurrency:4-8 for multi-URL batches; single URLs use {url}.",
     inputSchema: z.object({
       url: z.string().optional().describe("Single URL to fetch and index (legacy single-shape)"),
       source: z
@@ -2557,16 +2626,40 @@ server.registerTool(
       });
     }
 
+    // Queue-depth cap. A loop of 200+ fetches scheduled at once can exhaust
+    // FDs and pile up behind SQLite's single-writer queue (indexing serializes
+    // post-fetch). Cap the batch and tell the caller to chunk. Override with
+    // CONTEXT_MODE_FETCH_QUEUE_MAX if you know what you're doing.
+    const queueMax = Math.max(
+      1,
+      Number.parseInt(process.env.CONTEXT_MODE_FETCH_QUEUE_MAX ?? "", 10) || 64,
+    );
+    if (batch.length > queueMax) {
+      return trackResponse("ctx_fetch_and_index", {
+        content: [{
+          type: "text" as const,
+          text:
+            `ctx_fetch_and_index batch size ${batch.length} exceeds queue cap ${queueMax}. ` +
+            `Split into chunks of ≤${queueMax} URLs per call, or raise the cap via ` +
+            `CONTEXT_MODE_FETCH_QUEUE_MAX=${batch.length} if you've accounted for FD + SQLite-writer pressure.`,
+        }],
+        isError: true,
+      });
+    }
+
     const isLegacySingle = !requests && batch.length === 1;
     const requestedConcurrency = concurrency ?? 1;
 
-    // Parallel fetch via shared runPool primitive. capByCpuCount only for batch
-    // — single-URL doesn't need the cap (only one job, executor is one subprocess).
-    const jobs: PoolJob<FetchOneResult>[] = batch.map((req) => ({
+    // Parallel fetch with a per-host cap so one large batch cannot hammer a
+    // single origin. capByCpuCount only for batch — single-URL does not need it.
+    const perHostConcurrency = getFetchPerHostConcurrency();
+    const jobs: FetchPoolJob<FetchOneResult>[] = batch.map((req) => ({
+      url: req.url,
       run: () => fetchOneUrl(req.url, req.source, force),
     }));
-    const { settled, effectiveConcurrency, capped } = await runPool(jobs, {
+    const { settled, effectiveConcurrency, capped, effectivePerHostConcurrency } = await runFetchPoolByHost(jobs, {
       concurrency: requestedConcurrency,
+      perHostConcurrency,
       capByCpuCount: !isLegacySingle && requestedConcurrency > 1,
     });
 
@@ -2689,11 +2782,14 @@ server.registerTool(
     const cappedNote = capped
       ? ` cap=${effectiveConcurrency}/${cpus().length}cpu`
       : "";
+    const hostLimitNote = batch.length > 1
+      ? ` host<=${effectivePerHostConcurrency}`
+      : "";
     // Status line: counts + sections + size, with singular/plural agreement
     // (count=1 → "1 error" not "1 errors") so the line stays grammatical.
     const fmt = (n: number, sing: string, plur: string) => `${n} ${n === 1 ? sing : plur}`;
     const headerLine =
-      `fetched ${batch.length} c=${effectiveConcurrency}${cappedNote}. ` +
+      `fetched ${batch.length} c=${effectiveConcurrency}${cappedNote}${hostLimitNote}. ` +
       `ok=${fetchedCount} cache=${cachedCount} err=${errorCount}. ` +
       `${fmt(totalSections, "section", "sections")} ${totalKB}KB.`;
 
@@ -2722,17 +2818,10 @@ server.registerTool(
   {
     title: "Batch Execute & Search",
     description:
-      "Execute multiple commands in ONE call, auto-index all output, and search with multiple queries. " +
-      "Returns search results directly — no follow-up calls needed.\n\n" +
-      "THIS IS THE PRIMARY TOOL. Use this instead of multiple ctx_execute() calls.\n\n" +
-      "One ctx_batch_execute call replaces 30+ ctx_execute calls + 10+ ctx_search calls.\n" +
-      "Provide all commands to run and all queries to search — everything happens in one round trip.\n\n" +
-      "PARALLELIZE I/O: For I/O-bound batches (network calls, slow API queries, multi-URL fetches), ALWAYS pass concurrency: 4-8 — speeds up by 3-5x on real workloads.\n" +
-      "  ✅ Use concurrency: 4-8 for: gh API calls, curl/web fetches, multi-region cloud queries, multi-repo git reads, dig/DNS, docker inspect.\n" +
-      "  ❌ Keep concurrency: 1 for: npm test, build, lint, image processing (CPU-bound), or commands sharing state (ports, lock files, same-repo writes).\n" +
-      "  Example: [gh issue view 1, gh issue view 2, gh issue view 3] → concurrency: 3.\n" +
-      "  Speedup depends on workload — applies to I/O wait, not CPU work.\n\n" +
-      "THINK IN CODE — NON-NEGOTIABLE: When commands produce data you need to analyze, count, filter, compare, or transform — add a processing command that runs JavaScript and console.log() ONLY the answer. NEVER pull raw output into context to reason over. Concurrency parallelizes the FETCH; THINK IN CODE owns the PROCESSING. One programmed analysis replaces ten read-and-reason rounds. Pure JavaScript, Node.js built-ins (fs, path, child_process), try/catch, null-safe.",
+      "Run multiple shell commands in one call, auto-index their output, search the index with multiple queries — returns search results directly. " +
+      "Prefer this over multiple ctx_execute calls. " +
+      "concurrency: 1-8 (use 4-8 for I/O-bound batches like gh/curl/multi-fetch, keep at 1 for CPU-bound or stateful commands). " +
+      "For analysis output, add a JS processing command that console.logs only the answer — do not return raw data.",
     inputSchema: z.object({
       commands: z.preprocess(coerceCommandsArray, z
         .array(
@@ -2900,17 +2989,86 @@ function createMinimalDb(): import("./session/analytics.js").DatabaseAdapter {
   };
 }
 
+function formatStatsSessionList(sessionDbPath: string, limit: number): string {
+  const maxRows = Math.max(1, Math.min(100, Math.floor(limit)));
+  if (!existsSync(sessionDbPath)) {
+    return [
+      "ctx_stats sessions",
+      "",
+      "No session database found for this project.",
+    ].join("\n");
+  }
+  const Database = loadDatabase();
+  const db = new Database(sessionDbPath, { readonly: true });
+  try {
+    const rows = db.prepare(`
+      SELECT
+        session_id,
+        COUNT(*) AS events,
+        COALESCE(SUM(bytes_returned), 0) AS bytes_returned,
+        COALESCE(SUM(bytes_avoided), 0) AS bytes_avoided,
+        MIN(created_at) AS started_at,
+        MAX(created_at) AS last_event_at
+      FROM session_events
+      GROUP BY session_id
+      ORDER BY last_event_at DESC
+      LIMIT ?
+    `).all(maxRows) as Array<{
+      session_id: string;
+      events: number;
+      bytes_returned: number;
+      bytes_avoided: number;
+      started_at: string | null;
+      last_event_at: string | null;
+    }>;
+    const lines = [
+      "ctx_stats sessions",
+      "",
+      rows.length === 0
+        ? "No session events found for this project."
+        : `Showing ${rows.length} most recent ${rows.length === 1 ? "session" : "sessions"} for this project.`,
+    ];
+    for (const row of rows) {
+      const returnedKB = (row.bytes_returned / 1024).toFixed(1);
+      const avoidedKB = (row.bytes_avoided / 1024).toFixed(1);
+      lines.push(
+        `- ${row.session_id} events=${row.events} returned=${returnedKB}KB avoided=${avoidedKB}KB last=${row.last_event_at ?? "unknown"}`,
+      );
+    }
+    return lines.join("\n");
+  } finally {
+    db.close();
+  }
+}
+
 server.registerTool(
   "ctx_stats",
   {
     title: "Session Statistics",
     description:
-      "Returns context consumption statistics for the current session. " +
+      "Returns context consumption statistics. " +
       "Shows total bytes returned to context, breakdown by tool, call counts, " +
-      "estimated token usage, and context savings ratio.",
-    inputSchema: z.object({}),
+      "estimated token usage, and context savings ratio. " +
+      "Pass scope=\"session\" for current-session only, \"lifetime\" for cross-session totals, or \"all\" (default) for the full report. " +
+      "Pass listSessions:true to list recent project sessions.",
+    inputSchema: z.object({
+      scope: z
+        .enum(["session", "lifetime", "all"])
+        .default("all")
+        .describe("Report scope: 'session' = current session only (skips lifetime/multi-adapter aggregation); 'lifetime' = cross-session + multi-adapter totals only; 'all' = full report including session, lifetime, and multi-adapter."),
+      listSessions: z.boolean().optional().describe(
+        "Return a compact list of recent sessions for this project instead of the full stats report.",
+      ),
+      limit: z.coerce.number().int().min(1).max(100).optional().default(20).describe(
+        "Maximum number of sessions to list when listSessions:true is set.",
+      ),
+    }),
   },
-  async () => {
+  async (input) => {
+    const statsInput = input as { scope?: "session" | "lifetime" | "all"; listSessions?: boolean; limit?: number };
+    const scope: "session" | "lifetime" | "all" = statsInput?.scope ?? "all";
+    const includeSession = scope === "session" || scope === "all";
+    const includeLifetime = scope === "lifetime" || scope === "all";
     // ONE call, ONE source — AnalyticsEngine.queryAll()
     let text: string;
     try {
@@ -2924,6 +3082,13 @@ server.registerTool(
         projectDir,
         sessionsDir: getSessionDir(),
       });
+
+      if (statsInput.listSessions) {
+        text = formatStatsSessionList(sessionDbPath, statsInput.limit ?? 20);
+        return trackResponse("ctx_stats", {
+          content: [{ type: "text" as const, text }],
+        });
+      }
 
       if (existsSync(sessionDbPath)) {
         const Database = loadDatabase();
@@ -2940,13 +3105,15 @@ server.registerTool(
           // non-Claude platforms (Cursor, OpenCode, JetBrains, ...) read
           // from THEIR sessions dir — not the hardcoded ~/.claude/ default.
           // Mirrors the statusline contract at src/server.ts:540.
-          const lifetime = getLifetimeStats({ sessionsDir: getSessionDir() });
+          const lifetime = includeLifetime ? getLifetimeStats({ sessionsDir: getSessionDir() }) : undefined;
           // B3b Slices 3.2-3.6: cross-adapter aggregation so the renderer
           // can show "Where it came from" + the "across N AI tools"
           // headline. Best-effort — failures absorbed so a corrupt
           // sidecar in any adapter dir cannot break ctx_stats.
           let multiAdapter;
-          try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
+          if (includeLifetime) {
+            try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
+          }
           // F1: wire conversation + realBytes opts so formatReport renders the
           // narrative 5-section "kitap gibi" layout (timeline, ladder, receipt,
           // example cost, auto-memory). Without these, formatReport falls back
@@ -3069,6 +3236,8 @@ server.registerTool(
     title: "Purge Knowledge Base",
     description:
       "DESTRUCTIVE — permanently delete indexed content. CANNOT be undone.\n\n" +
+      "Preview first with { dryRun: true, ... } to list what would be removed " +
+      "without deleting files or database rows.\n\n" +
       "You MUST specify exactly ONE scope:\n\n" +
       "  • { confirm: true, sessionId: \"<uuid>\" }\n" +
       "      Deletes ONLY that session's events + per-session FTS5 chunks.\n" +
@@ -3077,7 +3246,7 @@ server.registerTool(
       "      Wipes the ENTIRE project: FTS5 knowledge base, every session DB row,\n" +
       "      events markdown, AND resets the stats file.\n\n" +
       "REFUSAL RULES (tool returns an error):\n" +
-      "  • confirm: false                              → 'purge cancelled'\n" +
+      "  • confirm: false without dryRun:true          → 'purge cancelled'\n" +
       "  • Both sessionId AND scope:'project' provided → 'ambiguous — pick one'\n" +
       "  • scope:'session' without sessionId           → throws (sessionId required)\n" +
       "  • Neither sessionId NOR scope provided        → DEPRECATED: maps to\n" +
@@ -3090,8 +3259,11 @@ server.registerTool(
     // .superRefine() wrapper. See block comment above & issue #563. The
     // cross-field ambiguity check lives in the handler body below.
     inputSchema: z.object({
-      confirm: z.boolean().describe(
-        "MUST be true. Destructive operation; false returns 'purge cancelled'."
+      confirm: z.boolean().optional().describe(
+        "MUST be true unless dryRun:true is set. Destructive operation; false returns 'purge cancelled'."
+      ),
+      dryRun: z.boolean().optional().describe(
+        "Preview only. When true, reports what would be removed but leaves rows and files untouched."
       ),
       sessionId: z.string().optional().describe(
         "UUID of a single session. Pairs with confirm:true to wipe only that " +
@@ -3105,7 +3277,7 @@ server.registerTool(
       ),
     }),
   },
-  async ({ confirm, sessionId, scope }) => {
+  async ({ confirm, dryRun, sessionId, scope }) => {
     // Cross-field ambiguity check — formerly a schema .refine(), moved
     // into the handler so the inputSchema stays a plain ZodObject and
     // the MCP SDK can serialize `.shape` into JSON Schema (issue #563).
@@ -3122,12 +3294,14 @@ server.registerTool(
       });
     }
     if (!confirm) {
-      return trackResponse("ctx_purge", {
-        content: [{
-          type: "text" as const,
-          text: "Purge cancelled. Pass confirm: true to proceed.",
-        }],
-      });
+      if (!dryRun) {
+        return trackResponse("ctx_purge", {
+          content: [{
+            type: "text" as const,
+            text: "Purge cancelled. Pass confirm: true to proceed.",
+          }],
+        });
+      }
     }
 
     // Effective scope resolution:
@@ -3145,14 +3319,14 @@ server.registerTool(
       );
     }
 
-    // Close the persistent FTS5 content store handle BEFORE delegating to
-    // purgeSession so the store's lock is released on Windows. The handle
-    // is recreated lazily on the next getStore() call.
+    // Close the persistent FTS5 content store handle BEFORE destructive
+    // purgeSession so the store's lock is released on Windows. Dry-run only
+    // checks paths/row counts and leaves the live handle in place.
     let storePathForPurge: string | undefined;
     try {
       storePathForPurge = getStorePath();
     } catch { /* best effort — store path may be unresolvable on fresh install */ }
-    if (_store) {
+    if (_store && !dryRun) {
       try { _store.cleanup(); } catch { /* best effort */ }
       _store = null;
     }
@@ -3163,7 +3337,7 @@ server.registerTool(
     // an absolute path that differs from the dual-hash pair (e.g. caller
     // pre-migrated). Both paths are de-duped during unlink.
     const contentDir = storePathForPurge ? dirname(storePathForPurge) : undefined;
-    const { deleted } = purgeSession({
+    const { deleted, wipedPaths } = purgeSession({
       projectDir: getProjectDir(),
       sessionsDir: getSessionDir(),
       storePath: storePathForPurge,
@@ -3176,16 +3350,24 @@ server.registerTool(
       contentHash: hashProjectDirLegacy(getProjectDir()),
       scope: effectiveScope,
       sessionId,
+      dryRun,
     });
 
     // Stats are PROJECT-scoped (one stats file per project, summing all
     // sessions). A scoped per-session purge MUST leave stats alone — they
     // still belong to other sessions in the same project. Stats reset
     // happens ONLY when scope === "project".
-    if (effectiveScope === "project") {
+    if (effectiveScope === "project" && dryRun) {
+      try {
+        const statsFile = getStatsFilePath();
+        if (existsSync(statsFile) && !deleted.includes("session stats")) deleted.push("session stats");
+      } catch { /* best effort */ }
+    } else if (effectiveScope === "project") {
       // Reset in-memory session stats
       sessionStats.calls = {};
       sessionStats.bytesReturned = {};
+      sessionStats.latencyMs = {};
+      sessionStats.latencyMaxMs = {};
       sessionStats.bytesIndexed = 0;
       sessionStats.bytesSandboxed = 0;
       sessionStats.cacheHits = 0;
@@ -3200,10 +3382,17 @@ server.registerTool(
       } catch { /* best effort */ }
     }
 
-    const message = effectiveScope === "session"
-      ? `Purged session ${sessionId}: ${deleted.length ? deleted.join(", ") : "no matching rows"}. ` +
-        `Other sessions and project-wide stats preserved.`
-      : `Purged: ${deleted.join(", ")}. All session data for this project has been permanently deleted.`;
+    const matchedFiles = wipedPaths.length === 1 ? "1 file" : `${wipedPaths.length} files`;
+    const message = dryRun
+      ? (effectiveScope === "session"
+          ? `Dry run: would purge session ${sessionId}: ${deleted.length ? deleted.join(", ") : "no matching rows"}. ` +
+            `${matchedFiles} matched. No data deleted.`
+          : `Dry run: would purge ${deleted.length ? deleted.join(", ") : "nothing"} for this project. ` +
+            `${matchedFiles} matched. No data deleted.`)
+      : (effectiveScope === "session"
+          ? `Purged session ${sessionId}: ${deleted.length ? deleted.join(", ") : "no matching rows"}. ` +
+            `Other sessions and project-wide stats preserved.`
+          : `Purged: ${deleted.join(", ")}. All session data for this project has been permanently deleted.`);
     return trackResponse("ctx_purge", {
       content: [{
         type: "text" as const,

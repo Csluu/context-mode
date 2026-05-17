@@ -19,26 +19,48 @@
  * vscode-copilot for the same reason).
  */
 
-// Mirror of `PLATFORM_ENV_VARS` in src/adapters/detect.ts:33-77.
-// Keep in lock-step. If you change one, change the other.
+const VALID_PLATFORMS = new Set([
+  "claude-code",
+  "gemini-cli",
+  "kilo",
+  "opencode",
+  "openclaw",
+  "codex",
+  "vscode-copilot",
+  "jetbrains-copilot",
+  "cursor",
+  "antigravity",
+  "kiro",
+  "pi",
+  "omp",
+  "zed",
+  "qwen-code",
+]);
+
+// Mirror of detect-capable `PLATFORM_ENV_VARS` entries in src/adapters/detect.ts.
+// Keep in lock-step. Workspace-only entries with detect:false stay excluded.
 const PLATFORM_ENV_VARS_MIRROR = [
-  ["claude-code",        ["CLAUDE_PROJECT_DIR", "CLAUDE_SESSION_ID"]],
+  ["claude-code",        ["CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PLUGIN_ROOT", "CLAUDE_PROJECT_DIR", "CLAUDE_SESSION_ID"]],
   ["antigravity",        ["ANTIGRAVITY_CLI_ALIAS"]],
-  ["cursor",             ["CURSOR_TRACE_ID", "CURSOR_CLI"]],
-  ["kilo",               ["KILO_PID"]],
-  ["opencode",           ["OPENCODE_CLIENT", "OPENCODE_TERMINAL", "OPENCODE", "OPENCODE_PID"]],
+  ["cursor",             ["CURSOR_CWD", "CURSOR_TRACE_ID", "CURSOR_CLI"]],
+  ["kilo",               ["KILO", "KILO_PID"]],
+  ["opencode",           ["OPENCODE_PROJECT_DIR", "OPENCODE_CLIENT", "OPENCODE_TERMINAL", "OPENCODE", "OPENCODE_PID"]],
   ["zed",                ["ZED_SESSION_ID", "ZED_TERM"]],
   ["codex",              ["CODEX_THREAD_ID", "CODEX_CI"]],
   ["gemini-cli",         ["GEMINI_PROJECT_DIR", "GEMINI_CLI"]],
   ["vscode-copilot",     ["VSCODE_PID", "VSCODE_CWD"]],
   ["jetbrains-copilot",  ["IDEA_INITIAL_DIRECTORY"]],
   ["qwen-code",          ["QWEN_PROJECT_DIR"]],
-  ["pi",                 ["PI_PROJECT_DIR"]],
+  ["omp",                ["PI_CODING_AGENT_DIR"]],
+  ["pi",                 ["PI_CONFIG_DIR", "PI_SESSION_FILE", "PI_COMPILED"]],
   // openclaw — no auto-set process env vars; falls through to default
   // kiro — no auto-set process env vars; falls through to default
 ];
 
 export function detectPlatformFromEnv(env = process.env) {
+  const override = env.CONTEXT_MODE_HOST ?? env.CONTEXT_MODE_PLATFORM;
+  if (VALID_PLATFORMS.has(override)) return override;
+
   for (const [platform, vars] of PLATFORM_ENV_VARS_MIRROR) {
     if (vars.some((v) => env[v])) return platform;
   }

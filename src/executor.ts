@@ -73,6 +73,97 @@ export function buildShellScriptContent(
   return `export PATH=${quoteForPosixShell(inheritedPath)}\n${code}`;
 }
 
+function sandboxNetworkDisabled(): boolean {
+  return (process.env.CONTEXT_MODE_SANDBOX_NETWORK || "").toLowerCase() === "deny";
+}
+
+function sandboxMemoryMb(): number | null {
+  const mb = Number.parseInt(process.env.CONTEXT_MODE_SANDBOX_MEM_MB ?? "", 10);
+  return Number.isFinite(mb) && mb > 0 ? mb : null;
+}
+
+function buildJavaScriptNetworkDenyPrelude(): string {
+  return `
+const __cmNetworkDenied = () => {
+  throw new Error("context-mode sandbox network disabled by CONTEXT_MODE_SANDBOX_NETWORK=deny");
+};
+if (typeof globalThis !== "undefined") {
+  globalThis.fetch = async () => __cmNetworkDenied();
+}
+try {
+  const __cmHttp = require("node:http");
+  const __cmHttps = require("node:https");
+  const __cmNet = require("node:net");
+  const __cmTls = require("node:tls");
+  const __cmDgram = require("node:dgram");
+  for (const mod of [__cmHttp, __cmHttps]) {
+    mod.request = __cmNetworkDenied;
+    mod.get = __cmNetworkDenied;
+  }
+  __cmNet.connect = __cmNetworkDenied;
+  __cmNet.createConnection = __cmNetworkDenied;
+  __cmTls.connect = __cmNetworkDenied;
+  __cmDgram.createSocket = __cmNetworkDenied;
+} catch {}
+`;
+}
+
+function buildPythonNetworkDenyPrelude(): string {
+  return `
+class __ContextModeNetworkDisabled(RuntimeError):
+    pass
+
+def __cm_network_denied(*_args, **_kwargs):
+    raise __ContextModeNetworkDisabled("context-mode sandbox network disabled by CONTEXT_MODE_SANDBOX_NETWORK=deny")
+
+try:
+    import socket as __cm_socket
+    __cm_socket.create_connection = __cm_network_denied
+    __cm_socket.socket.connect = __cm_network_denied
+    __cm_socket.socket.connect_ex = __cm_network_denied
+except Exception:
+    pass
+
+try:
+    import urllib.request as __cm_urllib_request
+    __cm_urllib_request.urlopen = __cm_network_denied
+except Exception:
+    pass
+`;
+}
+
+function buildPythonMemoryPrelude(memoryMb: number): string {
+  const bytes = memoryMb * 1024 * 1024;
+  return `
+try:
+    import resource as __cm_resource
+    __cm_limit = ${bytes}
+    __cm_soft, __cm_hard = __cm_resource.getrlimit(__cm_resource.RLIMIT_AS)
+    if __cm_hard > 0:
+        __cm_limit = min(__cm_limit, __cm_hard)
+    __cm_resource.setrlimit(__cm_resource.RLIMIT_AS, (__cm_limit, __cm_hard))
+except Exception:
+    pass
+`;
+}
+
+function applyExecutionPreludes(code: string, language: Language): string {
+  if (sandboxNetworkDisabled()) {
+    if (language === "javascript" || language === "typescript") {
+      code = `${buildJavaScriptNetworkDenyPrelude()}\n${code}`;
+    } else if (language === "python") {
+      code = `${buildPythonNetworkDenyPrelude()}\n${code}`;
+    }
+  }
+
+  const memoryMb = sandboxMemoryMb();
+  if (memoryMb !== null && language === "python" && process.platform !== "win32") {
+    code = `${buildPythonMemoryPrelude(memoryMb)}\n${code}`;
+  }
+
+  return code;
+}
+
 /**
  * Resolve the real OS temp directory, bypassing any TMPDIR env override.
  * os.tmpdir() reads TMPDIR from the environment, which some shells/tools
@@ -182,6 +273,23 @@ export class PolyglotExecutor {
         return await this.#compileAndRun(filePath, tmpDir, timeout);
       }
 
+      // Sandbox memory cap (#tier3). When CONTEXT_MODE_SANDBOX_MEM_MB is set,
+      // inject the relevant heap-cap flag into the runtime invocation so a
+      // runaway user script can't OOM the host. Applied here (post buildCommand)
+      // rather than in env because NODE_OPTIONS is denied by #buildSafeEnv as
+      // a code-injection vector. Bun honors --max-old-space-size (parsed for
+      // V8 compatibility but ignored at runtime — Bun's heap is JSC-based);
+      // we still inject so the flag is harmless and forward-portable.
+      const memMb = Number.parseInt(process.env.CONTEXT_MODE_SANDBOX_MEM_MB ?? "", 10);
+      if (Number.isFinite(memMb) && memMb > 0 && cmd.length > 0) {
+        const base = (cmd[0] || "").toLowerCase();
+        const isNode = /(?:^|[/\\])(node|bun|tsx|ts-node)(?:\.exe)?$/.test(base);
+        if (isNode) {
+          // Insert before the script path so V8 sees the flag, not the script
+          cmd.splice(1, 0, `--max-old-space-size=${memMb}`);
+        }
+      }
+
       // Shell commands run in the project directory so git, relative paths,
       // and other project-aware tools work naturally. Non-shell languages
       // run in the temp directory where their script file is written.
@@ -216,6 +324,8 @@ export class PolyglotExecutor {
   }
 
   #writeScript(tmpDir: string, code: string, language: Language): string {
+    code = applyExecutionPreludes(code, language);
+
     // Go needs a main package wrapper if not present
     if (language === "go" && !code.includes("package ")) {
       code = `package main\n\nimport "fmt"\n\nfunc main() {\n${code}\n}\n`;
@@ -569,6 +679,23 @@ export class PolyglotExecutor {
     }
     if (!env["PATH"]) {
       env["PATH"] = isWin ? "" : "/usr/local/bin:/usr/bin:/bin";
+    }
+
+    if (sandboxNetworkDisabled()) {
+      for (const key of [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "npm_config_proxy",
+        "npm_config_https_proxy",
+      ]) {
+        delete env[key];
+      }
     }
 
     // Windows-critical env vars and path fixes

@@ -1185,7 +1185,67 @@ if (!existsSync(join(DIST_DIR, "index.html"))) {
 // ── Server (dual runtime) ────────────────────────────────
 
 const indexHTML = readFileSync(join(DIST_DIR, "index.html"), "utf8");
-const API_JSON_HEADERS = { "Content-Type": "application/json" };
+const API_JSON_HEADERS = {
+  "Content-Type": "application/json",
+  "Cache-Control": "no-store",
+  "X-Content-Type-Options": "nosniff",
+};
+const HTML_HEADERS = {
+  "Content-Type": "text/html",
+  "Cache-Control": "no-store",
+  "Content-Security-Policy":
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; " +
+    "style-src 'self' 'unsafe-inline'; connect-src 'self'; " +
+    "img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'",
+  "X-Frame-Options": "DENY",
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+};
+
+function staticHeaders(type) {
+  return {
+    "Content-Type": type,
+    "Cache-Control": "public, max-age=31536000",
+    "X-Content-Type-Options": "nosniff",
+  };
+}
+
+function headerValue(headers, name) {
+  if (!headers) return "";
+  if (typeof headers.get === "function") return headers.get(name) || "";
+  const lower = name.toLowerCase();
+  return headers[lower] || headers[name] || "";
+}
+
+// Protect local session APIs from DNS rebinding and browser-origin probes.
+// Static assets can be public; /api/* contains local session data.
+function apiRequestRejection(pathname, headers) {
+  if (!pathname.startsWith("/api/")) return null;
+
+  const host = String(headerValue(headers, "host")).toLowerCase();
+  const allowedHosts = new Set([
+    `localhost:${PORT}`,
+    `127.0.0.1:${PORT}`,
+    `[::1]:${PORT}`,
+  ]);
+  if (!allowedHosts.has(host)) {
+    return { status: 403, body: { error: "host not allowed", host } };
+  }
+
+  const origin = String(headerValue(headers, "origin")).toLowerCase();
+  if (origin) {
+    const allowedOrigins = new Set([
+      `http://localhost:${PORT}`,
+      `http://127.0.0.1:${PORT}`,
+      `http://[::1]:${PORT}`,
+    ]);
+    if (!allowedOrigins.has(origin)) {
+      return { status: 403, body: { error: "origin not allowed", origin } };
+    }
+  }
+
+  return null;
+}
 
 if (isBun) {
   // Bun: use Bun.serve
@@ -1194,6 +1254,14 @@ if (isBun) {
     hostname: "127.0.0.1",
     fetch(req) {
       const url = new URL(req.url);
+      const rejection = apiRequestRejection(url.pathname, req.headers);
+      if (rejection) {
+        return new Response(JSON.stringify(rejection.body), {
+          status: rejection.status,
+          headers: API_JSON_HEADERS,
+        });
+      }
+
       const data = route(req.method, url.pathname, url.searchParams);
       if (data !== null) {
         return new Response(JSON.stringify(data), {
@@ -1203,10 +1271,10 @@ if (isBun) {
       if (url.pathname.startsWith("/assets/") || url.pathname.match(/\.\w{2,4}$/)) {
         const file = serveStaticFile(url.pathname);
         if (file) return new Response(file.content, {
-          headers: { "Content-Type": file.type, "Cache-Control": "public, max-age=31536000" },
+          headers: staticHeaders(file.type),
         });
       }
-      return new Response(indexHTML, { headers: { "Content-Type": "text/html" } });
+      return new Response(indexHTML, { headers: HTML_HEADERS });
     },
   });
 } else {
@@ -1215,21 +1283,32 @@ if (isBun) {
     const url = new URL(req.url, `http://localhost:${PORT}`);
     if (req.method === "OPTIONS") { res.writeHead(405); res.end(); return; }
 
+    const rejection = apiRequestRejection(url.pathname, req.headers);
+    if (rejection) {
+      res.writeHead(rejection.status, API_JSON_HEADERS);
+      res.end(JSON.stringify(rejection.body));
+      return;
+    }
+
     const data = route(req.method, url.pathname, url.searchParams);
     if (data !== null) {
-      res.writeHead(200, { "Content-Type": "application/json" });
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+      });
       res.end(JSON.stringify(data));
       return;
     }
     if (url.pathname.startsWith("/assets/") || url.pathname.match(/\.\w{2,4}$/)) {
       const file = serveStaticFile(url.pathname);
       if (file) {
-        res.writeHead(200, { "Content-Type": file.type, "Cache-Control": "public, max-age=31536000" });
+        res.writeHead(200, staticHeaders(file.type));
         res.end(file.content);
         return;
       }
     }
-    res.writeHead(200, { "Content-Type": "text/html" });
+    res.writeHead(200, HTML_HEADERS);
     res.end(indexHTML);
   });
   server.listen(PORT, "127.0.0.1");

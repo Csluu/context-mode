@@ -125,6 +125,11 @@ export interface PurgeOpts {
    * semantics (see src/session/db.ts).
    */
   sessionId?: string;
+  /**
+   * Preview mode. When true, purgeSession reports the rows/files that would
+   * be removed but leaves databases and files untouched.
+   */
+  dryRun?: boolean;
 }
 
 export interface PurgeResult {
@@ -142,11 +147,20 @@ export interface PurgeResult {
    * above carry the human story).
    */
   wipedPaths: string[];
+  /**
+   * True when the call was a preview and no rows/files were deleted.
+   */
+  dryRun?: boolean;
 }
 
 /** Try to unlink one path; report success without throwing on ENOENT etc. */
-function tryUnlink(p: string, wipedPaths: string[]): boolean {
+function tryUnlink(p: string, wipedPaths: string[], dryRun = false): boolean {
   try {
+    if (dryRun) {
+      if (!existsSync(p)) return false;
+      wipedPaths.push(p);
+      return true;
+    }
     unlinkSync(p);
     wipedPaths.push(p);
     return true;
@@ -159,10 +173,10 @@ function tryUnlink(p: string, wipedPaths: string[]): boolean {
  * Unlink a SQLite db at `path` plus its `-wal` / `-shm` sidecars.
  * Returns true when the MAIN db file (not a sidecar) was removed.
  */
-function tryUnlinkSqliteTriple(path: string, wipedPaths: string[]): boolean {
+function tryUnlinkSqliteTriple(path: string, wipedPaths: string[], dryRun = false): boolean {
   let mainRemoved = false;
   for (const suffix of SQLITE_SIDECARS) {
-    const removed = tryUnlink(`${path}${suffix}`, wipedPaths);
+    const removed = tryUnlink(`${path}${suffix}`, wipedPaths, dryRun);
     if (removed && suffix === "") mainRemoved = true;
   }
   return mainRemoved;
@@ -177,6 +191,7 @@ function tryUnlinkSqliteTriple(path: string, wipedPaths: string[]): boolean {
  */
 export function purgeSession(opts: PurgeOpts): PurgeResult {
   const { projectDir, sessionsDir, storePath, contentDir, legacyContentDir, contentHash, sessionId, scope } = opts;
+  const dryRun = opts.dryRun === true;
   const deleted: string[] = [];
   const wipedPaths: string[] = [];
 
@@ -214,7 +229,7 @@ export function purgeSession(opts: PurgeOpts): PurgeResult {
       try {
         db = new SessionDB({ dbPath });
         const before = db.getEvents(sessionId).length;
-        db.deleteSession(sessionId);
+        if (!dryRun) db.deleteSession(sessionId);
         if (before > 0) rowsRemoved = true;
       } catch {
         // Best-effort — corrupt DB is logged elsewhere; do not block purge.
@@ -258,8 +273,10 @@ export function purgeSession(opts: PurgeOpts): PurgeResult {
           const before = (fts.prepare(
             "SELECT COUNT(*) AS c FROM chunks WHERE session_id = ?"
           ).get(sessionId) as { c: number }).c;
-          fts.prepare("DELETE FROM chunks WHERE session_id = ?").run(sessionId);
-          fts.prepare("DELETE FROM chunks_trigram WHERE session_id = ?").run(sessionId);
+          if (!dryRun) {
+            fts.prepare("DELETE FROM chunks WHERE session_id = ?").run(sessionId);
+            fts.prepare("DELETE FROM chunks_trigram WHERE session_id = ?").run(sessionId);
+          }
           if (before > 0) chunksRemoved = true;
         } finally {
           try { fts.close(); } catch { /* best effort */ }
@@ -271,7 +288,7 @@ export function purgeSession(opts: PurgeOpts): PurgeResult {
     }
     if (chunksRemoved) deleted.push(`FTS5 chunks for ${sessionId}`);
 
-    return { deleted, wipedPaths };
+    return { deleted, wipedPaths, dryRun };
   }
 
   // ── 1. Knowledge base FTS5 store (per-platform). ──────────────────────
@@ -286,7 +303,7 @@ export function purgeSession(opts: PurgeOpts): PurgeResult {
   // semantics of `tryUnlinkSqliteTriple`. The "knowledge base (FTS5)"
   // label appears at most once.
   let storeFound = false;
-  if (storePath && tryUnlinkSqliteTriple(storePath, wipedPaths)) storeFound = true;
+  if (storePath && tryUnlinkSqliteTriple(storePath, wipedPaths, dryRun)) storeFound = true;
   if (contentDir) {
     const canonicalHash = hashProjectDirCanonical(projectDir);
     const legacyHash    = hashProjectDirLegacy(projectDir);
@@ -295,7 +312,7 @@ export function purgeSession(opts: PurgeOpts): PurgeResult {
       : [canonicalHash, legacyHash];
     for (const h of storeHashes) {
       const path = join(contentDir, `${h}.db`);
-      if (tryUnlinkSqliteTriple(path, wipedPaths)) storeFound = true;
+      if (tryUnlinkSqliteTriple(path, wipedPaths, dryRun)) storeFound = true;
     }
   }
   if (storeFound) deleted.push("knowledge base (FTS5)");
@@ -307,7 +324,7 @@ export function purgeSession(opts: PurgeOpts): PurgeResult {
       throw new TypeError("purgeSession: contentHash is required when legacyContentDir is provided");
     }
     const legacyPath = join(legacyContentDir, `${contentHash}.db`);
-    tryUnlinkSqliteTriple(legacyPath, wipedPaths);
+    tryUnlinkSqliteTriple(legacyPath, wipedPaths, dryRun);
     // No user-facing label — this is a silent legacy cleanup.
   }
 
@@ -327,12 +344,12 @@ export function purgeSession(opts: PurgeOpts): PurgeResult {
   let eventsFound = false;
   for (const h of hashes) {
     const base = join(sessionsDir, `${h}${worktreeSuffix}`);
-    if (tryUnlinkSqliteTriple(`${base}.db`, wipedPaths)) sessDbFound = true;
-    if (tryUnlink(`${base}-events.md`, wipedPaths)) eventsFound = true;
-    tryUnlink(`${base}.cleanup`, wipedPaths); // no user-facing label
+    if (tryUnlinkSqliteTriple(`${base}.db`, wipedPaths, dryRun)) sessDbFound = true;
+    if (tryUnlink(`${base}-events.md`, wipedPaths, dryRun)) eventsFound = true;
+    tryUnlink(`${base}.cleanup`, wipedPaths, dryRun); // no user-facing label
   }
   if (sessDbFound) deleted.push("session events DB");
   if (eventsFound) deleted.push("session events markdown");
 
-  return { deleted, wipedPaths };
+  return { deleted, wipedPaths, dryRun };
 }

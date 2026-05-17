@@ -16,7 +16,7 @@ import type { ToolContext, ToolDefinition } from "./types.js";
  * The handler's return value is passed through `ctx.trackResponse`
  * automatically.
  */
-export function registerTool(ctx: ToolContext, def: ToolDefinition): void {
+export function registerTool<I = unknown, O = unknown>(ctx: ToolContext, def: ToolDefinition<I, O>): void {
   // `as never` here intentionally bypasses the SDK's per-call generic that
   // ties inputSchema to handler-input type. ToolDefinition keeps `inputSchema`
   // as `unknown` so it can hold any Zod schema without infecting consumers

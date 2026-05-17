@@ -204,7 +204,8 @@ export function cleanupStaleContentDBs(contentDir: string, maxAgeDays: number): 
   try {
     if (!existsSync(contentDir)) return 0;
     const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
-    const files = readdirSync(contentDir).filter(f => f.endsWith(".db"));
+    const allFiles = readdirSync(contentDir);
+    const files = allFiles.filter(f => f.endsWith(".db"));
     for (const file of files) {
       try {
         const filePath = join(contentDir, file);
@@ -235,6 +236,35 @@ export function cleanupStaleContentDBs(contentDir: string, maxAgeDays: number): 
           cleaned++;
         }
       } catch { /* ignore per-file errors */ }
+    }
+    const orphanedSidecarBases = new Set<string>();
+    for (const file of allFiles) {
+      if (file.endsWith(".db-wal")) orphanedSidecarBases.add(file.slice(0, -4));
+      if (file.endsWith(".db-shm")) orphanedSidecarBases.add(file.slice(0, -4));
+    }
+    for (const dbFile of orphanedSidecarBases) {
+      try {
+        const filePath = join(contentDir, dbFile);
+        if (existsSync(filePath)) continue;
+        let shouldClean = false;
+        for (const suffix of ["-wal", "-shm"]) {
+          const sidecarPath = filePath + suffix;
+          if (!existsSync(sidecarPath)) continue;
+          if (statSync(sidecarPath).mtimeMs < cutoff) {
+            shouldClean = true;
+            break;
+          }
+        }
+        if (!shouldClean) continue;
+        let removed = false;
+        for (const suffix of ["-wal", "-shm"]) {
+          try {
+            unlinkSync(filePath + suffix);
+            removed = true;
+          } catch { /* ignore */ }
+        }
+        if (removed) cleaned++;
+      } catch { /* ignore per-sidecar errors */ }
     }
   } catch { /* ignore readdir errors */ }
   return cleaned;
@@ -1466,6 +1496,68 @@ export class ContentStore {
       this.#db.exec("INSERT INTO chunks(chunks) VALUES('optimize')");
       this.#db.exec("INSERT INTO chunks_trigram(chunks_trigram) VALUES('optimize')");
     } catch { /* best effort — don't block indexing */ }
+    // Piggyback eviction on the optimize tick so we don't pay an extra
+    // PRAGMA on every insert. Eviction is a no-op when the DB is under cap.
+    this.#evictIfOverCapacity();
+  }
+
+  /**
+   * LRU eviction by `indexed_at`. Triggered from #optimizeFTS (every
+   * OPTIMIZE_EVERY inserts). Caps the on-disk DB at
+   * CONTEXT_MODE_KB_MAX_MB MB (default 200). When over cap, deletes the
+   * oldest sources + their chunks until back under the soft watermark
+   * (75% of cap). Best-effort — errors absorbed so eviction never blocks
+   * indexing.
+   */
+  #evictIfOverCapacity(): void {
+    try {
+      const capMb = Math.max(
+        16,
+        Number.parseInt(process.env.CONTEXT_MODE_KB_MAX_MB ?? "", 10) || 200,
+      );
+      const capBytes = capMb * 1024 * 1024;
+      const sizeBytes = (this.#db.pragma("page_count", { simple: true }) as number)
+        * (this.#db.pragma("page_size", { simple: true }) as number);
+      if (sizeBytes <= capBytes) return;
+
+      // Over cap — evict to 75% watermark.
+      const watermarkBytes = Math.floor(capBytes * 0.75);
+      const rows = this.#db.prepare(
+        "SELECT id, label FROM sources ORDER BY indexed_at ASC",
+      ).all() as Array<{ id: number; label: string }>;
+      const evicted: string[] = [];
+      const deleteSourcesByLabel = this.#stmtDeleteSourcesByLabel;
+      const deleteChunksByLabel = this.#stmtDeleteChunksByLabel;
+      const deleteChunksTrigramByLabel = this.#stmtDeleteChunksTrigramByLabel;
+
+      const evictTxn = this.#db.transaction((toEvict: typeof rows) => {
+        for (const r of toEvict) {
+          deleteChunksByLabel.run(r.label);
+          deleteChunksTrigramByLabel.run(r.label);
+          deleteSourcesByLabel.run(r.label);
+          evicted.push(r.label);
+        }
+      });
+
+      // Evict in batches of 32 to avoid pathological single-txn cost on
+      // huge DBs; recheck size between batches.
+      const batchSize = 32;
+      let i = 0;
+      while (i < rows.length) {
+        const batch = rows.slice(i, i + batchSize);
+        evictTxn(batch);
+        i += batchSize;
+        const newSize = (this.#db.pragma("page_count", { simple: true }) as number)
+          * (this.#db.pragma("page_size", { simple: true }) as number);
+        if (newSize <= watermarkBytes) break;
+      }
+
+      if (evicted.length > 0) {
+        // VACUUM reclaims pages freed by the DELETE. Important — without it,
+        // page_count stays high and we'd "thrash evict" on every optimize tick.
+        try { this.#db.exec("VACUUM"); } catch { /* best effort */ }
+      }
+    } catch { /* best effort — never block indexing */ }
   }
 
   close(): void {

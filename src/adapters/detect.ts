@@ -361,7 +361,7 @@ export function getSessionDirSegments(platform: string): string[] | null {
  */
 export function detectPlatform(clientInfo?: { name: string; version?: string }): DetectionSignal {
   const validPlatforms: PlatformId[] = [
-    "claude-code", "gemini-cli", "kilo", "opencode", "codex",
+    "claude-code", "gemini-cli", "kilo", "opencode", "openclaw", "codex",
     "vscode-copilot", "jetbrains-copilot", "cursor", "antigravity", "kiro", "pi", "omp", "zed", "qwen-code",
   ];
 

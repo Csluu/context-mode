@@ -24,11 +24,9 @@ import { detectPlatform, PLATFORM_ENV_VARS } from "../../src/adapters/detect.js"
 
 const existsSyncMock = vi.mocked(fs.existsSync);
 
-// Derived from detect.ts's source-of-truth list so renames can't drift.
-const ALL_PLATFORM_ENV_VARS = [
-  ...PLATFORM_ENV_VARS.flatMap(([, vars]) => [...vars]),
-  "CONTEXT_MODE_PLATFORM",
-];
+const ALL_PLATFORM_ENV_VARS = Array.from(PLATFORM_ENV_VARS.values())
+  .flat()
+  .map((entry) => entry.name);
 
 describe("detectPlatform — config directory branches", () => {
   const home = homedir();

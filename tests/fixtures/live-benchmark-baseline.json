@@ -1,0 +1,33 @@
+{
+  "tolerancePct": 10,
+  "scenarios": {
+    "Supabase Edge Functions (5 examples)": {
+      "indexMs": 50,
+      "searchMs": 20
+    },
+    "React useEffect docs": {
+      "indexMs": 50,
+      "searchMs": 20
+    },
+    "Next.js App Router docs": {
+      "indexMs": 50,
+      "searchMs": 20
+    },
+    "Tailwind CSS docs": {
+      "indexMs": 50,
+      "searchMs": 20
+    },
+    "Skill: context-mode (main prompt)": {
+      "indexMs": 100,
+      "searchMs": 20
+    },
+    "Skill references (4 files combined)": {
+      "indexMs": 200,
+      "searchMs": 20
+    },
+    "MCP tools/list (40 tools)": {
+      "indexMs": 50,
+      "searchMs": 20
+    }
+  }
+}

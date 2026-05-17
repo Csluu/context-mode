@@ -5,7 +5,9 @@
  * vs loading full content into context.
  */
 
-import { readFileSync, existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { readFileSync, existsSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ContentStore } from "../src/store.js";
@@ -20,6 +22,8 @@ interface BenchmarkResult {
   rawBytes: number;
   searchQueries: string[];
   searchResultBytes: number;
+  indexMs: number;
+  searchMs: number;
   chunksCreated: number;
   codeChunks: number;
   savings: number;
@@ -34,13 +38,17 @@ function benchmark(opts: {
   content: string;
   queries: string[];
 }): BenchmarkResult {
-  const store = new ContentStore();
+  const dbPath = join(tmpdir(), `context-mode-live-benchmark-${randomUUID()}.db`);
+  const store = new ContentStore(dbPath);
   const rawBytes = Buffer.byteLength(opts.content);
 
+  const indexStart = performance.now();
   const indexed = store.index({ content: opts.content, source: opts.source });
+  const indexMs = performance.now() - indexStart;
 
   let totalSearchBytes = 0;
   let hasExactCode = true;
+  const searchStart = performance.now();
 
   for (const q of opts.queries) {
     const results = store.search(q, 1);
@@ -56,8 +64,12 @@ function benchmark(opts: {
       }
     }
   }
+  const searchMs = performance.now() - searchStart;
 
   store.close();
+  for (const suffix of ["", "-wal", "-shm"]) {
+    rmSync(`${dbPath}${suffix}`, { force: true });
+  }
 
   const savings =
     totalSearchBytes > 0
@@ -70,11 +82,44 @@ function benchmark(opts: {
     rawBytes,
     searchQueries: opts.queries,
     searchResultBytes: totalSearchBytes,
+    indexMs: +indexMs.toFixed(1),
+    searchMs: +searchMs.toFixed(1),
     chunksCreated: indexed.totalChunks,
     codeChunks: indexed.codeChunks,
     savings,
     exactCodePreserved: hasExactCode,
   };
+}
+
+function checkRegression(results: BenchmarkResult[]): string[] {
+  const baselinePath = join(fixtureDir, "live-benchmark-baseline.json");
+  if (!existsSync(baselinePath)) return [`missing benchmark baseline: ${baselinePath}`];
+  const baseline = JSON.parse(readFileSync(baselinePath, "utf-8")) as {
+    tolerancePct?: number;
+    scenarios: Record<string, { indexMs: number; searchMs: number }>;
+  };
+  const tolerance = Math.max(0, baseline.tolerancePct ?? 10);
+  const failures: string[] = [];
+  for (const result of results) {
+    const expected = baseline.scenarios[result.scenario];
+    if (!expected) {
+      failures.push(`${result.scenario}: missing baseline`);
+      continue;
+    }
+    const maxIndex = expected.indexMs * (1 + tolerance / 100);
+    const maxSearch = expected.searchMs * (1 + tolerance / 100);
+    if (result.indexMs > maxIndex) {
+      failures.push(
+        `${result.scenario}: index ${result.indexMs}ms > ${maxIndex.toFixed(1)}ms (+${tolerance}%)`,
+      );
+    }
+    if (result.searchMs > maxSearch) {
+      failures.push(
+        `${result.scenario}: search ${result.searchMs}ms > ${maxSearch.toFixed(1)}ms (+${tolerance}%)`,
+      );
+    }
+  }
+  return failures;
 }
 
 async function main() {
@@ -232,10 +277,10 @@ async function main() {
   // ===== RESULTS =====
   console.log("--- Results ---\n");
   console.log(
-    "| Scenario | Source | Raw | Search (3q) | Savings | Chunks | Code |",
+    "| Scenario | Source | Raw | Search (3q) | Index | Search ms | Savings | Chunks | Code |",
   );
   console.log(
-    "|----------|--------|-----|-------------|---------|--------|------|",
+    "|----------|--------|-----|-------------|-------|-----------|---------|--------|------|",
   );
 
   let totalRaw = 0;
@@ -247,7 +292,7 @@ async function main() {
     const rawKB = (r.rawBytes / 1024).toFixed(1);
     const searchB = r.searchResultBytes;
     console.log(
-      `| ${r.scenario} | ${r.source} | ${rawKB}KB | ${searchB}B | ${r.savings.toFixed(0)}% | ${r.chunksCreated} | ${r.codeChunks} |`,
+      `| ${r.scenario} | ${r.source} | ${rawKB}KB | ${searchB}B | ${r.indexMs}ms | ${r.searchMs}ms | ${r.savings.toFixed(0)}% | ${r.chunksCreated} | ${r.codeChunks} |`,
     );
   }
 
@@ -275,6 +320,16 @@ async function main() {
   // JSON output for markdown generation
   console.log("\n--- JSON ---");
   console.log(JSON.stringify({ results, totalRaw, totalSearch }, null, 2));
+
+  if (process.argv.includes("--check")) {
+    const failures = checkRegression(results);
+    if (failures.length > 0) {
+      console.error("\nBenchmark regression check failed:");
+      for (const failure of failures) console.error(`- ${failure}`);
+      process.exit(1);
+    }
+    console.log("\nBenchmark regression check passed.");
+  }
 }
 
 main().catch((err) => {

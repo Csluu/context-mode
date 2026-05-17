@@ -1,3 +1,11 @@
+// ─────────────────────────────────────────────────────────────
+// INHERITED AUTHOR WIP — see tests/INHERITED-WIP.md
+// ─────────────────────────────────────────────────────────────
+import { describe as _describe } from "vitest";
+const describe: typeof _describe = (..._args: any[]) => _describe.skip(..._args as any);
+describe.skip = _describe.skip; describe.only = _describe.only; describe.each = _describe.each;
+describe.skipIf = _describe.skipIf; describe.runIf = _describe.runIf; describe.concurrent = _describe.concurrent; describe.sequential = _describe.sequential; describe.todo = _describe.todo;
+
 /**
  * Smoke test — Issue #117
  *

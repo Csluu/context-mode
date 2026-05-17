@@ -211,11 +211,14 @@ export function startLifecycleGuard(opts: LifecycleGuardOptions): LifecycleGuard
   // e2e tests, 60 s in dev) reacts within ~16 % of its window while a
   // production 15 min timeout still polls every 30 s (cheap).
   //
-  // Skipped on TTY because interactive dev sessions are expected to
-  // sit idle between commands, and also when idleTimeoutMs is 0 (env
-  // opt-out via CONTEXT_MODE_IDLE_TIMEOUT_MS=0).
+  // Skipped when idleTimeoutMs is 0 (env opt-out via
+  // CONTEXT_MODE_IDLE_TIMEOUT_MS=0). The legacy `process.stdin.isTTY`
+  // skip is intentionally NOT used here — it returns false on Claude
+  // Code (which spawns the MCP child with a pipe, not a TTY), defeating
+  // the gate. Adapter-level gating in server.ts main() now handles which
+  // hosts opt into idle shutdown (see `idleLeakingHosts` set there).
   let idleTimer: NodeJS.Timeout | null = null;
-  if (idleTimeoutMs > 0 && !process.stdin.isTTY) {
+  if (idleTimeoutMs > 0) {
     const idleTick = Math.max(50, Math.min(Math.floor(idleTimeoutMs / 6), 30_000));
     idleTimer = setInterval(() => {
       if (now() - lastActivity > idleTimeoutMs) shutdown();

@@ -15,7 +15,8 @@ import { homedir } from "node:os";
 import { join, sep } from "node:path";
 import { loadDatabase as loadDatabaseImpl } from "../db-base.js";
 import { resolveClaudeConfigDir } from "../util/claude-config.js";
-import { kb, fmtNum, tokensToUsd, OPUS_INPUT_PRICE_PER_TOKEN } from "./render/format.js";
+import { kb, fmtNum, tokensToUsd, OPUS_INPUT_PRICE_PER_TOKEN, formatDuration, shortPath, formatLocalDateTime, collapseBlanks } from "./render/format.js";
+import { dataBar } from "./render/bars.js";
 export { kb, tokensToUsd, OPUS_INPUT_PRICE_PER_TOKEN } from "./render/format.js";
 
 function semverNewer(a: string, b: string): boolean {
@@ -132,6 +133,8 @@ export interface ConversationStats {
 /** Runtime stats tracked by server.ts during a live session. */
 export interface RuntimeStats {
   bytesReturned: Record<string, number>;
+  latencyMs?: Record<string, number>;
+  latencyMaxMs?: Record<string, number>;
   bytesIndexed: number;
   bytesSandboxed: number;
   calls: Record<string, number>;
@@ -153,7 +156,15 @@ export interface FullReport {
     saved_kb: number;
     pct: number;
     savings_ratio: number;
-    by_tool: Array<{ tool: string; calls: number; context_kb: number; tokens: number }>;
+    by_tool: Array<{
+      tool: string;
+      calls: number;
+      context_kb: number;
+      tokens: number;
+      latency_ms?: number;
+      avg_latency_ms?: number;
+      max_latency_ms?: number;
+    }>;
     total_calls: number;
     total_bytes_returned: number;
     kept_out: number;
@@ -436,12 +447,18 @@ export class AnalyticsEngine {
     const toolNames = new Set([
       ...Object.keys(runtimeStats.calls),
       ...Object.keys(runtimeStats.bytesReturned),
+      ...Object.keys(runtimeStats.latencyMs ?? {}),
     ]);
     const byTool = Array.from(toolNames).sort().map((tool) => ({
       tool,
       calls: runtimeStats.calls[tool] || 0,
       context_kb: Math.round((runtimeStats.bytesReturned[tool] || 0) / 1024 * 10) / 10,
       tokens: Math.round((runtimeStats.bytesReturned[tool] || 0) / 4),
+      latency_ms: runtimeStats.latencyMs?.[tool] || 0,
+      avg_latency_ms: runtimeStats.calls[tool]
+        ? Math.round((runtimeStats.latencyMs?.[tool] || 0) / runtimeStats.calls[tool])
+        : 0,
+      max_latency_ms: runtimeStats.latencyMaxMs?.[tool] || 0,
     }));
 
     const uptimeMs = Date.now() - runtimeStats.sessionStart;
@@ -1622,15 +1639,6 @@ function adapterLabel(name: string): string {
  * information. Scale awareness comes from the unit jump between rows.
  */
 
-/** Format session uptime as human-readable duration. */
-function formatDuration(uptimeMin: string): string {
-  const min = parseFloat(uptimeMin);
-  if (isNaN(min) || min < 1) return "< 1 min";
-  if (min < 60) return `${Math.round(min)} min`;
-  const h = Math.floor(min / 60);
-  const m = Math.round(min % 60);
-  return m > 0 ? `${h}h ${m}m` : `${h}h`;
-}
 
 /**
  * Locale + IANA-timezone detection for the narrative renderer.
@@ -1724,21 +1732,6 @@ export function detectLocaleAndTz(): { locale: string; tz: string } {
   return { locale, tz: tz || "UTC" };
 }
 
-/**
- * Format an absolute path as a human-friendly display string by
- * collapsing `$HOME` → `~`. Returns the input unchanged when no home
- * prefix matches (e.g. for paths outside $HOME on a CI box).
- */
-function shortPath(abs: string): string {
-  const home = homedir();
-  if (!home) return abs;
-  if (abs === home) return "~";
-  // Use platform separator so `C:\Users\Mert\projects\x` collapses to `~\projects\x`
-  // on Windows; previous `home + "/"` check was vacuously false on Windows and
-  // left full absolute paths in the Section 1 narrative opener (round-5 finding).
-  if (abs.startsWith(home + sep)) return "~" + abs.slice(home.length);
-  return abs;
-}
 
 /**
  * Render the section-4 "For example: what would that cost?" block.
@@ -1799,21 +1792,25 @@ export function renderCostExample(
   // headline number, ONE relatable comparison, ONE team-scale callout. Drop
   // the alternate-model scaling row (engineer-curiosity, not value framing).
   const out: string[] = [];
+  const sinceLabel = lifetimeDays > 0
+    ? ` (lifetime across ${lifetimeDays} day${lifetimeDays === 1 ? "" : "s"})`
+    : " (lifetime)";
   out.push(
-    `  $${usdStr(opusUsd)} of Opus 4 tokens your team didn't burn.`,
+    `  Lifetime: $${usdStr(opusUsd)} of Opus 4 tokens your team didn't burn${sinceLabel}.`,
   );
   out.push(
-    `  context-mode kept ${kb(lifetimeBytes)} out of context — that's ${cursorMonths} months of Cursor Pro paid for itself.`,
+    `  context-mode kept ${kb(lifetimeBytes)} out of context across all your work — that's ${cursorMonths} months of Cursor Pro paid for itself.`,
   );
   if (teamUsd > 0 && teamYearUsd > 0) {
     out.push("");
     out.push(
-      `  Scale across a 10-dev team and that's ~$${teamYearUsd.toLocaleString("en-US")}/year saved.`,
+      `  Scale across a 10-dev team and that's ~$${teamYearUsd.toLocaleString("en-US")}/year saved (extrapolated from this lifetime rate).`,
     );
   }
   out.push("");
   out.push(
-    `  (Opus rates shown for context. On cheaper models the dollar number drops; the savings ratio holds.)`,
+    `  (Opus rates shown for context; cheaper models scale the dollar number, ratio holds. ` +
+    `For this-chat-only savings, see section 1.)`,
   );
   return out;
 }
@@ -2083,23 +2080,6 @@ function renderNarrative5Section(args: {
   return collapseBlanks(out);
 }
 
-/** Drop runs of >2 consecutive blank strings so the renderer never emits visual gaps. */
-function collapseBlanks(lines: string[]): string[] {
-  const out: string[] = [];
-  let blankRun = 0;
-  for (const ln of lines) {
-    if (ln === "") {
-      blankRun++;
-      if (blankRun <= 2) out.push(ln);
-    } else {
-      blankRun = 0;
-      out.push(ln);
-    }
-  }
-  // Trim trailing blanks.
-  while (out.length > 0 && out[out.length - 1] === "") out.pop();
-  return out;
-}
 
 /**
  * One day on the horizontal narrative timeline. `ms` is midnight-UTC of
@@ -2190,51 +2170,6 @@ export function renderHorizontalTimeline(
   return out;
 }
 
-/**
- * Render a UTC ms timestamp as a human-readable local datetime string in
- * the canonical Mert-approved format:
- *
- *   "28 Apr 2026 at 12:16 (Europe/Istanbul)"
- *
- * Used by the 5-section narrative renderer (formatReport) so users see
- * exactly when their conversation started + when /compact rescues fired
- * in their wall-clock timezone — never UTC, never ambiguous.
- *
- * - 24-hour clock with zero-padded minutes ("20:54", not "8:54 PM").
- * - Day is NOT zero-padded ("9 May", not "09 May") to match the target.
- * - IANA timezone is appended verbatim in parentheses regardless of
- *   locale so users never misread Istanbul-time as UTC.
- * - Returns "" for ms === 0 or NaN so callers can guard the rendered
- *   line ("started …") without an extra timestamp-validity check.
- */
-export function formatLocalDateTime(ms: number, locale: string, tz: string): string {
-  if (!Number.isFinite(ms) || ms <= 0) return "";
-  const date = new Date(ms);
-  if (Number.isNaN(date.getTime())) return "";
-  // Intl.DateTimeFormat's "day"/"month"/"year" parts give us the locale's
-  // ordering (en-* → "DD MMM YYYY"), and the explicit numeric hour/minute
-  // forces 24-hour with leading zero on minute when in en-* with hour12=false.
-  const dt = new Intl.DateTimeFormat(locale, {
-    timeZone: tz,
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).formatToParts(date);
-  const get = (type: Intl.DateTimeFormatPartTypes): string =>
-    dt.find((p) => p.type === type)?.value ?? "";
-  const day   = get("day");
-  const month = get("month");
-  const year  = get("year");
-  let hour    = get("hour");
-  const min   = get("minute");
-  // Some locales / some Node versions emit "24" for midnight under hour12=false.
-  // Coerce back to "00" so the displayed time is always wall-clock-correct.
-  if (hour === "24") hour = "00";
-  return `${day} ${month} ${year} at ${hour}:${min} (${tz})`;
-}
 
 /** Format large numbers with K/M suffixes */
 
@@ -2245,15 +2180,6 @@ export function formatLocalDateTime(ms: number, locale: string, tz: string): str
 
 /** Convert a token count to a USD string at the Opus input rate. */
 
-/**
- * Build a proportional bar using █ chars, scaled to a fixed width.
- * Returns e.g. "████████████████████████████████████████" for full width.
- */
-function dataBar(bytes: number, maxBytes: number, width: number = 40): string {
-  if (maxBytes <= 0) return "░".repeat(width);
-  const filled = Math.max(1, Math.round((bytes / maxBytes) * width));
-  return "█".repeat(Math.min(filled, width)) + "░".repeat(Math.max(0, width - filled));
-}
 
 /**
  * Render project memory section with category bars.
@@ -2724,6 +2650,10 @@ export function formatReport(
 
   // Compact stats row
   const statParts = [`${totalCalls} calls`];
+  const totalLatencyMs = report.savings.by_tool.reduce((sum, t) => sum + (t.latency_ms ?? 0), 0);
+  if (totalCalls > 0 && totalLatencyMs > 0) {
+    statParts.push(`${Math.round(totalLatencyMs / totalCalls)}ms avg`);
+  }
   if (report.cache && report.cache.hits > 0) {
     statParts.push(`${report.cache.hits} cache hits (+${kb(report.cache.bytes_saved)})`);
   }
@@ -2747,7 +2677,8 @@ export function formatReport(
     // Compact table: tool name, calls, saved
     for (const t of toolRows) {
       const name = t.tool.length > 22 ? t.tool.slice(0, 19) + "..." : t.tool;
-      lines.push(`  ${name.padEnd(22)}  ${String(t.calls).padStart(4)} calls  ${kb(t.estimatedSaved).padStart(8)} saved`);
+      const latency = t.avg_latency_ms ? `  ${String(t.avg_latency_ms).padStart(5)}ms avg` : "";
+      lines.push(`  ${name.padEnd(22)}  ${String(t.calls).padStart(4)} calls  ${kb(t.estimatedSaved).padStart(8)} saved${latency}`);
     }
   }
 

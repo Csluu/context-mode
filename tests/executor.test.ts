@@ -199,6 +199,26 @@ describe("JavaScript Execution", () => {
     assert.equal(r.exitCode, 0);
     assert.ok(r.stdout.includes("even sum: 2550"));
   });
+
+  test("JS: sandbox network deny blocks fetch without touching the network", async () => {
+    const prev = process.env.CONTEXT_MODE_SANDBOX_NETWORK;
+    process.env.CONTEXT_MODE_SANDBOX_NETWORK = "deny";
+    try {
+      const r = await executor.execute({
+        language: "javascript",
+        code: `
+          fetch("http://example.com")
+            .then(() => console.log("unexpected"))
+            .catch((err) => console.log(err.message));
+        `,
+      });
+      assert.equal(r.exitCode, 0, r.stderr);
+      assert.ok(r.stdout.includes("CONTEXT_MODE_SANDBOX_NETWORK=deny"));
+    } finally {
+      if (prev === undefined) delete process.env.CONTEXT_MODE_SANDBOX_NETWORK;
+      else process.env.CONTEXT_MODE_SANDBOX_NETWORK = prev;
+    }
+  });
 });
 
 describe.runIf(runtimes.typescript)("TypeScript Execution", () => {
@@ -343,6 +363,51 @@ print(f"most common: {c.most_common(2)}")
     assert.equal(r.exitCode, 0);
     assert.ok(r.stdout.includes("most common:"));
     assert.ok(r.stdout.includes("the"));
+  });
+
+  test("Python: sandbox network deny blocks sockets without touching the network", async () => {
+    const prev = process.env.CONTEXT_MODE_SANDBOX_NETWORK;
+    process.env.CONTEXT_MODE_SANDBOX_NETWORK = "deny";
+    try {
+      const r = await executor.execute({
+        language: "python",
+        code: `
+import socket
+try:
+    socket.create_connection(("example.com", 80), timeout=1)
+    print("unexpected")
+except Exception as exc:
+    print(str(exc))
+        `,
+      });
+      assert.equal(r.exitCode, 0, r.stderr);
+      assert.ok(r.stdout.includes("CONTEXT_MODE_SANDBOX_NETWORK=deny"));
+    } finally {
+      if (prev === undefined) delete process.env.CONTEXT_MODE_SANDBOX_NETWORK;
+      else process.env.CONTEXT_MODE_SANDBOX_NETWORK = prev;
+    }
+  });
+
+  test.runIf(process.platform !== "win32")("Python: sandbox memory cap applies RLIMIT_AS", async () => {
+    const prev = process.env.CONTEXT_MODE_SANDBOX_MEM_MB;
+    process.env.CONTEXT_MODE_SANDBOX_MEM_MB = "128";
+    try {
+      const r = await executor.execute({
+        language: "python",
+        code: `
+import resource
+soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+print(soft)
+        `,
+      });
+      assert.equal(r.exitCode, 0, r.stderr);
+      const soft = Number.parseInt(r.stdout.trim(), 10);
+      assert.ok(Number.isFinite(soft), r.stdout);
+      assert.ok(soft > 0 && soft <= 128 * 1024 * 1024, r.stdout);
+    } finally {
+      if (prev === undefined) delete process.env.CONTEXT_MODE_SANDBOX_MEM_MB;
+      else process.env.CONTEXT_MODE_SANDBOX_MEM_MB = prev;
+    }
   });
 });
 
@@ -1637,4 +1702,3 @@ describe("Windows Shell Support", () => {
     assert.equal(buildScriptFilename("javascript", "darwin"), "script.js");
   });
 });
-

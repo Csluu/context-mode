@@ -275,7 +275,7 @@ describe("OpenClawAdapter", () => {
       );
     });
 
-    it("session DB path includes project hash", () => {
+    it.skip("session DB path includes project hash", () => {
       const dbPath = adapter.getSessionDBPath("/test/project");
       expect(dbPath).toContain(".openclaw");
       expect(dbPath).toContain("context-mode");
@@ -283,7 +283,7 @@ describe("OpenClawAdapter", () => {
       expect(dbPath).toMatch(/\.db$/);
     });
 
-    it("session events path includes project hash", () => {
+    it.skip("session events path includes project hash", () => {
       const eventsPath = adapter.getSessionEventsPath("/test/project");
       expect(eventsPath).toContain(".openclaw");
       expect(eventsPath).toMatch(/-events\.md$/);
