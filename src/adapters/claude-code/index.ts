@@ -6,9 +6,10 @@
  *
  * Claude Code hook specifics:
  *   - Session ID: transcript_path UUID > session_id > CLAUDE_SESSION_ID > ppid
- *   - Config: ~/.claude/settings.json
- *   - Session dir: ~/.claude/context-mode/sessions/
- *   - Plugin registry: ~/.claude/plugins/installed_plugins.json
+ *   - Config root: $CLAUDE_CONFIG_DIR (when set) or ~/.claude
+ *   - Settings: <configDir>/settings.json
+ *   - Session dir: <configDir>/context-mode/sessions/
+ *   - Plugin registry: <configDir>/plugins/installed_plugins.json
  */
 
 import {
@@ -18,24 +19,30 @@ import {
   readdirSync,
   chmodSync,
   accessSync,
+  mkdirSync,
   constants,
 } from "node:fs";
 import { resolve, join } from "node:path";
 import { homedir } from "node:os";
 
 import { ClaudeCodeBaseAdapter, type ClaudeCodeWireInput } from "../claude-code-base.js";
+import { resolveClaudeConfigDir } from "../../util/claude-config.js";
+import { checkPluginCacheIntegritySync } from "../../util/plugin-cache-integrity.js";
 
-import type {
-  HookAdapter,
-  HookParadigm,
-  PlatformCapabilities,
-  DiagnosticResult,
-  HookRegistration,
+import {
+  buildNodeCommand,
+  type HookAdapter,
+  type HookParadigm,
+  type PlatformCapabilities,
+  type DiagnosticResult,
+  type HookRegistration,
+  type HealthCheck,
 } from "../types.js";
 import {
   HOOK_TYPES,
   HOOK_SCRIPTS,
   REQUIRED_HOOKS,
+  PRE_TOOL_USE_MATCHERS,
   PRE_TOOL_USE_MATCHER_PATTERN,
   isContextModeHook,
   isAnyContextModeHook,
@@ -69,22 +76,54 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
 
   // ── Configuration ──────────────────────────────────────
 
+  /**
+   * Honor `CLAUDE_CONFIG_DIR` (the canonical Claude Code config root) before
+   * falling back to `~/.claude`. Mirrors the contract that
+   * `hooks/session-helpers.mjs::resolveConfigDir` already follows — including
+   * tilde expansion for shells that pass `~/foo` through unchanged — so server
+   * and hooks agree on where session-scoped state lives. See issue #453.
+   *
+   * Tilde regex `/^~[/\\]?/` only handles the current-user form (`~`, `~/`,
+   * `~\`); `~user/` is NOT expanded to a per-user homedir (matches
+   * `resolveConfigDir`). Non-tilde values are run through `resolve()` to
+   * normalize relative paths to absolute against cwd; the hook helper
+   * intentionally leaves them raw, but the adapter contract guarantees an
+   * absolute path (BaseAdapter.getConfigDir docstring).
+   *
+   * Issue #460 round-3: routed through the canonical
+   * `resolveClaudeConfigDir` util so server, CLI, security, and adapter
+   * agree byte-for-byte (incl. empty/whitespace-only env fallback).
+   */
+  getConfigDir(_projectDir?: string): string {
+    return resolveClaudeConfigDir();
+  }
+
+  getSessionDir(): string {
+    const dir = join(this.getConfigDir(), "context-mode", "sessions");
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
   getSettingsPath(): string {
-    return resolve(homedir(), ".claude", "settings.json");
+    return join(this.getConfigDir(), "settings.json");
   }
 
   generateHookConfig(pluginRoot: string): HookRegistration {
-    const preToolUseCommand = `node ${pluginRoot}/hooks/pretooluse.mjs`;
-    const preToolUseMatchers = [
-      "Bash",
-      "WebFetch",
-      "Read",
-      "Grep",
-      "Task",
-      "mcp__plugin_context-mode_context-mode__ctx_execute",
-      "mcp__plugin_context-mode_context-mode__ctx_execute_file",
-      "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
-    ];
+    // Algo-D3: every command flows through `buildNodeCommand` (defined in
+    // src/adapters/types.ts), which:
+    //   - quotes both nodePath and scriptPath (#548 — Windows pluginRoots
+    //     with spaces no longer fall through extractHookScriptPath's
+    //     ambiguous-tail fallback),
+    //   - swaps backslashes for forward slashes (#372 MSYS path mangling),
+    //   - uses `process.execPath` instead of bare `node` (#369 PATH
+    //     resolution on Git Bash).
+    // Pre-D3 we hand-rolled `node "${pluginRoot}/hooks/X.mjs"` for all
+    // five events; bare `node` made claude-code the lone outlier and
+    // dropping the execPath swap re-opened the Windows class. Algo-D3.5
+    // (CI invariant in tests/adapters/claude-code.test.ts) locks this in
+    // for adapter #16.
+    const preToolUseCommand = buildNodeCommand(`${pluginRoot}/hooks/pretooluse.mjs`);
+    const preToolUseMatchers = [...PRE_TOOL_USE_MATCHERS];
 
     return {
       PreToolUse: preToolUseMatchers.map((matcher) => ({
@@ -97,7 +136,7 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
           hooks: [
             {
               type: "command",
-              command: `node ${pluginRoot}/hooks/posttooluse.mjs`,
+              command: buildNodeCommand(`${pluginRoot}/hooks/posttooluse.mjs`),
             },
           ],
         },
@@ -108,7 +147,7 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
           hooks: [
             {
               type: "command",
-              command: `node ${pluginRoot}/hooks/precompact.mjs`,
+              command: buildNodeCommand(`${pluginRoot}/hooks/precompact.mjs`),
             },
           ],
         },
@@ -119,7 +158,7 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
           hooks: [
             {
               type: "command",
-              command: `node ${pluginRoot}/hooks/userpromptsubmit.mjs`,
+              command: buildNodeCommand(`${pluginRoot}/hooks/userpromptsubmit.mjs`),
             },
           ],
         },
@@ -130,7 +169,7 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
           hooks: [
             {
               type: "command",
-              command: `node ${pluginRoot}/hooks/sessionstart.mjs`,
+              command: buildNodeCommand(`${pluginRoot}/hooks/sessionstart.mjs`),
             },
           ],
         },
@@ -165,7 +204,7 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
       results.push({
         check: "PreToolUse hook",
         status: "fail",
-        message: "Could not read ~/.claude/settings.json",
+        message: `Could not read ${this.getSettingsPath()}`,
         fix: "context-mode upgrade",
       });
       return results;
@@ -200,6 +239,58 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
     });
 
     return results;
+  }
+
+  /**
+   * Adapter-defined health checks (Algo-D1 + Algo-D5).
+   *
+   * For each entry in HOOK_SCRIPTS (the canonical hookType → scriptName
+   * map), emit a HealthCheck that joins `pluginRoot + "hooks" +
+   * scriptName` and probes via `existsSync`. Crucially, this NEVER
+   * parses a hook command — pluginRoot and scriptName are both in our
+   * hand, so the regex round-trip that produced the #548 doubled-path
+   * FAIL is bypassed entirely.
+   *
+   * The hook check derives from HOOK_SCRIPTS (single source of truth in
+   * src/adapters/claude-code/hooks.ts), so adding a new hook event in
+   * that map auto-extends doctor coverage — no parallel hardcoded list
+   * to maintain.
+   *
+   * Algo-D5: appends a single "Plugin cache integrity" check that
+   * delegates to the same helper start.mjs uses at boot
+   * (scripts/plugin-cache-integrity.mjs::assertPluginCacheIntegrity).
+   * Same code, two callsites — boot fail-fast and doctor diagnostic
+   * agree byte-for-byte. Users hitting #550 get the actionable signal
+   * without restarting the MCP server.
+   */
+  getHealthChecks(pluginRoot: string): readonly HealthCheck[] {
+    const hookChecks: HealthCheck[] = Object.entries(HOOK_SCRIPTS).map(
+      ([hookType, scriptName]) => {
+        const absolutePath = join(pluginRoot, "hooks", scriptName);
+        return {
+          name: `Hook script: ${hookType} (${scriptName})`,
+          check: () => {
+            // Direct existsSync — no hook-command parsing, no regex.
+            // pluginRoot is the value the doctor was invoked with;
+            // scriptName comes from the canonical HOOK_SCRIPTS map.
+            if (existsSync(absolutePath)) {
+              return { status: "OK" as const, detail: absolutePath };
+            }
+            return {
+              status: "FAIL" as const,
+              detail: `not found at ${absolutePath}`,
+            };
+          },
+        };
+      },
+    );
+
+    const integrityCheck: HealthCheck = {
+      name: "Plugin cache integrity",
+      check: () => checkPluginCacheIntegritySync(pluginRoot),
+    };
+
+    return [...hookChecks, integrityCheck];
   }
 
   /** Read plugin hooks from hooks/hooks.json or .claude-plugin/hooks/hooks.json */
@@ -290,9 +381,8 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
   getInstalledVersion(): string {
     // Primary: read from installed_plugins.json
     try {
-      const ipPath = resolve(
-        homedir(),
-        ".claude",
+      const ipPath = join(
+        this.getConfigDir(),
         "plugins",
         "installed_plugins.json",
       );
@@ -309,11 +399,18 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
       /* fallback below */
     }
 
-    // Fallback: scan common plugin cache locations
-    const bases = [
-      resolve(homedir(), ".claude"),
-      resolve(homedir(), ".config", "claude"),
-    ];
+    // Fallback: scan common plugin cache locations.
+    // `resolveClaudeConfigDir` honors $CLAUDE_CONFIG_DIR; the literal
+    // `~/.claude` is also retained as a hard floor so environments that
+    // misconfigure the env still find the canonical dir if it exists.
+    const bases = Array.from(
+      new Set([
+        this.getConfigDir(),
+        resolveClaudeConfigDir(),
+        resolve(homedir(), ".claude"),
+        resolve(homedir(), ".config", "claude"),
+      ]),
+    );
     for (const base of bases) {
       const cacheDir = resolve(
         base,
@@ -393,20 +490,36 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
         this.checkHookType(undefined, pluginHooks, ht),
       );
       if (allCovered) {
-        // Remove ALL existing context-mode hooks from settings.json — hooks.json
-        // is the source of truth. Keeping them causes duplicate concurrent hook
-        // processes (one from settings.json, one from hooks.json), which triggers
-        // "non-blocking hook error" warnings on every tool call.
+        // Strip ONLY the inner context-mode hook commands from each matcher entry —
+        // hooks.json is the source of truth for ctx-mode. User hooks co-located in
+        // the same matcher entry MUST be preserved (#415: entry-level filter wiped
+        // every co-located user hook). After stripping, prune entries whose `hooks`
+        // array becomes empty.
+        const ctxScriptNames = Object.values(HOOK_SCRIPTS);
+        const isCtxModeCommand = (cmd?: string): boolean =>
+          cmd != null &&
+          (ctxScriptNames.some((s) => cmd.includes(s)) ||
+            cmd.includes("context-mode hook"));
         for (const hookType of Object.keys(hooks)) {
           const entries = hooks[hookType];
           if (!Array.isArray(entries)) continue;
-          const filtered = (entries as Array<Record<string, unknown>>).filter((entry) =>
-            !isAnyContextModeHook(entry as { hooks?: Array<{ command?: string }> }),
-          );
-          const removed = entries.length - filtered.length;
-          if (removed > 0) {
-            hooks[hookType] = filtered;
-            changes.push(`Removed ${removed} duplicate ${hookType} hook(s) — covered by plugin hooks.json`);
+          let totalRemoved = 0;
+          for (const entry of entries as Array<Record<string, unknown>>) {
+            const typedEntry = entry as { hooks?: Array<{ command?: string }> };
+            const innerHooks = typedEntry.hooks ?? [];
+            const before = innerHooks.length;
+            typedEntry.hooks = innerHooks.filter((h) => !isCtxModeCommand(h.command));
+            totalRemoved += before - typedEntry.hooks.length;
+          }
+          const pruned = (entries as Array<Record<string, unknown>>).filter((e) => {
+            const ih = (e as { hooks?: unknown[] }).hooks;
+            return Array.isArray(ih) && ih.length > 0;
+          });
+          if (totalRemoved > 0 || pruned.length !== entries.length) {
+            hooks[hookType] = pruned;
+            if (totalRemoved > 0) {
+              changes.push(`Removed ${totalRemoved} duplicate ${hookType} hook(s) — covered by plugin hooks.json`);
+            }
           }
         }
         settings.hooks = hooks;
@@ -494,9 +607,8 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
 
   updatePluginRegistry(pluginRoot: string, version: string): void {
     try {
-      const ipPath = resolve(
-        homedir(),
-        ".claude",
+      const ipPath = join(
+        this.getConfigDir(),
         "plugins",
         "installed_plugins.json",
       );

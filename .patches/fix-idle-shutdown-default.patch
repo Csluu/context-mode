@@ -1,0 +1,71 @@
+# Fix #592: idle-shutdown default OFF + adapter-aware opt-in + ctx_doctor advice
+#
+# Three changes:
+#  1) src/lifecycle.ts — idleTimeoutForEnv default: 15min -> 0
+#  2) src/server.ts    — bootstrap: opt-in idle (15min) only for opencode/kilo;
+#                        explicit env CONTEXT_MODE_IDLE_TIMEOUT_MS still honored
+#  3) src/server.ts    — ctx_doctor: detect risky env+host combo, print FIX command
+#
+# Apply with: git apply .patches/fix-idle-shutdown-default.patch
+# Rebuild bundles: npm run build
+
+
+--- a/src/lifecycle.ts
++++ b/src/lifecycle.ts
+@@ idleTimeoutForEnv @@
+   const raw = env.CONTEXT_MODE_IDLE_TIMEOUT_MS;
+-  if (raw === undefined) return 15 * 60 * 1000;
++  if (raw === undefined) return 0;
+   const n = Number.parseInt(raw, 10);
+-  if (!Number.isFinite(n) || n < 0) return 15 * 60 * 1000;
++  if (!Number.isFinite(n) || n < 0) return 0;
+   return n;
+
+--- a/src/server.ts (~line 3909, startLifecycleGuard call)
++++ b/src/server.ts
+@@ bootstrap @@
+-  const lifecycle = startLifecycleGuard({ onShutdown: () => gracefulShutdown() });
++  const idleLeakingHosts = new Set<string>(["opencode", "kilo", "kilocode"]);
++  let bootstrapIdleTimeoutMs: number | undefined;
++  if (process.env.CONTEXT_MODE_IDLE_TIMEOUT_MS === undefined) {
++    try {
++      const { detectPlatform } = await import("./adapters/detect.js");
++      const signal = detectPlatform();
++      const host: string = signal?.platform ?? "";
++      bootstrapIdleTimeoutMs = idleLeakingHosts.has(host) ? 15 * 60 * 1000 : 0;
++    } catch { bootstrapIdleTimeoutMs = 0; }
++  }
++  const lifecycle = startLifecycleGuard({
++    onShutdown: () => gracefulShutdown(),
++    idleTimeoutMs: bootstrapIdleTimeoutMs,
++  });
+
+--- a/src/server.ts (~line 3128, ctx_doctor handler, before "Version")
++++ b/src/server.ts
+@@ ctx_doctor @@
++    // Idle-shutdown sanity check (#592)
++    {
++      const affected = new Set<string>([
++        "claude-code", "codex", "cursor", "gemini-cli",
++        "vscode-copilot", "jetbrains-copilot", "antigravity", "zed",
++      ]);
++      let detectedHost = "";
++      try {
++        const { detectPlatform } = await import("./adapters/detect.js");
++        detectedHost = detectPlatform()?.platform ?? "";
++      } catch {}
++      const raw = process.env.CONTEXT_MODE_IDLE_TIMEOUT_MS;
++      const parsed = raw === undefined ? NaN : Number.parseInt(raw, 10);
++      const idleActive = Number.isFinite(parsed) && parsed > 0;
++      if (detectedHost && affected.has(detectedHost) && idleActive) {
++        const setCmd = process.platform === "win32"
++          ? "setx CONTEXT_MODE_IDLE_TIMEOUT_MS 0"
++          : "export CONTEXT_MODE_IDLE_TIMEOUT_MS=0";
++        lines.push(
++          `[WARN] Idle shutdown: CONTEXT_MODE_IDLE_TIMEOUT_MS=${raw} on host '${detectedHost}' — ` +
++          `this host does not auto-respawn the MCP child (issue #592). Fix: ${setCmd}`,
++        );
++      } else {
++        lines.push(`[OK] Idle shutdown: safe (host=${detectedHost || "unknown"}, idle=${raw ?? "default"})`);
++      }
++    }

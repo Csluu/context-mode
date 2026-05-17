@@ -209,14 +209,17 @@ export interface HookAdapter {
   /** Path to the platform's settings file (e.g., ~/.claude/settings.json). */
   getSettingsPath(): string;
 
-  /** Directory where session data is stored. */
+  /**
+   * Directory where session data is stored.
+   *
+   * NOTE — C2 narrowing (2026-05): this is the ONLY storage-path concern an
+   * adapter exposes. Per-project DB paths are derived by callers via
+   * `resolveSessionDbPath({ projectDir, sessionsDir: adapter.getSessionDir() })`
+   * (see `src/session/db.ts`). Per-project events.md paths follow the same
+   * `<sessionDir>/<hash><suffix>-events.md` shape and are computed inline at
+   * the small number of call sites that need them (server.ts, hooks).
+   */
   getSessionDir(): string;
-
-  /** Compute per-project session DB path. */
-  getSessionDBPath(projectDir: string): string;
-
-  /** Compute per-project session events file path. */
-  getSessionEventsPath(projectDir: string): string;
 
   /**
    * Platform config directory.
@@ -268,6 +271,22 @@ export interface HookAdapter {
   /** Validate that hooks are properly configured for this platform. */
   validateHooks(pluginRoot: string): DiagnosticResult[];
 
+  /**
+   * Adapter-defined per-platform health checks (Algo-D1).
+   *
+   * OPTIONAL. Adapters that don't override return nothing — they don't
+   * have this class of check today. claude-code overrides with hook-script
+   * existence checks that join `pluginRoot + scriptName` directly via
+   * `existsSync`, so doctor never round-trips through a regex on a hook
+   * command (the #548 root cause).
+   *
+   * Adapter #16 with hook scripts inherits the contract by overriding;
+   * adapter #17 without hook scripts simply doesn't override. The doctor
+   * iterates `adapter.getHealthChecks?.(pluginRoot) ?? []` and renders
+   * each — no per-adapter wiring in the doctor body.
+   */
+  getHealthChecks?(pluginRoot: string): readonly HealthCheck[];
+
   /** Check if the plugin is registered/enabled on this platform. */
   checkPluginRegistration(): DiagnosticResult;
 
@@ -306,6 +325,24 @@ export interface DiagnosticResult {
   fix?: string;
 }
 
+/**
+ * Adapter-defined health check (Algo-D1).
+ *
+ * Lighter-weight than `DiagnosticResult`: adapters declare a name and a
+ * synchronous `check()` thunk. The doctor renders the result. The
+ * thunk-style intentionally avoids forcing adapters into async — the
+ * existsSync probe used by claude-code is sync and the doctor invokes it
+ * directly without an `await`. Adapters needing async work return a
+ * pre-resolved status (the check ran at thunk-creation time) or extend
+ * `validateHooks()` instead.
+ */
+export interface HealthCheck {
+  /** Human-readable check title (e.g. "Hook script exists: pretooluse.mjs"). */
+  readonly name: string;
+  /** Synchronous check thunk. Returns OK or FAIL with optional detail. */
+  check(): { status: "OK" | "FAIL"; detail?: string };
+}
+
 // ─────────────────────────────────────────────────────────
 // Platform detection
 // ─────────────────────────────────────────────────────────
@@ -332,6 +369,36 @@ export function buildNodeCommand(scriptPath: string): string {
   return `"${nodePath}" "${safePath}"`;
 }
 
+/**
+ * Strict inverse of `buildNodeCommand`.
+ *
+ * Returns `{ nodePath, scriptPath }` ONLY when `cmd` could have been
+ * produced by `buildNodeCommand` — i.e. exactly two double-quoted args
+ * separated by whitespace. Anything else (bare `node …`, single quotes,
+ * unquoted ambiguous input, CLI dispatcher entries) returns `null`.
+ *
+ * Why strict: the legacy `\S+\.mjs` fallback in
+ * `src/util/hook-config.ts:24` and the two-step regex in
+ * `src/adapters/claude-code/hooks.ts:178` silently grabbed the path tail
+ * after the last whitespace whenever the host wire-format dropped quotes,
+ * producing the #548 doubled-path FAIL when `pluginRoot` contained
+ * spaces (e.g. `C:\Users\High Ground Services\…`). A canonical inverse
+ * lets every emit (`buildNodeCommand`) round-trip through every parse
+ * (`parseNodeCommand`) without inventing fallbacks. Adapter #16 inherits
+ * the contract by importing one module.
+ */
+export function parseNodeCommand(
+  cmd: string,
+): { nodePath: string; scriptPath: string } | null {
+  if (typeof cmd !== "string" || cmd.length === 0) return null;
+  // Match `"<nodePath>" "<scriptPath>"` with arbitrary whitespace
+  // separator. Both segments must be non-empty and contain no embedded
+  // double quotes — buildNodeCommand never emits embedded quotes.
+  const m = cmd.match(/^"([^"]+)"\s+"([^"]+)"\s*$/);
+  if (!m) return null;
+  return { nodePath: m[1], scriptPath: m[2] };
+}
+
 /** Supported platform identifiers. */
 export type PlatformId =
   | "claude-code"
@@ -346,6 +413,7 @@ export type PlatformId =
   | "antigravity"
   | "kiro"
   | "pi"
+  | "omp"
   | "zed"
   | "qwen-code"
   | "unknown";

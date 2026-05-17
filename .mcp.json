@@ -2,7 +2,9 @@
   "mcpServers": {
     "context-mode": {
       "command": "node",
-      "args": ["./start.mjs"]
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/start.mjs"
+      ]
     }
   }
 }

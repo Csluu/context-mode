@@ -14,6 +14,14 @@ import { fileURLToPath } from "node:url";
 import { ContentStore, cleanupStaleDBs } from "../src/store.js";
 import { withRetry, closeDB, loadDatabase, applyWALPragmas } from "../src/db-base.js";
 
+// This test file exercises trigram behavior on prose-style fixtures
+// (release notes, markdown). Production default skips trigram indexing for
+// prose to save ~40% DB size / ~30% insert time; trigram correctness itself
+// is what these tests verify — force the legacy "index everything" mode for
+// the entire file so the behavioral assertions still apply.
+process.env.CONTEXT_MODE_TRIGRAM = "all";
+
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixtureDir = join(__dirname, "fixtures");
 

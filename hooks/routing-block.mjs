@@ -36,11 +36,11 @@ export function createRoutingBlock(t, options = {}) {
 
   <forbidden_actions>
     - NO Bash for commands producing >20 lines output.
-    - NO Read for analysis — use execute_file. Read IS correct for files you intend to Edit.
+    - NO Read for analysis — use ${t("ctx_execute_file")}. Read IS correct for files you intend to Edit.
     - NO WebFetch — use ${t("ctx_fetch_and_index")}.
     - Bash ONLY for git/mkdir/rm/mv/navigation.
     - NO ${t("ctx_execute")} or ${t("ctx_execute_file")} for file creation/modification.
-      ctx_execute is for analysis, processing, computation only.
+      ${t("ctx_execute")} is for analysis, processing, computation only.
   </forbidden_actions>
 
   <file_writing_policy>
@@ -50,22 +50,10 @@ export function createRoutingBlock(t, options = {}) {
   </file_writing_policy>
 
   <output_constraints>
-    <communication_style>
-      Terse like caveman. Technical substance exact. Only fluff die.
-      Use fragments when clear. Short synonyms (fix not "implement a solution for").
-      Technical terms exact. Code blocks unchanged.
-      Auto-expand for: security warnings, irreversible actions, user confusion.
-    </communication_style>
     <artifact_policy>
       Write artifacts (code, configs, PRDs) to FILES. NEVER inline.
       Return only: file path + 1-line description.
     </artifact_policy>
-    <response_format>
-      Concise summary:
-      - Actions taken (2-3 bullets)
-      - File paths created/modified
-      - Key findings
-    </response_format>
   </output_constraints>
   <session_continuity>
     Skills, roles, and decisions set during this session remain active until the user revokes them.
@@ -103,6 +91,10 @@ export function createBashGuidance(t) {
   return '<context_guidance>\n  <tip>\n    May produce large output. Use ' + t("ctx_batch_execute") + '(commands, queries) for multiple commands, ' + t("ctx_execute") + '(language: "shell", code: "...") for single. Only printed summary enters context. Bash only for: git, mkdir, rm, mv, navigation.\n  </tip>\n</context_guidance>';
 }
 
+export function createExternalMcpGuidance(t) {
+  return '<context_guidance>\n  <tip>\n    External MCP tools may return large payloads (channel history, file content, search results) that flood context. After this call, if the result is large or you need to filter/aggregate it, pipe the data through ' + t("ctx_execute") + '(language, code) — only your printed summary enters context. For docs-style fetches, prefer ' + t("ctx_fetch_and_index") + '(url, source) then ' + t("ctx_search") + '(queries).\n  </tip>\n</context_guidance>';
+}
+
 // ── Backward compat: static exports defaulting to claude-code ──
 
 const _t = createToolNamer("claude-code");
@@ -110,3 +102,4 @@ export const ROUTING_BLOCK = createRoutingBlock(_t);
 export const READ_GUIDANCE = createReadGuidance(_t);
 export const GREP_GUIDANCE = createGrepGuidance(_t);
 export const BASH_GUIDANCE = createBashGuidance(_t);
+export const EXTERNAL_MCP_GUIDANCE = createExternalMcpGuidance(_t);

@@ -16,11 +16,13 @@ import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { SessionDB } from "./session/db.js";
-import { extractEvents, extractUserEvents } from "./session/extract.js";
-import type { HookInput } from "./session/extract.js";
-import { buildResumeSnapshot } from "./session/snapshot.js";
-import type { SessionEvent } from "./types.js";
+import { SessionDB } from "../../session/db.js";
+import { extractEvents, extractUserEvents } from "../../session/extract.js";
+import type { HookInput } from "../../session/extract.js";
+import { buildResumeSnapshot } from "../../session/snapshot.js";
+import type { SessionEvent } from "../../types.js";
+import { bootstrapMCPTools, type BridgeHandle } from "./mcp-bridge.js";
+import { PiAdapter } from "./index.js";
 
 // ── Pi Tool Name Mapping ─────────────────────────────────
 // Pi uses lowercase; shared extractors expect PascalCase (Claude Code convention).
@@ -53,8 +55,25 @@ const BLOCKED_BASH_PATTERNS: RegExp[] = [
 let _db: SessionDB | null = null;
 let _sessionId = "";
 
-// Per-session gate: routing block injected at most once per session_id.
-const _routingInjected: Set<string> = new Set();
+// MCP bridge handle. The bridge spawns server.bundle.mjs once and
+// registers each MCP tool through pi.registerTool() so the Pi LLM can
+// actually call ctx_execute / ctx_search / etc. (#426). Pi 0.73.x has
+// no native MCP support, so without this bridge the tools are
+// invisible to the LLM and the routing block is dead weight.
+let _mcpBridge: BridgeHandle | null = null;
+
+/**
+ * Settles when the MCP bridge bootstrap has finished — resolves on
+ * success AND on failure (the bootstrap is best-effort; failures are
+ * logged to stderr but never propagated). Exposed for tests so they
+ * can `await` the wiring deterministically without relying on internal
+ * timing or `setImmediate` polling.
+ *
+ * Reset to a fresh promise on every `piExtension(pi)` call so repeated
+ * registrations in one test process don't see a stale resolution from
+ * a prior load.
+ */
+export let _mcpBridgeReady: Promise<void> = Promise.resolve();
 
 // Cached routing-block string (built once per process from hooks/routing-block.mjs).
 let _routingBlock: string | null = null;
@@ -97,8 +116,14 @@ async function getAutoInjection(
 
 // ── Helpers ──────────────────────────────────────────────
 
+// Single PiAdapter instance — owns the canonical session-dir contract
+// (~/.pi/context-mode/sessions). Routing the extension through it means
+// any future segment change in PiAdapter (or BaseAdapter) propagates
+// here automatically instead of silently desyncing (#473 round-3).
+const _piAdapter = new PiAdapter();
+
 function getSessionDir(): string {
-  const dir = join(homedir(), ".pi", "context-mode", "sessions");
+  const dir = _piAdapter.getSessionDir();
   mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -130,6 +155,22 @@ function deriveSessionId(ctx: Record<string, unknown>): string {
   return `pi-${Date.now()}`;
 }
 
+/**
+ * Parse SessionDB timestamps as UTC. SQLite datetime('now') returns
+ * "YYYY-MM-DD HH:MM:SS" in UTC without a timezone suffix; JavaScript parses
+ * that shape as local time, which skews ages by the local UTC offset.
+ */
+function parseSessionTimestampMs(value: string): number {
+  const trimmed = value.trim();
+  const sqliteUtc = trimmed.match(
+    /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})(\.\d+)?$/,
+  );
+  const normalized = sqliteUtc
+    ? `${sqliteUtc[1]}T${sqliteUtc[2]}${sqliteUtc[3] ?? ""}Z`
+    : trimmed;
+  return Date.parse(normalized);
+}
+
 /** Build stats text for the /ctx-stats command. */
 function buildStatsText(db: SessionDB, sessionId: string): string {
   try {
@@ -158,9 +199,11 @@ function buildStatsText(db: SessionDB, sessionId: string): string {
 
     // Session age
     if (stats?.started_at) {
-      const startedMs = new Date(stats.started_at).getTime();
-      const ageMinutes = Math.round((Date.now() - startedMs) / 60_000);
-      lines.push(`- Session age: ${ageMinutes}m`);
+      const startedMs = parseSessionTimestampMs(stats.started_at);
+      if (Number.isFinite(startedMs)) {
+        const ageMinutes = Math.round((Date.now() - startedMs) / 60_000);
+        lines.push(`- Session age: ${ageMinutes}m`);
+      }
     }
 
     return lines.join("\n");
@@ -187,19 +230,113 @@ function handleCommandText(
   return { text };
 }
 
+// ── Pi short-circuit argv detection (#534) ───────────────
+//
+// Pi's runtime loads every extension during module discovery, BEFORE its
+// `runCli()` decides whether the invocation is a real session or a
+// short-lived help / version print. Without this guard, even `pi --help`
+// causes us to spawn `server.bundle.mjs` as a long-lived stdio child —
+// which is then reparented to PID 1 the moment Pi's `--help` handler
+// returns. The MCP SDK's StdioServerTransport CPU-spins on the half-closed
+// pipe until the 30 s ppid poll catches up, accumulating multi-hour orphans
+// (see issue #534, plus the historical #311 / #388 fixes that only addressed
+// the *recovery* path — not the *prevention* path).
+//
+// Token set verified against the Pi 14.x source — specifically:
+//   refs/platforms/oh-my-pi/packages/coding-agent/src/cli.ts:runCli
+//
+//     if (first === "--help" || first === "-h" || first === "--version"
+//      || first === "-v" || first === "help") { /* short-circuit */ }
+//
+// We mirror it exactly — no inferred flags, no `-V` (Pi uses lowercase `-v`),
+// no `--no-help`. Anything else (including `pi stats --help`) routes through
+// the normal launch path and the bridge bootstraps as usual.
+
+const PI_SHORT_CIRCUIT_TOKENS = new Set(["--help", "-h", "--version", "-v", "help"]);
+
+/**
+ * Returns true iff `argv` matches a Pi top-level short-circuit invocation
+ * (help or version). Only argv[0] is inspected — Pi's runCli only checks
+ * the first token, and subcommand-level `--help` (e.g. `pi stats --help`)
+ * still spins up a real session, so we must NOT skip bootstrap there.
+ *
+ * Exported for unit tests.
+ */
+export function isPiShortCircuitArgv(argv: readonly string[]): boolean {
+  if (argv.length === 0) return false;
+  return PI_SHORT_CIRCUIT_TOKENS.has(argv[0]);
+}
+
+/**
+ * Issue #545 — Pi workspace resolver.
+ *
+ * Pi's runtime sets PI_CONFIG_DIR to ~/.pi (its CONFIG dir, not the user's
+ * project). The extension previously used this as the project anchor, which
+ * meant every Pi session re-rooted under ~/.pi — collapsing all of a user's
+ * projects into a single phantom workspace. This helper picks the user's
+ * actual project directory while NEVER returning a path equal to or under
+ * ~/.pi/.
+ *
+ * Cascade:
+ *   1. PI_WORKSPACE_DIR — set by Pi's bridge (extension-set, freshest)
+ *   2. PI_PROJECT_DIR   — legacy/user override
+ *   3. PWD              — shell-set, survives process.chdir
+ *   4. cwd              — last resort
+ *
+ * Each candidate is rejected if it equals ~/.pi or lives under ~/.pi/. If
+ * every candidate is poisoned, falls back to homedir() as a safe non-config
+ * anchor — caller may still render a "no project context" notice but the
+ * function stays total.
+ */
+export function resolvePiWorkspaceDir(opts: {
+  env: Record<string, string | undefined>;
+  pwd: string | undefined;
+  cwd: string;
+  /** Optional override for tests; defaults to `os.homedir()`. */
+  home?: string;
+}): string {
+  const home = opts.home ?? homedir();
+  const piConfigDir = join(home, ".pi");
+  const isUnderPi = (p: string | undefined): boolean => {
+    if (!p) return true;
+    if (p === piConfigDir) return true;
+    // Match both POSIX (/) and Windows (\) child-of relations.
+    return p.startsWith(piConfigDir + "/") || p.startsWith(piConfigDir + "\\");
+  };
+  const candidates = [
+    opts.env.PI_WORKSPACE_DIR,
+    opts.env.PI_PROJECT_DIR,
+    opts.pwd,
+    opts.cwd,
+  ];
+  for (const c of candidates) {
+    if (c && !isUnderPi(c)) return c;
+  }
+  return home;
+}
+
 // ── Extension entry point ────────────────────────────────
 
 /** Pi extension default export. Called once by Pi runtime with the extension API. */
 export default function piExtension(pi: any): void {
   const buildDir = dirname(fileURLToPath(import.meta.url));
-  const pluginRoot = resolve(buildDir, "..");
-  const projectDir = process.env.PI_PROJECT_DIR || process.cwd();
+  const pluginRoot = resolve(buildDir, "..", "..", "..");
+  // Issue #545 — Pi workspace resolver. PI_CONFIG_DIR is Pi's CONFIG dir
+  // (~/.pi), NOT the user's workspace; using it as the project anchor
+  // collapsed every Pi session into a single phantom workspace. The
+  // dedicated resolver picks PI_WORKSPACE_DIR > PI_PROJECT_DIR > PWD > cwd
+  // and refuses to return any path under ~/.pi/.
+  const projectDir = resolvePiWorkspaceDir({
+    env: process.env,
+    pwd: process.env.PWD,
+    cwd: process.cwd(),
+  });
 
   const db = getOrCreateDB();
 
   // ── 1. session_start — Initialize session ──────────────
 
-  pi.on("session_start", (ctx: any) => {
+  pi.on("session_start", (_event: any, ctx: any) => {
     try {
       _sessionId = deriveSessionId(ctx ?? {});
       db.ensureSession(_sessionId, projectDir);
@@ -302,6 +439,19 @@ export default function piExtension(pi: any): void {
 
   pi.on("before_agent_start", async (event: any) => {
     try {
+      // Block first agent start until the MCP bridge bootstrap has
+      // settled so the LLM call dispatched right after this handler
+      // sees the ctx_* tools in Pi's registry. Each subagent starts
+      // a fresh `pi --mode json -p --no-session` process whose only
+      // window to register tools is the gap between piExtension(pi)
+      // returning and the first before_agent_start firing — that gap
+      // is too small for the spawn → initialize → tools/list →
+      // pi.registerTool round-trip, so without this await the first
+      // (and often only) prompt of a subagent goes out with an empty
+      // ctx_* registry and the routing block becomes dead weight.
+      // Resolves on bootstrap failure too — the bridge is best-effort.
+      await _mcpBridgeReady;
+
       if (!_sessionId) return;
 
       const prompt = String(event?.prompt ?? "");
@@ -318,16 +468,13 @@ export default function piExtension(pi: any): void {
       const parts: string[] = [];
       if (existingPrompt) parts.push(existingPrompt);
 
-      // Pi-1: Inject routing block once per session (gated by _routingInjected).
-      // v1.0.107 — visible marker so Pi users can verify the routing block
-      // reached the model (Mickey-class verification path; mirrors OpenCode).
-      if (!_routingInjected.has(_sessionId)) {
-        const routingBlock = await getRoutingBlock(pluginRoot);
-        if (routingBlock) {
-          const marker = `<!-- context-mode: routing block injected (sessionID=${String(_sessionId).slice(0, 8)}) -->`;
-          parts.push(marker + "\n" + routingBlock);
-          _routingInjected.add(_sessionId);
-        }
+      // Pi-1: Inject routing block every turn.
+      // Unlike Claude Code where the SessionStart hook injects once into a persistent
+      // context, Pi rebuilds the system prompt fresh on every before_agent_start call.
+      // The routing block must be re-injected each turn or it disappears after turn 1.
+      const routingBlock = await getRoutingBlock(pluginRoot);
+      if (routingBlock) {
+        parts.push(routingBlock);
       }
 
       // Pi-3 + Pi-4: Always build active_memory (not just post-compact),
@@ -454,16 +601,38 @@ export default function piExtension(pi: any): void {
 
   // ── 7. session_shutdown — Cleanup old sessions ─────────
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", async () => {
     try {
       if (_db) {
         _db.cleanupOldSessions(7);
       }
       _db = null;
-      _routingInjected.clear();
       _sessionId = "";
     } catch {
       // best effort — never throw during shutdown
+    }
+    // Race fix (#472 round-3): if shutdown fires while bridge bootstrap
+    // is still in flight, _mcpBridge is null at this point and the
+    // freshly-spawned MCP child gets orphaned once bootstrap eventually
+    // resolves. Await the bootstrap up to a 2s ceiling so we see the
+    // real handle, then call shutdown() on it. The ceiling prevents a
+    // hung bootstrap (e.g. broken bundle) from blocking session exit.
+    try {
+      await Promise.race([
+        _mcpBridgeReady,
+        new Promise<void>((r) => setTimeout(r, 2000).unref()),
+      ]);
+    } catch {
+      // _mcpBridgeReady never rejects (best-effort), but defensively
+      // swallow anyway so shutdown never throws.
+    }
+    if (_mcpBridge) {
+      try {
+        _mcpBridge.shutdown();
+      } catch {
+        // best effort — never throw during shutdown
+      }
+      _mcpBridge = null;
     }
   });
 
@@ -517,4 +686,53 @@ export default function piExtension(pi: any): void {
       return handleCommandText(text, ctx);
     },
   });
+
+  // ── 9. MCP tool bridge (#426) ───────────────────────────
+  //
+  // Pi 0.73.x has no native MCP support. Without bridging here, the
+  // routing block tells the LLM to call ctx_execute / ctx_search / etc.
+  // but those tools never appear in Pi's tool list and the LLM cannot
+  // reach them — context-mode becomes a pure cost (~2.5K tokens of
+  // system-prompt overhead, 0 actual ctx_* calls).
+  //
+  // Spawn server.bundle.mjs as a long-lived MCP child and register
+  // each of its tools via pi.registerTool() so they enter the Pi
+  // tool list under their bare names — same names the routing block
+  // emits for the Pi platform (per hooks/core/tool-naming.mjs).
+  //
+  // Best-effort: a missing bundle or a spawn failure must NOT prevent
+  // the rest of the extension (session capture, hooks, slash commands)
+  // from initializing. We log to stderr and continue.
+  // Short-circuit guard (#534): skip the MCP bridge bootstrap for
+  // `pi --help` / `pi --version` / `pi help` and similar. Pi prints and
+  // exits within milliseconds, but the bridge child would otherwise live
+  // long enough to be reparented to PID 1, half-close stdin, and pin a CPU
+  // core via the MCP SDK's stdio loop. We use process.argv directly so the
+  // guard works for any caller that boots Pi with a short-circuit token,
+  // regardless of how the runtime wires its CLI parser.
+  const piArgv = process.argv.slice(2);
+  if (isPiShortCircuitArgv(piArgv)) {
+    _mcpBridgeReady = Promise.resolve();
+    return;
+  }
+
+  const serverBundle = resolve(pluginRoot, "server.bundle.mjs");
+  if (existsSync(serverBundle)) {
+    _mcpBridgeReady = bootstrapMCPTools(pi, serverBundle).then(
+      (handle) => {
+        _mcpBridge = handle;
+      },
+      (err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(
+          `[context-mode] WARNING: failed to bridge MCP tools to Pi (${msg}). ` +
+            `ctx_* tools will not be callable from this session.\n`,
+        );
+      },
+    );
+  } else {
+    // No bundle on disk → nothing to await. Tests can still rely on
+    // _mcpBridgeReady being a settled promise.
+    _mcpBridgeReady = Promise.resolve();
+  }
 }

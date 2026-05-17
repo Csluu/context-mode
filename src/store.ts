@@ -11,7 +11,7 @@
 import type { Database as DatabaseInstance } from "better-sqlite3";
 import { loadDatabase, applyWALPragmas, closeDB, cleanOrphanedWALFiles, withRetry, deleteDBFiles, isSQLiteCorruptionError } from "./db-base.js";
 import type { PreparedStatement } from "./db-base.js";
-import { readFileSync, readdirSync, unlinkSync, existsSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, unlinkSync, existsSync, statSync, openSync, fstatSync, closeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -331,6 +331,13 @@ function findMinSpan(positionLists: number[][]): number {
 export class ContentStore {
   #db: DatabaseInstance;
   #dbPath: string;
+  // Optional deny-policy callback. When set (by server.ts at startup),
+  // #refreshStaleSources consults it before re-reading file_path during
+  // auto-refresh. This catches policy edits between initial indexing and
+  // a later search: a file that was allowed at index time may have been
+  // added to the Read deny list afterwards. Without this hook, refresh
+  // would re-read and re-expose the file. See #442 round-3.
+  #denyChecker?: (filePath: string) => boolean;
 
   // ── Cached Prepared Statements ──
   // Prepared once at construction, reused on every call to avoid
@@ -782,14 +789,32 @@ export class ContentStore {
     );
   }
 
+  // ── Deny Policy Hook ──
+
+  /**
+   * Register a deny-policy checker. When set, #refreshStaleSources
+   * calls it before re-reading any file_path during auto-refresh.
+   * Returning `true` causes the source to be skipped (kept in cache,
+   * not re-indexed). server.ts wires this to the Read deny patterns.
+   */
+  setDenyChecker(fn: ((filePath: string) => boolean) | undefined): void {
+    this.#denyChecker = fn;
+  }
+
   // ── Index ──
 
   index(options: {
     content?: string;
     path?: string;
     source?: string;
+    /**
+     * Optional FK metadata recorded on each indexed chunk so per-session
+     * honest-savings stats can join chunks → session_events. When omitted,
+     * chunks fall back to empty-string columns (legacy behaviour).
+     */
+    attribution?: { sessionId?: string; eventId?: string };
   }): IndexResult {
-    const { content, path, source } = options;
+    const { content, path, source, attribution } = options;
 
     // Treat empty string as "no content" so an empty `content` paired with a
     // valid `path` falls back to reading the file. Some MCP clients
@@ -802,7 +827,29 @@ export class ContentStore {
       throw new Error("Either content or path must be provided");
     }
 
-    const text = hasContent ? content! : readFileSync(path!, "utf-8");
+    // Read file via fd to close the TOCTOU window between the security
+    // gate (security.ts evaluateFilePath calls realpathSync) and the read
+    // here. Lexical re-read by path string allowed an attacker to swap a
+    // symlink to a denied target (e.g. ~/.ssh/id_rsa) AFTER gate passed.
+    // openSync + fstat + readFileSync(fd) binds the read to the inode
+    // captured at gate-time. fstat also rejects non-regular files
+    // (directories, character devices) which would otherwise read as ""
+    // or throw inconsistently. See #442 round-3.
+    let text: string;
+    if (hasContent) {
+      text = content!;
+    } else {
+      const fd = openSync(path!, "r");
+      try {
+        const st = fstatSync(fd);
+        if (!st.isFile()) {
+          throw new Error(`refusing to index ${path}: not a regular file`);
+        }
+        text = readFileSync(fd, "utf-8");
+      } finally {
+        closeSync(fd);
+      }
+    }
     const label = source ?? path ?? "untitled";
     const chunks = this.#chunkMarkdown(text);
 
@@ -810,7 +857,7 @@ export class ContentStore {
     const filePath = path ?? undefined;
     const contentHash = filePath ? createHash("sha256").update(text).digest("hex") : undefined;
 
-    return withRetry(() => this.#insertChunks(chunks, label, text, filePath, contentHash));
+    return withRetry(() => this.#insertChunks(chunks, label, text, filePath, contentHash, attribution));
   }
 
   // ── Index Plain Text ──
@@ -824,9 +871,10 @@ export class ContentStore {
     content: string,
     source: string,
     linesPerChunk: number = 20,
+    attribution?: { sessionId?: string; eventId?: string },
   ): IndexResult {
     if (!content || content.trim().length === 0) {
-      return this.#insertChunks([], source, "");
+      return this.#insertChunks([], source, "", undefined, undefined, attribution);
     }
 
     const chunks = this.#chunkPlainText(content, linesPerChunk);
@@ -835,6 +883,9 @@ export class ContentStore {
       chunks.map((c) => ({ ...c, hasCode: false })),
       source,
       content,
+      undefined,
+      undefined,
+      attribution,
     ));
   }
 
@@ -851,26 +902,27 @@ export class ContentStore {
     content: string,
     source: string,
     maxChunkBytes: number = MAX_CHUNK_BYTES,
+    attribution?: { sessionId?: string; eventId?: string },
   ): IndexResult {
     if (!content || content.trim().length === 0) {
-      return this.indexPlainText("", source);
+      return this.indexPlainText("", source, undefined, attribution);
     }
 
     let parsed: unknown;
     try {
       parsed = JSON.parse(content);
     } catch {
-      return this.indexPlainText(content, source);
+      return this.indexPlainText(content, source, undefined, attribution);
     }
 
     const chunks: Chunk[] = [];
     this.#walkJSON(parsed, [], chunks, maxChunkBytes);
 
     if (chunks.length === 0) {
-      return this.indexPlainText(content, source);
+      return this.indexPlainText(content, source, undefined, attribution);
     }
 
-    return withRetry(() => this.#insertChunks(chunks, source, content));
+    return withRetry(() => this.#insertChunks(chunks, source, content, undefined, undefined, attribution));
   }
 
   // ── Shared DB Insertion ──
@@ -880,8 +932,19 @@ export class ContentStore {
    * into both FTS5 tables within a transaction and extracts vocabulary.
    * Uses cached prepared statements from #prepareStatements().
    */
-  #insertChunks(chunks: Chunk[], label: string, text: string, filePath?: string, contentHash?: string): IndexResult {
+  #insertChunks(
+    chunks: Chunk[],
+    label: string,
+    text: string,
+    filePath?: string,
+    contentHash?: string,
+    attribution?: { sessionId?: string; eventId?: string },
+  ): IndexResult {
     const codeChunks = chunks.filter((c) => c.hasCode).length;
+    // FK columns on chunks. Empty-string fallback preserves the FTS5-friendly
+    // "not-null but unattributed" sentinel used by legacy rows.
+    const sessionIdCol = attribution?.sessionId ?? "";
+    const eventIdCol = attribution?.eventId ?? "";
 
     // Atomic dedup + insert: delete previous source with same label,
     // then insert new content — all within a single transaction.
@@ -900,10 +963,23 @@ export class ContentStore {
       const sourceId = Number(info.lastInsertRowid);
 
       const now = new Date().toISOString();
+      // Trigram opt-in policy: code chunks always indexed (substring/identifier
+      // search is the trigram raison d'être); prose skipped because BM25 porter
+      // alone handles prose recall well. Saves ~40% DB size + ~30% insert time
+      // on prose-heavy workloads (web fetches, log indexing). Force full
+      // indexing via CONTEXT_MODE_TRIGRAM=all (back-compat). Disable trigram
+      // entirely with CONTEXT_MODE_TRIGRAM=off.
+      const trigramMode = process.env.CONTEXT_MODE_TRIGRAM ?? "code-only";
       for (const chunk of chunks) {
         const ct = chunk.hasCode ? "code" : "prose";
-        this.#stmtInsertChunk.run(chunk.title, chunk.content, sourceId, ct, null, null, null, now);
-        this.#stmtInsertChunkTrigram.run(chunk.title, chunk.content, sourceId, ct, null, null, null, now);
+        this.#stmtInsertChunk.run(chunk.title, chunk.content, sourceId, ct, null, sessionIdCol, eventIdCol, now);
+        const indexTrigram =
+          trigramMode === "all" ? true
+          : trigramMode === "off" ? false
+          : ct === "code";
+        if (indexTrigram) {
+          this.#stmtInsertChunkTrigram.run(chunk.title, chunk.content, sourceId, ct, null, sessionIdCol, eventIdCol, now);
+        }
       }
 
       return sourceId;
@@ -1222,17 +1298,36 @@ export class ContentStore {
     for (const src of sources) {
       try {
         if (!existsSync(src.file_path)) continue; // file deleted — keep cached results
+        // Re-check deny policy before re-reading. The Read deny list may
+        // have been edited after this source was originally indexed; a
+        // file that was allowed then may now be denied. Without this
+        // gate, refresh would happily re-read and re-expose it. #442 r3.
+        if (this.#denyChecker && this.#denyChecker(src.file_path)) continue;
         const mtime = statSync(src.file_path).mtime;
         const indexedAt = new Date(src.indexed_at + "Z");
         if (mtime <= indexedAt) continue; // file unchanged — fast path
 
-        // mtime advanced — check hash to confirm real change (not just touch)
-        const newContent = readFileSync(src.file_path, "utf-8");
+        // mtime advanced — fd-bound read for hash + indexing in one go.
+        // Open once, fstat, read from fd. Closes the swap-mid-flight
+        // window between hash read and re-index. #442 round-3.
+        const fd = openSync(src.file_path, "r");
+        let newContent: string;
+        try {
+          const st = fstatSync(fd);
+          if (!st.isFile()) continue; // skip non-regular targets
+          newContent = readFileSync(fd, "utf-8");
+        } finally {
+          closeSync(fd);
+        }
         const newHash = createHash("sha256").update(newContent).digest("hex");
         if (newHash === src.content_hash) continue; // content identical — skip
 
-        // File genuinely changed — re-index
-        this.index({ path: src.file_path, source: src.label });
+        // File genuinely changed — re-index using already-read content
+        // (avoids a second open/read race) but preserve file_path/hash
+        // by going through index() which stores them. Since we pass
+        // content, index() does NOT re-read; the bytes hashed above
+        // are exactly the bytes indexed.
+        this.index({ content: newContent, path: src.file_path, source: src.label });
         this.lastRefreshCount++;
       } catch {
         // Graceful degradation — never break search for stale detection

@@ -14,7 +14,7 @@
 
 import * as p from "@clack/prompts";
 import color from "picocolors";
-import { execFileSync, execFile as nodeExecFile } from "node:child_process";
+import { execFileSync, execSync, execFile as nodeExecFile, type ExecSyncOptions } from "node:child_process";
 import { readFileSync, writeFileSync, cpSync, accessSync, existsSync, readdirSync, rmSync, closeSync, openSync, chmodSync, mkdirSync, constants } from "node:fs";
 import { request as httpsRequest } from "node:https";
 import { resolve, dirname, join } from "node:path";
@@ -26,10 +26,35 @@ import {
   hasBunRuntime,
   getAvailableLanguages,
 } from "./runtime.js";
+import { getHookScriptPaths } from "./util/hook-config.js";
+import { resolveClaudeConfigDir } from "./util/claude-config.js";
+// v1.0.128 — Issue #559 sibling MCP kill helpers (see PR-559-560-FIX-DESIGN.md).
+import { discoverSiblingMcpPids, killSiblingMcpServers } from "./util/sibling-mcp.js";
+// v1.0.119 — Issue #523 Layer 5 heal: post-bump assertion on .claude-plugin/plugin.json
+// mcpServers args. Single source of truth shared with start.mjs HEAL block + postinstall.
+// @ts-expect-error — JS module, no TS declarations
+import { healPluginJsonMcpServers, healMcpJsonArgs } from "../scripts/heal-installed-plugins.mjs";
+// @ts-expect-error — JS module, no TS declarations
+import { detectWindowsVsYear } from "../scripts/heal-better-sqlite3.mjs";
+// Private 16-LOC copy of browserOpenArgv. Canonical version lives in src/server.ts;
+// duplicated here so the cli bundle does not pull server.ts top-level boot side effects.
+// Keep in sync — pure data, no I/O.
+function browserOpenArgv(
+  url: string,
+  platform: NodeJS.Platform,
+): readonly { cmd: string; args: readonly string[] }[] {
+  if (platform === "darwin") return [{ cmd: "open", args: [url] }];
+  if (platform === "win32") {
+    return [{ cmd: "cmd", args: ["/c", "start", "", url] }];
+  }
+  return [
+    { cmd: "xdg-open", args: [url] },
+    { cmd: "sensible-browser", args: [url] },
+  ];
+}
 
 // ── Adapter imports ──────────────────────────────────────
 import { detectPlatform, getAdapter } from "./adapters/detect.js";
-import type { HookAdapter } from "./adapters/types.js";
 
 /* -------------------------------------------------------
  * Hook dispatcher — `context-mode hook <platform> <event>`
@@ -65,6 +90,7 @@ const HOOK_MAP: Record<string, Record<string, string>> = {
   "codex": {
     pretooluse: "hooks/codex/pretooluse.mjs",
     posttooluse: "hooks/codex/posttooluse.mjs",
+    precompact: "hooks/codex/precompact.mjs",
     sessionstart: "hooks/codex/sessionstart.mjs",
     userpromptsubmit: "hooks/codex/userpromptsubmit.mjs",
     stop: "hooks/codex/stop.mjs",
@@ -117,7 +143,21 @@ const args = process.argv.slice(2);
 if (args[0] === "doctor") {
   doctor().then((code) => process.exit(code));
 } else if (args[0] === "upgrade") {
-  upgrade();
+  // Issue #542 — accept --platform <id> from the ctx_upgrade MCP handler,
+  // which forwards the live MCP clientInfo's resolved PlatformId. The flag
+  // wins over upgrade()'s own detectPlatform() heuristic chain so an
+  // ambiguous config-dir collision (e.g. ~/.cursor + ~/.pi both present)
+  // can never misroute the upgrade.
+  const platformFlagIdx = args.indexOf("--platform");
+  const platformArg =
+    platformFlagIdx >= 0 && args[platformFlagIdx + 1]
+      ? args[platformFlagIdx + 1]
+      : undefined;
+  upgrade(platformArg ? { platform: platformArg } : undefined).catch((err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err);
+    p.log.error(color.red(message));
+    process.exit(1);
+  });
 } else if (args[0] === "hook") {
   hookDispatch(args[1], args[2]);
 } else if (args[0] === "insight") {
@@ -156,11 +196,16 @@ export function npmExecFile(args: string[], opts: Record<string, unknown> = {}):
 }
 
 export function npmExec(command: string, opts: Record<string, unknown> = {}): void {
-  const { execSync: es } = require("node:child_process");
-  es(isWin ? command.replace(/^npm /, "npm.cmd ") : command, {
+  // Issue #511: use top-level static import (line 17) — never inline `require("node:...")`
+  // in ESM-bundled sources. esbuild rewrites them to a `__require` shim that throws
+  // `Dynamic require of "node:child_process" is not supported` under Node ESM/Bun.
+  // Cast preserves the prior `require()`-as-`any` shape; `shell: true` is the documented
+  // Node behavior even though @types/node typed `shell` as `string | undefined`.
+  const execOpts = {
     ...opts,
     ...(isWin ? { shell: true } : {}),
-  });
+  } as unknown as ExecSyncOptions;
+  execSync(isWin ? command.replace(/^npm /, "npm.cmd ") : command, execOpts);
 }
 
 /**
@@ -191,28 +236,18 @@ export function openInBrowser(
   const hint = () =>
     console.error(`\nCould not auto-open browser. Open manually: ${url}`);
 
-  try {
-    if (platform === "darwin") {
-      runner("open", [url], opts);
-    } else if (platform === "win32") {
-      // `start` is a cmd.exe builtin; first arg after `start` is the
-      // window title — pass empty so the URL isn't consumed as a title.
-      runner("cmd", ["/c", "start", "", url], opts);
-    } else {
-      // linux/bsd: try xdg-open, fall back to sensible-browser.
-      try {
-        runner("xdg-open", [url], opts);
-      } catch {
-        try {
-          runner("sensible-browser", [url], opts);
-        } catch {
-          hint();
-        }
-      }
-    }
-  } catch {
-    hint();
+  // Platform→argv mapping is canonical in src/server.ts; mirrored privately
+  // above to avoid pulling server boot side effects into the cli bundle.
+  const attempts = browserOpenArgv(url, platform);
+  let opened = false;
+  for (const { cmd, args } of attempts) {
+    try {
+      runner(cmd, args as string[], opts);
+      opened = true;
+      break;
+    } catch { /* try next fallback */ }
   }
+  if (!opened) hint();
 }
 
 function defaultPluginRoot(): string {
@@ -323,6 +358,41 @@ async function doctor(): Promise<number> {
   // Runtime check
   p.note(getRuntimeSummary(runtimes), "Runtimes");
 
+  // ── Issue #564 — Linux + Node < 22.5 + no Bun is unsafe ────────────
+  // V8's madvise(MADV_DONTNEED) can corrupt better-sqlite3's native addon
+  // `.got.plt` on Linux, causing sporadic SIGSEGV (1-4/hour). The 22.5
+  // gate (`hasModernSqlite()` in src/db-base.ts:226-244) is the contract:
+  // at or above it we use node:sqlite (built-in, no native addon, no
+  // .got.plt to corrupt); below it we fall through to better-sqlite3
+  // which WILL crash. engines.node + a hard-fail postinstall guard this
+  // at install time, but doctor() surfaces it for already-installed users
+  // (and for adapters whose MCP host swallows stderr during install).
+  // Refs:
+  //   - https://github.com/nodejs/node/issues/62515
+  //   - https://github.com/mksglu/context-mode/issues/564
+  {
+    const { hasModernSqlite } = await import("./db-base.js");
+    if (
+      process.platform === "linux" &&
+      !hasModernSqlite() &&
+      !hasBunRuntime()
+    ) {
+      criticalFails++;
+      p.log.error(
+        color.red("Node version: FAIL") +
+          ` — Linux + Node ${process.versions.node} is unsafe (SIGSEGV)` +
+          color.dim(
+            "\n  context-mode requires Node.js >= 22.5 (or Bun) on Linux to avoid the" +
+            "\n  V8 madvise(MADV_DONTNEED) SIGSEGV in better-sqlite3 (1-4/hour)." +
+            "\n  Refs: https://github.com/nodejs/node/issues/62515" +
+            "\n        https://github.com/mksglu/context-mode/issues/564" +
+            "\n  Fix:  nvm install 22.5 && nvm use 22.5 && npm install -g context-mode" +
+            "\n  Or:   curl -fsSL https://bun.sh/install | bash && bun add -g context-mode",
+          ),
+      );
+    }
+  }
+
   // Speed tier
   if (hasBunRuntime()) {
     p.log.success(
@@ -390,6 +460,12 @@ async function doctor(): Promise<number> {
   for (const result of hookResults) {
     if (result.status === "pass") {
       p.log.success(color.green(`${result.check}: PASS`) + ` — ${result.message}`);
+    } else if (result.status === "warn") {
+      p.log.warn(
+        color.yellow(`${result.check}: WARN`) +
+          ` — ${result.message}` +
+          (result.fix ? color.dim(`\n  Run: ${result.fix}`) : ""),
+      );
     } else {
       p.log.error(
         color.red(`${result.check}: FAIL`) +
@@ -399,17 +475,51 @@ async function doctor(): Promise<number> {
     }
   }
 
-  // Hook script exists
-  p.log.step("Checking hook script...");
-  const hookScriptPath = resolve(pluginRoot, "hooks", "pretooluse.mjs");
-  try {
-    accessSync(hookScriptPath, constants.R_OK);
-    p.log.success(color.green("Hook script exists: PASS") + color.dim(` — ${hookScriptPath}`));
-  } catch {
-    p.log.error(
-      color.red("Hook script exists: FAIL") +
-        color.dim(` — not found at ${hookScriptPath}`),
-    );
+  // Hook scripts exist — Algo-D1 protocol path takes precedence.
+  // Adapters that override `getHealthChecks` (claude-code today) get a
+  // direct `existsSync(join(pluginRoot, "hooks", scriptName))` per
+  // HOOK_SCRIPTS entry — no regex round-trip on a hook command, so the
+  // #548 doubled-path FAIL class can't surface. Adapters that don't
+  // override fall through to the legacy `getHookScriptPaths` flow which
+  // generates the hook config and parses each command via
+  // `extractHookScriptPath`. Post-D3 every adapter emits buildNodeCommand-
+  // shape, so the legacy flow is also safe — but the direct existsSync
+  // path is strictly preferable when the adapter offers it.
+  p.log.step("Checking hook scripts...");
+  const adapterHealthChecks = adapter.getHealthChecks?.(pluginRoot) ?? [];
+  if (adapterHealthChecks.length > 0) {
+    for (const hc of adapterHealthChecks) {
+      const result = hc.check();
+      if (result.status === "OK") {
+        p.log.success(
+          color.green(`${hc.name}: PASS`) +
+            (result.detail ? color.dim(` — ${result.detail}`) : ""),
+        );
+      } else {
+        p.log.error(
+          color.red(`${hc.name}: FAIL`) +
+            (result.detail ? color.dim(` — ${result.detail}`) : ""),
+        );
+      }
+    }
+  } else {
+    const hookScriptPaths = getHookScriptPaths(adapter, pluginRoot);
+    if (hookScriptPaths.length === 0) {
+      p.log.success(color.green("Hook scripts: PASS") + color.dim(" — no direct .mjs script paths to verify"));
+    } else {
+      for (const scriptPath of hookScriptPaths) {
+        const absolutePath = resolve(pluginRoot, scriptPath);
+        try {
+          accessSync(absolutePath, constants.R_OK);
+          p.log.success(color.green("Hook script exists: PASS") + color.dim(` — ${absolutePath}`));
+        } catch {
+          p.log.error(
+            color.red("Hook script exists: FAIL") +
+              color.dim(` — not found at ${absolutePath}`),
+          );
+        }
+      }
+    }
   }
 
   // Plugin registration — adapter-aware
@@ -441,15 +551,61 @@ async function doctor(): Promise<number> {
     }
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    if (message.includes("Cannot find module") || message.includes("MODULE_NOT_FOUND")) {
-      p.log.warn(color.yellow("FTS5 / better-sqlite3: SKIP") + color.dim(" — module not available (restart session after upgrade)"));
-    } else {
+    // Distinguish package-missing from binding-missing (#514). Both
+    // throw with similar shapes from `import("better-sqlite3")` but the
+    // recovery commands differ:
+    //   - package-missing → `npm install better-sqlite3 --no-optional`
+    //     (npm@7+ silently drops optionalDependencies on engine
+    //     mismatch, e.g. Node 26 vs better-sqlite3@12.x — we name the
+    //     package explicitly + flip the optional filter to recover)
+    //   - binding-missing → `npm rebuild better-sqlite3` (#408 flow,
+    //     Windows + missing prebuild-install shim)
+    const pluginRootForDoctor = getPluginRoot();
+    const bsqPackageDir = resolve(pluginRootForDoctor, "node_modules", "better-sqlite3");
+    const packageMissing = !existsSync(bsqPackageDir);
+
+    if (packageMissing) {
       criticalFails++;
       p.log.error(
         color.red("FTS5 / better-sqlite3: FAIL") +
-          ` — ${message}` +
-          color.dim("\n  Try: npm rebuild better-sqlite3"),
+          color.dim(" — package-missing") +
+          color.dim(
+            `\n  Path: ${bsqPackageDir}` +
+            "\n  Root cause: npm silently skipped better-sqlite3 because the package's `engines` field excluded the running Node (issue #514, e.g. Node 26 vs better-sqlite3@12.x)." +
+            `\n  Try (primary): cd "${pluginRootForDoctor}" && npm install better-sqlite3 --no-optional` +
+            "\n  Try (fallback): /context-mode:ctx-upgrade",
+          ),
       );
+    } else if (message.includes("Cannot find module") || message.includes("MODULE_NOT_FOUND")) {
+      p.log.warn(color.yellow("FTS5 / better-sqlite3: SKIP") + color.dim(" — module not available (restart session after upgrade)"));
+    } else {
+      criticalFails++;
+      // Detect better-sqlite3 native bindings-missing pattern (issue #408).
+      // The `bindings` package throws "Could not locate the bindings file"
+      // when better_sqlite3.node failed to install — typical on Windows
+      // when prebuild-install was not on PATH so install fell through to
+      // node-gyp without an MSVC toolchain.
+      const isBindingsMissing =
+        /Could not locate the bindings file/i.test(message) ||
+        /bindings\.node/i.test(message) ||
+        /\bbindings\b/i.test(message);
+      if (isBindingsMissing && process.platform === "win32") {
+        p.log.error(
+          color.red("FTS5 / better-sqlite3: FAIL") +
+            ` — ${message}` +
+            color.dim(
+              "\n  Root cause: prebuild-install was likely not on PATH, so install fell through to node-gyp without an MSVC toolchain (Windows)." +
+              "\n  Try (primary): npm install better-sqlite3   # re-resolves the dep tree and re-links the prebuild-install bin shim to fetch a prebuilt binary" +
+              "\n  Try (fallback): npm rebuild better-sqlite3",
+            ),
+        );
+      } else {
+        p.log.error(
+          color.red("FTS5 / better-sqlite3: FAIL") +
+            ` — ${message}` +
+            color.dim("\n  Try: npm rebuild better-sqlite3"),
+        );
+      }
     }
   }
 
@@ -626,11 +782,18 @@ async function insight(port: number) {
  * Upgrade — adapter-aware hook configuration
  * ------------------------------------------------------- */
 
-async function upgrade() {
+async function upgrade(opts?: { platform?: string }) {
   if (process.stdout.isTTY) console.clear();
 
-  // Detect platform
-  const detection = detectPlatform();
+  // Issue #542 — when the MCP ctx_upgrade handler threads through an
+  // explicit --platform <id> (resolved from live clientInfo), trust it
+  // over the local heuristic chain. detectPlatform() with no args cannot
+  // see the MCP handshake and falls through to the config-dir tier,
+  // which misdetects Pi/OMP installs as Cursor on systems where both
+  // ~/.cursor/ and ~/.pi/ exist.
+  const detection = opts?.platform
+    ? { platform: opts.platform as Parameters<typeof getAdapter>[0], confidence: "high" as const, reason: `--platform ${opts.platform} from ctx_upgrade handler` }
+    : detectPlatform();
   const adapter = await getAdapter(detection.platform);
 
   p.intro(color.bgCyan(color.black(" context-mode upgrade ")));
@@ -642,6 +805,48 @@ async function upgrade() {
   let pluginRoot = getPluginRoot();
   const changes: string[] = [];
   const s = p.spinner();
+
+  // Step 0: Sync the marketplace clone (#418).
+  // Claude Code reads plugin metadata from ~/.claude/plugins/marketplaces/context-mode/.
+  // Without a git pull there, the marketplace stays pinned at the install-time
+  // commit and CC keeps reporting the old version even after our cache dir is
+  // updated — users then see "ctx-upgrade succeeded" but nothing actually
+  // changed at the plugin-system level.
+  // Issue #460 round-3: route through resolveClaudeConfigDir so users who
+  // relocate their CC config root keep the marketplace clone in the same tree.
+  const marketplaceDir = resolve(resolveClaudeConfigDir(), "plugins", "marketplaces", "context-mode");
+  if (existsSync(join(marketplaceDir, ".git"))) {
+    s.start("Syncing marketplace clone");
+    try {
+      // Preserve user dev edits (Mert-class users symlink the clone to a worktree).
+      const statusOut = execFileSync(
+        "git", ["-C", marketplaceDir, "status", "--porcelain"],
+        { stdio: "pipe", encoding: "utf-8", timeout: 5000 },
+      );
+      if (statusOut.trim()) {
+        s.stop(color.yellow("Marketplace clone has local edits — skipping git pull"));
+        p.log.info(
+          color.dim(`  Run manually: git -C "${marketplaceDir}" stash && git pull --ff-only`),
+        );
+      } else {
+        execFileSync(
+          "git", ["-C", marketplaceDir, "fetch", "--tags", "origin"],
+          { stdio: "pipe", timeout: 30000 },
+        );
+        execFileSync(
+          "git", ["-C", marketplaceDir, "reset", "--hard", "origin/HEAD"],
+          { stdio: "pipe", timeout: 10000 },
+        );
+        s.stop(color.green("Marketplace clone synced"));
+        changes.push("Marketplace clone updated to upstream");
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      s.stop(color.yellow("Marketplace sync skipped"));
+      p.log.warn(color.yellow("git refresh on marketplace failed") + ` — ${message}`);
+      p.log.info(color.dim("  Continuing — cache dir update will still happen."));
+    }
+  }
 
   // Step 1: Pull latest from GitHub
   p.log.step("Pulling latest from GitHub...");
@@ -665,147 +870,404 @@ async function upgrade() {
     if (newVersion === localVersion) {
       p.log.success(color.green("Already on latest") + ` — v${localVersion}`);
       rmSync(tmpDir, { recursive: true, force: true });
-      return;
     } else {
       p.log.info(
         `Update available: ${color.yellow("v" + localVersion)} → ${color.green("v" + newVersion)}`,
       );
-    }
 
-    // Step 2: Install dependencies + build
-    s.start("Installing dependencies & building");
-    npmExecFile(["install", "--no-audit", "--no-fund"], {
-      cwd: srcDir,
-      stdio: "pipe",
-      timeout: 120000,
-    });
-    npmExecFile(["run", "build"], {
-      cwd: srcDir,
-      stdio: "pipe",
-      timeout: 60000,
-    });
-    s.stop("Built successfully");
-
-    // Step 3: Update in-place
-    s.start("Updating files in-place");
-
-    // Old version dirs are cleaned lazily by sessionstart.mjs (age-gated >1h)
-    // to avoid breaking active sessions that still reference them (#181).
-
-    // Read files list from cloned repo's package.json so new directories
-    // (like insight/) are automatically included without chicken-and-egg issues
-    // where the old CLI doesn't know about new directories.
-    const clonedPkg = JSON.parse(readFileSync(resolve(srcDir, "package.json"), "utf-8"));
-    const items = [
-      ...(clonedPkg.files || []),
-      "src", "package.json",
-    ];
-    for (const item of items) {
+      // v1.0.128 — Issue #559: terminate sibling MCP servers BEFORE installing
+      // new files. Historically /ctx-upgrade rsynced new code over the old
+      // tree but never signalled the running MCP server, so the previous
+      // version stayed alive holding stdio + DB handles. Across enough
+      // upgrades users observed 5+ context-mode start.mjs processes pinned
+      // to RAM. Discovery + kill must happen before npm install to avoid
+      // racing against the EXCLUSIVE lock the new server claims on first
+      // ctx_search (see #560 fix). Wrapped in try/catch so a missing pgrep
+      // (stripped Linux distro) or unavailable PowerShell (weird Windows)
+      // can never block the upgrade itself.
       try {
-        rmSync(resolve(pluginRoot, item), { recursive: true, force: true });
-        cpSync(resolve(srcDir, item), resolve(pluginRoot, item), { recursive: true });
-      } catch { /* some files may not exist in source */ }
-    }
-
-    // Write .mcp.json with resolved absolute path (fixes #132)
-    const mcpConfig = {
-      mcpServers: {
-        "context-mode": {
-          command: "node",
-          args: [resolve(pluginRoot, "start.mjs")],
-        },
-      },
-    };
-    writeFileSync(
-      resolve(pluginRoot, ".mcp.json"),
-      JSON.stringify(mcpConfig, null, 2) + "\n",
-    );
-
-    s.stop(color.green(`Updated in-place to v${newVersion}`));
-
-    // Fix registry — adapter-aware
-    adapter.updatePluginRegistry(pluginRoot, newVersion);
-    p.log.info(color.dim("  Registry synced to " + pluginRoot));
-
-    // Install production deps
-    s.start("Installing production dependencies");
-    npmExecFile(["install", "--production", "--no-audit", "--no-fund"], {
-      cwd: pluginRoot,
-      stdio: "pipe",
-      timeout: 60000,
-    });
-    s.stop("Dependencies ready");
-
-    if (detection.platform !== 'opencode' && detection.platform !== 'kilo') {
-      // Rebuild native addons for current Node.js ABI (fixes #131)
-      s.start("Rebuilding native addons");
-      try {
-        npmExecFile(["rebuild", "better-sqlite3"], {
-          cwd: pluginRoot,
-          stdio: "pipe",
-          timeout: 60000,
+        const siblingPids = discoverSiblingMcpPids({
+          ownPid: process.pid,
+          ownPpid: process.ppid,
         });
-        s.stop(color.green("Native addons rebuilt"));
-        changes.push("Rebuilt better-sqlite3 for current Node.js");
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        s.stop(color.yellow("Native addon rebuild warning"));
-        p.log.warn(
-          color.yellow("better-sqlite3 rebuild issue") +
-            ` — ${message}` +
-            color.dim(`\n  Try manually: cd "${pluginRoot}" && npm rebuild better-sqlite3`),
+        if (siblingPids.length > 0) {
+          const killReport = await killSiblingMcpServers({ pids: siblingPids });
+          if (killReport.totalKilled > 0) {
+            // Concise summary only — no PIDs in the user-facing log to keep
+            // the line readable. Plural-aware so "1 sibling MCP server" reads
+            // naturally alongside "3 sibling MCP servers".
+            const noun = killReport.totalKilled === 1
+              ? "sibling MCP server"
+              : "sibling MCP servers";
+            p.log.info(
+              color.dim(
+                `Stopped ${killReport.totalKilled} ${noun} (SIGTERM: ${killReport.terminatedBySigterm}, SIGKILL: ${killReport.terminatedBySigkill})`,
+              ),
+            );
+          }
+        }
+      } catch { /* never block upgrade on discovery/kill failure */ }
+
+      // Step 2: Install dependencies + build
+      s.start("Installing dependencies & building");
+      const vsYear = detectWindowsVsYear();
+      npmExecFile(["install", "--no-audit", "--no-fund"], {
+        cwd: srcDir,
+        stdio: "pipe",
+        timeout: 120000,
+        ...(vsYear ? { env: { ...process.env, npm_config_msvs_version: vsYear } } : {}),
+      });
+      npmExecFile(["run", "build"], {
+        cwd: srcDir,
+        stdio: "pipe",
+        timeout: 60000,
+      });
+      s.stop("Built successfully");
+
+      // Step 3: Update in-place
+      s.start("Updating files in-place");
+
+      // Old version dirs are cleaned lazily by sessionstart.mjs (age-gated >1h)
+      // to avoid breaking active sessions that still reference them (#181).
+
+      // Read files list from cloned repo's package.json so new directories
+      // (like insight/) are automatically included without chicken-and-egg issues
+      // where the old CLI doesn't know about new directories.
+      const clonedPkg = JSON.parse(readFileSync(resolve(srcDir, "package.json"), "utf-8"));
+      const items = [
+        ...(clonedPkg.files || []),
+        "src", "package.json",
+      ];
+      for (const item of items) {
+        try {
+          rmSync(resolve(pluginRoot, item), { recursive: true, force: true });
+          cpSync(resolve(srcDir, item), resolve(pluginRoot, item), { recursive: true });
+        } catch { /* some files may not exist in source */ }
+      }
+
+      // Write .mcp.json with CLAUDE_PLUGIN_ROOT placeholder (fixes #411).
+      // Absolute paths bake-in the current pluginRoot dir, which sessionstart.mjs
+      // (#181) deletes after upgrade — breaking MCP server resolution. The literal
+      // ${CLAUDE_PLUGIN_ROOT} placeholder is resolved by Claude at load-time and
+      // stays valid across version cleanups. Matches .claude-plugin/plugin.json.
+      const mcpConfig = {
+        mcpServers: {
+          "context-mode": {
+            command: "node",
+            args: ["${CLAUDE_PLUGIN_ROOT}/start.mjs"],
+          },
+        },
+      };
+      writeFileSync(
+        resolve(pluginRoot, ".mcp.json"),
+        JSON.stringify(mcpConfig, null, 2) + "\n",
+      );
+
+      // Normalize hooks.json + plugin.json against the REAL pluginRoot now that
+      // files have been copied. Two reasons:
+      //   1. If a prior buggy postinstall (or any future regression) baked the
+      //      tmpdir path into hooks.json, this rewrites it to pluginRoot before
+      //      the next hook fires.
+      //   2. Closes the same gap #414 closed for fresh installs — the first
+      //      hook fire after upgrade now works without waiting for MCP boot.
+      try {
+        const mod: { normalizeHooksOnStartup: (opts: { pluginRoot: string; nodePath: string; platform: string }) => void } =
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (await import("../hooks/normalize-hooks.mjs" as any)) as any;
+        mod.normalizeHooksOnStartup({
+          pluginRoot,
+          nodePath: process.execPath,
+          platform: process.platform,
+        });
+      } catch { /* best effort — never block upgrade */ }
+
+      s.stop(color.green(`Updated in-place to v${newVersion}`));
+
+      // v1.0.114 hotfix — pre-flight: verify the in-place copy actually
+      // wrote a plugin.json carrying newVersion BEFORE we tell the
+      // registry that's the install path. If the manifest still reports
+      // the old version (rsync race, partial write, files-array drift),
+      // updating the registry would create the silent v1.0.113-class
+      // drift Mert hit. Bail out — the next /ctx-upgrade gets to retry.
+      const pluginManifest = resolve(pluginRoot, ".claude-plugin", "plugin.json");
+      let onDiskVersion: string | null = null;
+      try {
+        const pj = JSON.parse(readFileSync(pluginManifest, "utf-8"));
+        if (pj && typeof pj.version === "string") onDiskVersion = pj.version;
+      } catch { /* parse error → onDiskVersion stays null */ }
+      if (onDiskVersion !== newVersion) {
+        throw new Error(
+          `pluginRoot manifest version mismatch — disk says "${onDiskVersion ?? "<missing>"}" but newVersion is "${newVersion}". Refusing to bump registry.`,
         );
       }
-    }
-    
-    // Update global npm
-    s.start("Updating npm global package");
-    try {
-      npmExecFile(["install", "-g", pluginRoot, "--no-audit", "--no-fund"], {
-        stdio: "pipe",
-        timeout: 30000,
-      });
-      s.stop(color.green("npm global updated"));
-      changes.push("Updated npm global package");
-    } catch {
-      s.stop(color.yellow("npm global update skipped"));
-      p.log.info(color.dim("  Could not update global npm — may need sudo or standalone install"));
-    }
 
-    // Cleanup
-    rmSync(tmpDir, { recursive: true, force: true });
+      // Fix registry — adapter-aware
+      adapter.updatePluginRegistry(pluginRoot, newVersion);
+      p.log.info(color.dim("  Registry synced to " + pluginRoot));
 
-    // Sync skills to the active install path from installed_plugins.json (#228).
-    // Only targets the ACTUAL directory Claude Code reads from — not spraying everywhere.
-    try {
-      const registryPath = resolve(homedir(), ".claude", "plugins", "installed_plugins.json");
-      if (existsSync(registryPath)) {
-        const registry = JSON.parse(readFileSync(registryPath, "utf-8"));
-        const entries = registry?.plugins?.["context-mode@context-mode"];
-        if (Array.isArray(entries)) {
-          for (const entry of entries) {
-            const installPath = entry.installPath;
-            if (installPath && installPath !== pluginRoot && existsSync(installPath)) {
-              const srcSkills = resolve(srcDir, "skills");
-              if (existsSync(srcSkills)) {
-                cpSync(srcSkills, resolve(installPath, "skills"), { recursive: true });
-                changes.push(`Synced skills to active install path`);
+      // v1.0.114 hotfix — post-write assertion: re-read installed_plugins.json
+      // and verify installPath/.claude-plugin/plugin.json's version matches
+      // the registry entry. Throws on mismatch — fails loudly so a future
+      // adapter regression surfaces here, not weeks later in user reports.
+      try {
+        const ipPath = resolve(resolveClaudeConfigDir(), "plugins", "installed_plugins.json");
+        if (existsSync(ipPath)) {
+          const ip = JSON.parse(readFileSync(ipPath, "utf-8"));
+          const entries = ip?.plugins?.["context-mode@context-mode"];
+          if (Array.isArray(entries)) {
+            for (const entry of entries) {
+              const ip2 = entry?.installPath;
+              if (typeof ip2 !== "string" || !ip2) continue;
+              if (!existsSync(ip2)) {
+                throw new Error(`installPath does not exist on disk: ${ip2}`);
+              }
+              const pjPath = resolve(ip2, ".claude-plugin", "plugin.json");
+              if (!existsSync(pjPath)) {
+                throw new Error(`missing plugin.json manifest at ${pjPath}`);
+              }
+              const pj = JSON.parse(readFileSync(pjPath, "utf-8"));
+              if (pj?.version !== entry.version) {
+                throw new Error(
+                  `version mismatch — registry says "${entry.version}" but ${pjPath} says "${pj?.version}"`,
+                );
               }
             }
           }
         }
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(`Registry consistency check failed: ${message}`);
       }
-    } catch { /* best effort — registry may not exist or be malformed */ }
 
-    changes.push(
-      newVersion !== localVersion
-        ? `Updated v${localVersion} → v${newVersion}`
-        : `Reinstalled v${localVersion} from GitHub`,
-    );
-    p.log.success(
-      color.green("Plugin reinstalled from GitHub!") +
-        color.dim(` — v${newVersion}`),
-    );
+      // v1.0.119 — Issue #523 — Layer 5 heal: assert .claude-plugin/plugin.json's
+      // mcpServers["context-mode"].args[0] is the literal ${CLAUDE_PLUGIN_ROOT}/start.mjs
+      // placeholder, not a tmpdir-prefixed absolute path. cli.ts already wrote .mcp.json
+      // with the placeholder (#411 fix), but plugin.json was never touched here — and
+      // start.mjs's normalize-hooks (Windows + #378) can bake in absolute paths that
+      // become stale across upgrades. We call the shared heal twice: first call cleans
+      // any drift; second call MUST return healed:[] or we throw. Single source of
+      // truth shared with start.mjs HEAL block + postinstall.
+      try {
+        const pluginCacheRoot = resolve(resolveClaudeConfigDir(), "plugins", "cache");
+        const pluginKey = "context-mode@context-mode";
+        const firstPass = healPluginJsonMcpServers({ pluginRoot, pluginCacheRoot, pluginKey });
+        if (firstPass && firstPass.error) {
+          throw new Error(firstPass.error);
+        }
+        const secondPass = healPluginJsonMcpServers({ pluginRoot, pluginCacheRoot, pluginKey });
+        if (secondPass && Array.isArray(secondPass.healed) && secondPass.healed.length > 0) {
+          throw new Error(
+            `Plugin manifest drift: plugin.json mcpServers.args still poisoned after first heal pass (healed=${secondPass.healed.join(",")})`,
+          );
+        }
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(`plugin.json drift check failed: ${message}`);
+      }
+
+      // v1.0.122 — Issue #531 — Layer 6 heal: assert .mcp.json's
+      // mcpServers["context-mode"].args[0] is the literal ${CLAUDE_PLUGIN_ROOT}/start.mjs
+      // placeholder. Asymmetric-heal sibling of the plugin.json assertion above.
+      // cli.ts writes .mcp.json at ~line 829-845 with the placeholder, but never
+      // asserted the on-disk shape afterwards — if a future regression dropped
+      // the placeholder write or a parallel normalize baked in an absolute path,
+      // upgrade() would declare success on a poisoned tree. Belt-and-braces:
+      // first call cleans any drift; second call MUST return healed:[] or throw.
+      // Single source of truth shared with start.mjs HEAL block + postinstall.
+      try {
+        const pluginCacheRoot = resolve(resolveClaudeConfigDir(), "plugins", "cache");
+        const pluginKey = "context-mode@context-mode";
+        const firstPass = healMcpJsonArgs({ pluginRoot, pluginCacheRoot, pluginKey });
+        if (firstPass && firstPass.error) {
+          throw new Error(firstPass.error);
+        }
+        const secondPass = healMcpJsonArgs({ pluginRoot, pluginCacheRoot, pluginKey });
+        if (secondPass && Array.isArray(secondPass.healed) && secondPass.healed.length > 0) {
+          throw new Error(
+            `.mcp.json drift: mcpServers.args still poisoned after first heal pass (healed=${secondPass.healed.join(",")})`,
+          );
+        }
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(`.mcp.json drift check failed: ${message}`);
+      }
+
+      // v1.0.X — Layer 7 heal: update user-level ~/.claude.json MCP server
+      // registrations that point to old context-mode version dirs.
+      // (anthropics/claude-code#59310 workaround — see heal-installed-plugins.mjs)
+      try {
+        // @ts-expect-error — JS module, no TS declarations
+        const { healClaudeJsonMcpArgs } = await import("../scripts/heal-installed-plugins.mjs");
+        const dotClaudeJson = resolve(homedir(), ".claude.json");
+        const pluginCacheParent = resolve(resolveClaudeConfigDir(), "plugins", "cache", "context-mode", "context-mode");
+        const result = healClaudeJsonMcpArgs({ dotClaudeJsonPath: dotClaudeJson, pluginCacheParent, newPluginRoot: pluginRoot });
+        if (result.healed && result.healed.length > 0) {
+          p.log.info(color.dim("  ~/.claude.json user MCP registrations updated → " + newVersion));
+        }
+      } catch {
+        /* best effort — never block upgrade */
+      }
+
+      // v1.0.114 hotfix — marketplace post-pull assertion: clone (if
+      // present) MUST be on newVersion. Mert's case showed marketplace
+      // stuck at v1.0.89 — the sync block above swallowed that silently.
+      // Warn (don't throw) — npm-only users have no marketplace clone.
+      try {
+        const marketplaceManifest = resolve(marketplaceDir, ".claude-plugin", "plugin.json");
+        if (existsSync(marketplaceManifest)) {
+          const mpj = JSON.parse(readFileSync(marketplaceManifest, "utf-8"));
+          if (mpj?.version !== newVersion) {
+            p.log.warn(
+              color.yellow("Marketplace clone version mismatch") +
+                ` — ${marketplaceDir} reports "${mpj?.version}" but expected "${newVersion}"`,
+            );
+            p.log.info(
+              color.dim(`  Run manually: git -C "${marketplaceDir}" fetch --tags origin && git -C "${marketplaceDir}" reset --hard origin/HEAD`),
+            );
+          }
+        }
+      } catch { /* best effort */ }
+
+      // Install production deps
+      s.start("Installing production dependencies");
+      npmExecFile(["install", "--production", "--no-audit", "--no-fund"], {
+        cwd: pluginRoot,
+        stdio: "pipe",
+        timeout: 60000,
+      });
+      s.stop("Dependencies ready");
+
+      if (detection.platform !== 'opencode' && detection.platform !== 'kilo') {
+        // Verify native addons through the same bootstrap start.mjs imports.
+        // On modern Node, the ABI-specific cache file is the compatibility marker;
+        // the active binding alone may be stale from a previous Node ABI.
+        s.start("Verifying native addon ABI");
+        const bsqAbiCachePath = resolve(
+          pluginRoot,
+          "node_modules",
+          "better-sqlite3",
+          "build",
+          "Release",
+          `better_sqlite3.abi${process.versions.modules}.node`,
+        );
+        try {
+          const ensureDepsPath = resolve(pluginRoot, "hooks", "ensure-deps.mjs");
+          if (!existsSync(ensureDepsPath)) {
+            throw new Error(`missing ${ensureDepsPath}`);
+          }
+          await import(`${pathToFileURL(ensureDepsPath).href}?upgrade=${Date.now()}`);
+          if (existsSync(bsqAbiCachePath)) {
+            s.stop(color.green("Native addons OK") + color.dim(" — ABI cache present"));
+            changes.push(`better-sqlite3 ABI ${process.versions.modules} cache ready`);
+          } else {
+            s.stop(color.yellow("Native addon ABI cache missing"));
+            p.log.warn(
+              color.dim(`  Try manually: cd "${pluginRoot}" && npm rebuild better-sqlite3`),
+            );
+          }
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          s.stop(color.yellow("Native addon ABI bootstrap unavailable"));
+          p.log.warn(
+            color.yellow("better-sqlite3 ABI repair did not run") +
+              ` — ${message}` +
+              color.dim(`\n  Try manually: cd "${pluginRoot}" && npm rebuild better-sqlite3`),
+          );
+        }
+
+        // ── Post-install binding verifier (#514) ────────────────────
+        // npm@7+ silently drops optionalDependencies whose engines
+        // field excludes the running Node (e.g. Node 26 vs
+        // better-sqlite3@12.x). On a silent skip the package directory
+        // is missing entirely and ensure-deps cannot recover. Fail
+        // loud so /ctx-upgrade no longer reports success while the
+        // knowledge base is unusable.
+        const bsqBindingPath = resolve(
+          pluginRoot,
+          "node_modules",
+          "better-sqlite3",
+          "build",
+          "Release",
+          "better_sqlite3.node",
+        );
+        if (!existsSync(bsqBindingPath)) {
+          // Try one last self-heal — explicit, named install bypasses
+          // the optionalDependency silent-skip path even if the dep
+          // somehow regressed back to optional.
+          try {
+            const healPath = resolve(pluginRoot, "scripts", "heal-better-sqlite3.mjs");
+            if (existsSync(healPath)) {
+              const mod = await import(
+                `${pathToFileURL(healPath).href}?upgrade=${Date.now()}`
+              );
+              if (typeof mod.healBetterSqlite3Binding === "function") {
+                mod.healBetterSqlite3Binding(pluginRoot);
+              }
+            }
+          } catch { /* best effort — verifier below will fail loud */ }
+        }
+        if (!existsSync(bsqBindingPath)) {
+          // Mark the upgrade process for a non-zero exit at completion.
+          // Stays in scope only for the rest of upgrade(); the actual
+          // exit-code wiring sits below the top-level changes report.
+          process.exitCode = 1;
+          p.log.error(
+            color.red("better-sqlite3 native binding: MISSING") +
+              color.dim(`\n  Path: ${bsqBindingPath}`) +
+              color.dim("\n  Cause: npm silently skipped the package (Node engine mismatch, issue #514)") +
+              color.dim(`\n  Try (primary): cd "${pluginRoot}" && npm install better-sqlite3 --no-optional`) +
+              color.dim("\n  Try (fallback): /context-mode:ctx-doctor"),
+          );
+        }
+      }
+
+      // Update global npm
+      s.start("Updating npm global package");
+      try {
+        npmExecFile(["install", "-g", pluginRoot, "--no-audit", "--no-fund"], {
+          stdio: "pipe",
+          timeout: 30000,
+        });
+        s.stop(color.green("npm global updated"));
+        changes.push("Updated npm global package");
+      } catch {
+        s.stop(color.yellow("npm global update skipped"));
+        p.log.info(color.dim("  Could not update global npm — may need sudo or standalone install"));
+      }
+
+      // Cleanup
+      rmSync(tmpDir, { recursive: true, force: true });
+
+      // Sync skills to the active install path from installed_plugins.json (#228).
+      // Only targets the ACTUAL directory Claude Code reads from — not spraying everywhere.
+      // Issue #460 round-3: honor $CLAUDE_CONFIG_DIR so the registry lookup
+      // tracks relocated CC config trees.
+      try {
+        const registryPath = resolve(resolveClaudeConfigDir(), "plugins", "installed_plugins.json");
+        if (existsSync(registryPath)) {
+          const registry = JSON.parse(readFileSync(registryPath, "utf-8"));
+          const entries = registry?.plugins?.["context-mode@context-mode"];
+          if (Array.isArray(entries)) {
+            for (const entry of entries) {
+              const installPath = entry.installPath;
+              if (installPath && installPath !== pluginRoot && existsSync(installPath)) {
+                const srcSkills = resolve(srcDir, "skills");
+                if (existsSync(srcSkills)) {
+                  cpSync(srcSkills, resolve(installPath, "skills"), { recursive: true });
+                  changes.push(`Synced skills to active install path`);
+                }
+              }
+            }
+          }
+        }
+      } catch { /* best effort — registry may not exist or be malformed */ }
+
+      changes.push(`Updated v${localVersion} → v${newVersion}`);
+      p.log.success(
+        color.green("Plugin reinstalled from GitHub!") +
+          color.dim(` — v${newVersion}`),
+      );
+    }
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     s.stop(color.red("Update failed"));
@@ -831,12 +1293,17 @@ async function upgrade() {
 
   // Step 4: Configure hooks — adapter-aware
   p.log.step(`Configuring ${adapter.name} hooks...`);
-  const hookChanges = adapter.configureAllHooks(pluginRoot);
-  for (const change of hookChanges) {
-    p.log.info(color.dim(`  ${change}`));
-    changes.push(change);
+  try {
+    const hookChanges = adapter.configureAllHooks(pluginRoot);
+    for (const change of hookChanges) {
+      p.log.info(color.dim(`  ${change}`));
+      changes.push(change);
+    }
+    p.log.success(color.green("Hooks configured") + color.dim(` — ${adapter.name}`));
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`Hook configuration failed: ${message}`);
   }
-  p.log.success(color.green("Hooks configured") + color.dim(` — ${adapter.name}`));
 
   // Step 5: Set hook script permissions — adapter-aware
   p.log.step("Setting hook script permissions...");
@@ -894,6 +1361,7 @@ async function upgrade() {
       stdio: "inherit",
       timeout: 30000,
       cwd: pluginRoot,
+      env: { ...process.env, CONTEXT_MODE_PLATFORM: detection.platform },
     });
   } catch {
     p.log.warn(
@@ -908,15 +1376,47 @@ async function upgrade() {
  * ------------------------------------------------------- */
 
 function statuslineForward(): void {
-  const scriptPath = resolve(getPluginRoot(), "bin", "statusline.mjs");
-  if (!existsSync(scriptPath)) {
-    process.stderr.write(`statusline script missing: ${scriptPath}\n`);
-    process.exit(1);
+  // Try multiple plugin-root candidates in priority order. After ctx-upgrade,
+  // getPluginRoot() can resolve to a cache dir that sessionstart.mjs (#181)
+  // already cleaned, leaving bin/statusline.mjs missing. Falling back to the
+  // marketplace clone (#418-synced, stable across upgrades) and to the path
+  // Claude Code itself loads from (installed_plugins.json) keeps the bar
+  // alive instead of silently going blank.
+  // Issue #460 round-3: marketplace + registry paths must follow
+  // $CLAUDE_CONFIG_DIR so relocated CC trees still find the statusline binary.
+  const claudeRoot = resolveClaudeConfigDir();
+  const candidates: string[] = [
+    resolve(getPluginRoot(), "bin", "statusline.mjs"),
+    resolve(claudeRoot, "plugins", "marketplaces", "context-mode", "bin", "statusline.mjs"),
+  ];
+
+  // installed_plugins.json may list one or more install paths CC actually
+  // loads from. Prefer those if they exist.
+  try {
+    const registryPath = resolve(claudeRoot, "plugins", "installed_plugins.json");
+    if (existsSync(registryPath)) {
+      const registry = JSON.parse(readFileSync(registryPath, "utf-8"));
+      const entries = registry?.plugins?.["context-mode@context-mode"];
+      if (Array.isArray(entries)) {
+        for (const entry of entries) {
+          const installPath = entry?.installPath;
+          if (typeof installPath === "string" && installPath) {
+            candidates.push(resolve(installPath, "bin", "statusline.mjs"));
+          }
+        }
+      }
+    }
+  } catch { /* registry malformed — fall through to other candidates */ }
+
+  const scriptPath = candidates.find((c) => existsSync(c));
+  if (!scriptPath) {
+    // Statusline output is the user-facing status bar; stderr surfaces visibly
+    // in some terminals. Exit silently — the bar simply stays empty until the
+    // next /ctx-upgrade or restart resolves the path.
+    process.exit(0);
   }
   // Re-exec via dynamic import so stdin/stdout are inherited cleanly.
-  import(pathToFileURL(scriptPath).href).catch((err) => {
-    process.stderr.write(`statusline failed: ${err?.message ?? err}\n`);
-    process.exit(1);
+  import(pathToFileURL(scriptPath).href).catch(() => {
+    process.exit(0);
   });
 }
-

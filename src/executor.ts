@@ -32,6 +32,7 @@ const SCRIPT_EXT: Record<Language, string> = {
   perl: "pl",
   r: "R",
   elixir: "exs",
+  csharp: "csx",
 };
 
 /** Pure helper — exported for unit testing. Returns "script" or "script.<ext>". */
@@ -56,6 +57,20 @@ export function buildScriptFilename(
  */
 export function buildSpawnOptions(platform: NodeJS.Platform): { windowsHide: boolean } {
   return { windowsHide: platform === "win32" };
+}
+
+function quoteForPosixShell(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Pure helper — exported for unit testing. Restores parent PATH after shell startup. */
+export function buildShellScriptContent(
+  code: string,
+  inheritedPath: string | undefined,
+  platform: NodeJS.Platform,
+): string {
+  if (platform === "win32" || !inheritedPath) return code;
+  return `export PATH=${quoteForPosixShell(inheritedPath)}\n${code}`;
 }
 
 /**
@@ -226,7 +241,11 @@ export class PolyglotExecutor {
       ),
     );
     if (language === "shell") {
-      writeFileSync(fp, code, { encoding: "utf-8", mode: 0o700 });
+      writeFileSync(
+        fp,
+        buildShellScriptContent(code, process.env.PATH, process.platform),
+        { encoding: "utf-8", mode: 0o700 },
+      );
     } else {
       writeFileSync(fp, code, "utf-8");
     }
@@ -275,7 +294,11 @@ export class PolyglotExecutor {
     return new Promise((res) => {
       // Only .cmd/.bat shims need shell on Windows; real executables don't.
       // Using shell: true globally causes process-tree kill issues with MSYS2/Git Bash.
-      const needsShell = isWin && ["tsx", "ts-node", "elixir"].includes(cmd[0]);
+      // "bun" is included as defense-in-depth: bunCommand() prefers absolute
+      // .exe paths now (#506), but if it falls back to the bare "bun" string
+      // on Windows that resolution typically goes through a `bun.cmd` shim
+      // (npm i -g bun) which CreateProcess can't execute without cmd.exe.
+      const needsShell = isWin && ["tsx", "ts-node", "elixir", "bun", "dotnet-script"].includes(cmd[0]);
 
       // On Windows with Git Bash, pass the script as `bash -c "source /posix/path"`
       // rather than `bash /path/to/script.sh`. This avoids MSYS2 path mangling
@@ -291,11 +314,11 @@ export class PolyglotExecutor {
           : cmd.slice(1);
       }
 
-      const proc = spawn(spawnCmd, spawnArgs, {
+      // Common options shared by both spawn variants below.
+      const commonOpts = {
         cwd,
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"],
         env: this.#buildSafeEnv(sandboxTmpDir),
-        shell: needsShell,
         // On Unix, create a new process group so killTree can kill all children
         detached: !isWin,
         // Hide the spawned-process console window on Windows. Without this,
@@ -303,7 +326,22 @@ export class PolyglotExecutor {
         // leaving the MCP response empty and popping a Git Bash terminal over
         // the user's IDE. Issue #384.
         ...buildSpawnOptions(process.platform),
-      });
+      };
+
+      // DEP0190 fix: when shell is true (Windows .cmd/.bat shims), pass a
+      // single command string instead of cmd + args array. Node.js warns
+      // that args are unsafely concatenated when shell:true is combined with
+      // the args-array form of spawn(). Colllapsing to a string avoids the
+      // warning while preserving the same shell behavior.
+      let proc: ReturnType<typeof spawn>;
+      if (needsShell) {
+        const fullCmd = [spawnCmd, ...spawnArgs]
+          .map(a => /\s/.test(a) ? JSON.stringify(a) : a)
+          .join(" ");
+        proc = spawn(fullCmd, [], { ...commonOpts, shell: true });
+      } else {
+        proc = spawn(spawnCmd, spawnArgs, { ...commonOpts, shell: false });
+      }
 
       let timedOut = false;
       let resolved = false;
@@ -455,6 +493,30 @@ export class PolyglotExecutor {
       "R_PROFILE",            // site-wide R profile
       "R_PROFILE_USER",       // user R profile
       "R_HOME",               // R installation override
+      // .NET / C# — runtime/startup hooks, additional deps
+      "DOTNET_STARTUP_HOOKS",       // injects managed assemblies on startup
+      "DOTNET_ADDITIONAL_DEPS",     // additional .deps.json injection
+      "DOTNET_SHARED_STORE",        // shared assembly probe path injection
+      "DOTNET_ROOT",                // arbitrary .NET runtime override
+      "DOTNET_ROOT(x86)",           // 32-bit override
+      "DOTNET_HOST_PATH",           // host binary substitution
+      // .NET / C# — profiler attach (loads arbitrary DLL into dotnet host)
+      // and IPC-based debugger/IL injection. PR #546 follow-up.
+      // learn.microsoft.com/en-us/dotnet/core/runtime-config/debugging-profiling
+      "CORECLR_PROFILER",                 // CLSID of profiler to attach
+      "CORECLR_PROFILER_PATH",            // path to profiler DLL
+      "CORECLR_PROFILER_PATH_32",         // 32-bit specific profiler DLL
+      "CORECLR_PROFILER_PATH_64",         // 64-bit specific profiler DLL
+      "CORECLR_PROFILER_PATH_ARM32",      // ARM32 specific profiler DLL
+      "CORECLR_PROFILER_PATH_ARM64",      // ARM64 specific profiler DLL
+      "CORECLR_ENABLE_PROFILING",         // gates profiler load
+      "DOTNET_PROFILER_PATH",             // cross-platform alias
+      "DOTNET_PROFILER_PATH_32",
+      "DOTNET_PROFILER_PATH_64",
+      "DOTNET_PROFILER_PATH_ARM32",
+      "DOTNET_PROFILER_PATH_ARM64",
+      "DOTNET_DiagnosticPorts",           // peer attach via diagnostic IPC
+      "DOTNET_BUNDLE_EXTRACT_BASE_DIR",   // single-file extraction hijack
       // Dynamic linker — shared library injection
       "LD_PRELOAD",           // loads .so before all others (Linux)
       "DYLD_INSERT_LIBRARIES", // macOS equivalent of LD_PRELOAD
@@ -475,10 +537,19 @@ export class PolyglotExecutor {
       "GIT_ASKPASS",          // arbitrary credential command
     ]);
 
-    // Start with parent env, then strip dangerous vars and apply overrides
+    // Start with parent env, then strip dangerous vars and apply overrides.
+    // The `COMPlus_` prefix sweep covers every COMPlus_* synonym of the
+    // DOTNET_* runtime knobs (.NET back-compat alias — case-insensitive).
+    // PR #546 follow-up: closes the alias bypass for the explicit denylist
+    // entries above.
     const env: Record<string, string> = {};
     for (const [key, val] of Object.entries(process.env)) {
-      if (val !== undefined && !DENIED.has(key) && !key.startsWith("BASH_FUNC_")) {
+      if (
+        val !== undefined &&
+        !DENIED.has(key) &&
+        !key.startsWith("BASH_FUNC_") &&
+        !/^COMPlus_/i.test(key)
+      ) {
         env[key] = val;
       }
     }
@@ -561,6 +632,11 @@ export class PolyglotExecutor {
         return `FILE_CONTENT_PATH <- ${escaped}\nfile_path <- FILE_CONTENT_PATH\nFILE_CONTENT <- readLines(FILE_CONTENT_PATH, warn=FALSE, encoding="UTF-8")\nFILE_CONTENT <- paste(FILE_CONTENT, collapse="\\n")\n${code}`;
       case "elixir":
         return `file_content_path = ${escaped}\nfile_path = file_content_path\nfile_content = File.read!(file_content_path)\n${code}`;
+      case "csharp":
+        // .csx forbids `using` directives after any other top-level statement
+        // (CS1529). User code inside executeFile must use fully-qualified type
+        // names (e.g. `System.Text.Json.JsonDocument`) instead of `using`.
+        return `var FILE_CONTENT_PATH = ${escaped};\nvar file_path = FILE_CONTENT_PATH;\nvar FILE_CONTENT = System.IO.File.ReadAllText(FILE_CONTENT_PATH);\n${code}`;
     }
   }
 }

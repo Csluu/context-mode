@@ -35,17 +35,17 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { SessionDB } from "./session/db.js";
-import { OpenClawSessionDB } from "./adapters/openclaw/session-db.js";
-import { extractEvents, extractUserEvents } from "./session/extract.js";
-import type { HookInput } from "./session/extract.js";
-import { buildResumeSnapshot } from "./session/snapshot.js";
-import type { SessionEvent } from "./types.js";
+import { SessionDB } from "../../session/db.js";
+import { OpenClawSessionDB } from "./session-db.js";
+import { extractEvents, extractUserEvents } from "../../session/extract.js";
+import type { HookInput } from "../../session/extract.js";
+import { buildResumeSnapshot } from "../../session/snapshot.js";
+import type { SessionEvent } from "../../types.js";
 
-import { WorkspaceRouter } from "./openclaw/workspace-router.js";
-import { buildNodeCommand } from "./adapters/types.js";
-import { OPENCLAW_TOOL_DEFS } from "./openclaw/mcp-tools.js";
-import type { OpenClawToolDef } from "./openclaw/mcp-tools.js";
+import { WorkspaceRouter } from "./workspace-router.js";
+import { buildNodeCommand } from "../types.js";
+import { OPENCLAW_TOOL_DEFS } from "./mcp-tools.js";
+import type { OpenClawToolDef } from "./mcp-tools.js";
 
 // ── System-reminder filter (CCv2 — SLICE OClaw-3) ─────────
 // Mirror hooks/userpromptsubmit.mjs:30-33: skip system-generated wrappers
@@ -142,7 +142,12 @@ interface SessionStartEvent {
 /** Shape of the event object OpenClaw passes to before_tool_call hooks. */
 interface BeforeToolCallEvent {
   toolName?: string;
-  params?: Record<string, unknown>;
+  tool_name?: string;
+  name?: string;
+  params?: Record<string, unknown> | string;
+  tool_input?: Record<string, unknown> | string;
+  input?: Record<string, unknown> | string;
+  arguments?: Record<string, unknown> | string;
   runId?: string;
   toolCallId?: string;
 }
@@ -157,16 +162,24 @@ interface BeforeModelResolveEvent {
 /** Shape of the event object OpenClaw passes to tool_call:after hooks. */
 interface AfterToolCallEvent {
   toolName?: string;
-  params?: Record<string, unknown>;
+  tool_name?: string;
+  name?: string;
+  params?: Record<string, unknown> | string;
+  tool_input?: Record<string, unknown> | string;
+  input?: Record<string, unknown> | string;
+  arguments?: Record<string, unknown> | string;
   /** Stable per agent turn — all tool calls in the same LLM response share a runId. */
   runId?: string;
   toolCallId?: string;
   /** Result payload — OpenClaw v2+ uses `result`; older builds use `output`. */
   result?: unknown;
-  output?: string;
+  output?: unknown;
+  tool_response?: unknown;
+  tool_output?: unknown;
   /** Error indicator — string message (v2+) or boolean flag (older builds). */
   error?: string;
   isError?: boolean;
+  is_error?: boolean;
   durationMs?: number;
 }
 
@@ -202,6 +215,64 @@ function getDBPath(projectDir: string): string {
     .digest("hex")
     .slice(0, 16);
   return join(getSessionDir(), `${hash}.db`);
+}
+
+type ToolInputField = "params" | "tool_input" | "input" | "arguments";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseRecord(value: unknown): Record<string, unknown> | null {
+  if (isRecord(value)) return value;
+  if (typeof value !== "string" || value.trim() === "") return null;
+  try {
+    const parsed = JSON.parse(value);
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function getToolName(event: BeforeToolCallEvent | AfterToolCallEvent): string {
+  return event.toolName ?? event.tool_name ?? event.name ?? "";
+}
+
+function getToolInputSlot(event: BeforeToolCallEvent | AfterToolCallEvent): {
+  input: Record<string, unknown>;
+  assign(updatedInput: Record<string, unknown>): void;
+} {
+  const fields: ToolInputField[] = ["params", "tool_input", "input", "arguments"];
+  for (const field of fields) {
+    const raw = event[field];
+    const parsed = parseRecord(raw);
+    if (!parsed) continue;
+    return {
+      input: parsed,
+      assign(updatedInput: Record<string, unknown>) {
+        const merged = { ...parsed, ...updatedInput };
+        if (isRecord(raw)) {
+          Object.assign(raw, updatedInput);
+        } else {
+          event[field] = merged;
+        }
+      },
+    };
+  }
+  return {
+    input: {},
+    assign(updatedInput: Record<string, unknown>) {
+      event.params = { ...updatedInput };
+    },
+  };
+}
+
+function getToolResult(event: AfterToolCallEvent): unknown {
+  return event.result ?? event.output ?? event.tool_response ?? event.tool_output;
+}
+
+function getToolError(event: AfterToolCallEvent): boolean {
+  return Boolean(event.error || event.isError || event.is_error);
 }
 
 // ── Module-level DB singleton ─────────────────────────────
@@ -244,7 +315,7 @@ export default {
     // Resolve build dir from compiled JS location
     const buildDir = dirname(fileURLToPath(import.meta.url));
     const projectDir = process.cwd();
-    const pluginRoot = resolve(buildDir, "..");
+    const pluginRoot = resolve(buildDir, "..", "..", "..");
 
     // Structured logger — wraps api.logger, falls back to no-op.
     // info/error always emit; debug only when api.logger.debug is present
@@ -280,17 +351,20 @@ export default {
     // MCP-prefix substitution stays in lockstep with hooks/routing-block.mjs.
     let routingInstructions = "";
     const initPromise = (async () => {
-      const routingPath = resolve(buildDir, "..", "hooks", "core", "routing.mjs");
+      const routingPath = resolve(buildDir, "..", "..", "..", "hooks", "core", "routing.mjs");
       const routing = await import(pathToFileURL(routingPath).href);
-      await routing.initSecurity(buildDir);
+      // initSecurity() looks for `<dir>/security.js`, which lives at the
+      // top of build/ — two levels up from this adapter directory.
+      const buildRoot = resolve(buildDir, "..", "..");
+      await routing.initSecurity(buildRoot);
 
       try {
         const blockMod = await import(
-          pathToFileURL(resolve(buildDir, "..", "hooks", "routing-block.mjs")).href
+          pathToFileURL(resolve(buildDir, "..", "..", "..", "hooks", "routing-block.mjs")).href
         );
         const namingMod = await import(
           pathToFileURL(
-            resolve(buildDir, "..", "hooks", "core", "tool-naming.mjs"),
+            resolve(buildDir, "..", "..", "..", "hooks", "core", "tool-naming.mjs"),
           ).href
         );
         const toolNamer = namingMod.createToolNamer("openclaw");
@@ -328,8 +402,9 @@ export default {
       async (event: unknown) => {
         const { routing } = await initPromise;
         const e = event as BeforeToolCallEvent;
-        const toolName = e.toolName ?? "";
-        const toolInput = e.params ?? {};
+        const toolName = getToolName(e);
+        const toolInputSlot = getToolInputSlot(e);
+        const toolInput = toolInputSlot.input;
 
         let decision;
         try {
@@ -351,7 +426,7 @@ export default {
 
         if (decision.action === "modify" && decision.updatedInput) {
           // In-place mutation — OpenClaw reads the mutated params object.
-          Object.assign(toolInput, decision.updatedInput);
+          toolInputSlot.assign(decision.updatedInput);
         }
 
         // "context" action → handled by before_prompt_build, not inline
@@ -363,13 +438,22 @@ export default {
     // Map OpenClaw tool names → Claude Code equivalents so extractEvents
     // can recognize them. OpenClaw uses lowercase names; CC uses PascalCase.
     const OPENCLAW_TOOL_MAP: Record<string, string> = {
+      "container.exec": "Bash",
       exec: "Bash",
+      exec_command: "Bash",
+      local_shell: "Bash",
+      run_shell_command: "Bash",
+      shell: "Bash",
+      shell_command: "Bash",
       read: "Read",
+      read_file: "Read",
+      view: "Read",
       write: "Write",
       edit: "Edit",
       apply_patch: "Edit",
       glob: "Glob",
       grep: "Grep",
+      grep_files: "Grep",
       search: "Grep",
     };
 
@@ -378,10 +462,11 @@ export default {
       async (event: unknown) => {
         try {
           const e = event as AfterToolCallEvent;
-          const rawToolName = e.toolName ?? "";
+          const rawToolName = getToolName(e);
           const mappedToolName = OPENCLAW_TOOL_MAP[rawToolName] ?? rawToolName;
+          const toolInput = getToolInputSlot(e).input;
           // Accept both result (v2+) and output (older builds)
-          const rawResult = e.result ?? e.output;
+          const rawResult = getToolResult(e);
           const resultStr =
             typeof rawResult === "string"
               ? rawResult
@@ -389,11 +474,11 @@ export default {
                 ? JSON.stringify(rawResult)
                 : undefined;
           // Accept both error (string, v2+) and isError (boolean, older builds)
-          const hasError = Boolean(e.error || e.isError);
+          const hasError = getToolError(e);
 
           const hookInput: HookInput = {
             tool_name: mappedToolName,
-            tool_input: e.params ?? {},
+            tool_input: toolInput,
             tool_response: resultStr,
             tool_output: hasError ? { isError: true } : undefined,
           };
@@ -401,7 +486,7 @@ export default {
           const events = extractEvents(hookInput);
 
           // Resolve agent-specific sessionId from workspace paths in params
-          const routedSessionId = workspaceRouter.resolveSessionId(e.params ?? {}) ?? sessionId;
+          const routedSessionId = workspaceRouter.resolveSessionId(toolInput) ?? sessionId;
 
           if (events.length > 0) {
             for (const ev of events) {
@@ -412,7 +497,7 @@ export default {
             // Fallback: record any unrecognized tool call as a generic event
             const data = JSON.stringify({
               tool: rawToolName,
-              params: e.params,
+              params: toolInput,
               durationMs: e.durationMs,
             });
             db.insertEvent(
@@ -599,7 +684,7 @@ export default {
           }
           const events = extractUserEvents(messageText);
           for (const ev of events) {
-            db.insertEvent(sid, ev as import("./types.js").SessionEvent, "PostToolUse");
+            db.insertEvent(sid, ev as import("../../types.js").SessionEvent, "PostToolUse");
           }
         } catch {
           // best effort — never break model resolution

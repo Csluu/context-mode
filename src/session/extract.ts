@@ -18,6 +18,13 @@ export interface SessionEvent {
   data: string;
   /** 1=critical (rules, files, tasks) … 5=low */
   priority: number;
+  /**
+   * Optional — bytes context-mode prevented from entering the model context
+   * window for this event. Currently populated by external_ref when a
+   * ctx_fetch_and_index tool_response carries the
+   * `Fetched and indexed N sections (XKB)` preamble.
+   */
+  bytes_avoided?: number;
 }
 
 export interface ToolCall {
@@ -36,7 +43,7 @@ export interface HookInput {
   tool_input: Record<string, unknown>;
   tool_response?: string;
   /** Optional structured output from the tool (may carry isError) */
-  tool_output?: { isError?: boolean };
+  tool_output?: { isError?: boolean; is_error?: boolean };
 }
 
 // ── Internal helpers ───────────────────────────────────────────────────────
@@ -51,6 +58,56 @@ function safeString(value: string | null | undefined): string {
 function safeStringAny(value: unknown): string {
   if (value == null) return "";
   return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+function isToolError(input: HookInput): boolean {
+  const response = String(input.tool_response ?? "");
+  const isErrorFlag = input.tool_output?.isError === true || input.tool_output?.is_error === true;
+  const isBashError =
+    input.tool_name === "Bash" &&
+    /exit code [1-9]|error:|Error:|FAIL|failed/i.test(response);
+  return isBashError || isErrorFlag;
+}
+
+interface ApplyPatchTarget {
+  path: string;
+  type: "file_write" | "file_edit";
+}
+
+function extractApplyPatchTargets(command: string): ApplyPatchTarget[] {
+  if (!command) return [];
+
+  const targets: ApplyPatchTarget[] = [];
+  for (const line of command.split(/\r?\n/)) {
+    if (line.startsWith("*** Add File: ")) {
+      targets.push({ path: line.slice(14).trim(), type: "file_write" });
+      continue;
+    }
+    if (line.startsWith("*** Update File: ")) {
+      targets.push({ path: line.slice(17).trim(), type: "file_edit" });
+      continue;
+    }
+    if (line.startsWith("*** Delete File: ")) {
+      targets.push({ path: line.slice(17).trim(), type: "file_edit" });
+      continue;
+    }
+    if (line.startsWith("*** Move to: ")) {
+      targets.push({ path: line.slice(13).trim(), type: "file_edit" });
+    }
+  }
+
+  const seen = new Set<string>();
+  return targets.filter((target) => {
+    if (!target.path) return false;
+    const key = `${target.type}:${target.path}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function isPlanFilePath(filePath: string): boolean {
+  return /(?:^|[/\\])\.claude[/\\]plans[/\\]/.test(filePath);
 }
 
 // ── Category extractors ────────────────────────────────────────────────────
@@ -152,6 +209,22 @@ function extractFileAndRule(input: HookInput): SessionEvent[] {
     return events;
   }
 
+  if (tool_name === "apply_patch") {
+    if (isToolError(input)) return [];
+    const patchTargets = extractApplyPatchTargets(
+      String(tool_input["command"] ?? tool_input["patch"] ?? ""),
+    );
+    for (const target of patchTargets) {
+      events.push({
+        type: target.type,
+        category: "file",
+        data: safeString(target.path),
+        priority: 1,
+      });
+    }
+    return events;
+  }
+
   // Glob — file pattern exploration
   if (tool_name === "Glob") {
     const pattern = String(tool_input["pattern"] ?? "");
@@ -207,16 +280,9 @@ function extractCwd(input: HookInput): SessionEvent[] {
  * isError flag in tool_output.
  */
 function extractError(input: HookInput): SessionEvent[] {
-  const { tool_name, tool_input, tool_response, tool_output } = input;
-
+  const { tool_response } = input;
   const response = String(tool_response ?? "");
-  const isErrorFlag = tool_output?.isError === true;
-
-  const isBashError =
-    tool_name === "Bash" &&
-    /exit code [1-9]|error:|Error:|FAIL|failed/i.test(response);
-
-  if (!isBashError && !isErrorFlag) return [];
+  if (!isToolError(input)) return [];
 
   return [{
     type: "error_tool",
@@ -351,7 +417,7 @@ function extractPlan(input: HookInput): SessionEvent[] {
   // Detect plan file writes (Write/Edit to ~/.claude/plans/)
   if (input.tool_name === "Write" || input.tool_name === "Edit") {
     const filePath = String(input.tool_input["file_path"] ?? "");
-    if (/[/\\]\.claude[/\\]plans[/\\]/.test(filePath)) {
+    if (isPlanFilePath(filePath)) {
       return [{
         type: "plan_file_write",
         category: "plan",
@@ -359,6 +425,21 @@ function extractPlan(input: HookInput): SessionEvent[] {
         priority: 2,
       }];
     }
+  }
+
+  if (input.tool_name === "apply_patch") {
+    if (isToolError(input)) return [];
+    const patchTargets = extractApplyPatchTargets(
+      String(input.tool_input["command"] ?? input.tool_input["patch"] ?? ""),
+    );
+    return patchTargets
+      .filter((target) => isPlanFilePath(target.path))
+      .map((target) => ({
+        type: "plan_file_write",
+        category: "plan",
+        data: safeString(`plan file: ${target.path.split(/[/\\]/).pop() ?? target.path}`),
+        priority: 2,
+      }));
   }
 
   return [];
@@ -704,12 +785,30 @@ function extractExternalRef(input: HookInput): SessionEvent[] {
 
   if (refs.size === 0) return [];
 
-  return [{
+  // ctx_fetch_and_index returns a preamble like
+  //   "Fetched and indexed **5 sections** (47.50KB) from: <label>"
+  // Parse the size to credit bytes_avoided on the event so per-session
+  // honest-savings stats reflect what was kept out of the context window.
+  // KB literal in the preamble is decimal (KB = 1024 bytes per the formatter).
+  let bytesAvoided: number | undefined;
+  const preambleMatch = safeString(input.tool_response).match(
+    /Fetched and indexed[^\(]*\(([\d.]+)\s*KB\)/i,
+  );
+  if (preambleMatch) {
+    const kb = Number(preambleMatch[1]);
+    if (Number.isFinite(kb) && kb > 0) {
+      bytesAvoided = Math.round(kb * 1024);
+    }
+  }
+
+  const event: SessionEvent = {
     type: "external_ref",
     category: "external-ref",
     data: safeString(Array.from(refs).join(", ")),
     priority: 3,
-  }];
+  };
+  if (bytesAvoided !== undefined) event.bytes_avoided = bytesAvoided;
+  return [event];
 }
 
 /**
@@ -733,19 +832,38 @@ function extractWorktree(input: HookInput): SessionEvent[] {
 /**
  * Category 6: decision
  * User corrections / approach selections.
+ *
+ * Universal-rule detector (Hybrid C, issue #535):
+ *   A decision message typically takes the structural shape
+ *     "{negation/rejection} X {separator} Y" — across every human language.
+ *
+ *   We treat the following as the structural shape:
+ *     - contains a clause separator (ASCII `,` `;`, fullwidth `，` `；`,
+ *       Japanese ideographic `、`, Arabic `،`), AND
+ *     - codepoint length is in the corrective range (15..500), AND
+ *     - the message is not a question (no cross-script `?`), AND
+ *     - contains at least one alphabetic codepoint.
+ *
+ *   The renderer prints the raw message back to the next LLM, so the gate
+ *   only needs to be a coarse "looks like a correction" filter — the LLM
+ *   handles fine-grained interpretation. No per-language keyword list.
  */
 
-const DECISION_PATTERNS: RegExp[] = [
-  /\b(don'?t|do not|never|always|instead|rather|prefer)\b/i,
-  /\b(use|switch to|go with|pick|choose)\s+\w+\s+(instead|over|not)\b/i,
-  /\b(no,?\s+(use|do|try|make))\b/i,
-  // Turkish patterns
-  /\b(hayır|hayir|evet|böyle|boyle|degil|değil|yerine|kullan)\b/i,
-];
+const CLAUSE_SEPARATOR_PATTERN = /[,;，；、،]/u;
+const DECISION_MIN_CHARS = 15;
+const DECISION_MAX_CHARS = 500;
+
+function looksLikeDecision(trimmed: string): boolean {
+  if (QUESTION_MARK_PATTERN.test(trimmed)) return false;
+  if (!ALPHABETIC_PATTERN.test(trimmed)) return false;
+  if (!CLAUSE_SEPARATOR_PATTERN.test(trimmed)) return false;
+  const codepointLength = [...trimmed].length;
+  return codepointLength >= DECISION_MIN_CHARS && codepointLength <= DECISION_MAX_CHARS;
+}
 
 function extractUserDecision(message: string): SessionEvent[] {
-  const isDecision = DECISION_PATTERNS.some(p => p.test(message));
-  if (!isDecision) return [];
+  const trimmed = message.trim();
+  if (!looksLikeDecision(trimmed)) return [];
 
   return [{
     type: "decision",
@@ -758,18 +876,59 @@ function extractUserDecision(message: string): SessionEvent[] {
 /**
  * Category 7: role
  * Persona / behavioral directive patterns.
+ *
+ * Universal-rule detector (Hybrid C, issue #535):
+ *   A persona/role statement is structurally a single non-question clause
+ *   of moderate length containing more than one lexical token — e.g.
+ *     "You are a senior engineer", "Tu es développeur",
+ *     "あなたは経験豊富なエンジニアです", "Sen kıdemli mühendisisin".
+ *
+ *   We treat the following as the structural shape:
+ *     - codepoint length is in the persona range (12..120), AND
+ *     - is not a question (no cross-script `?`), AND
+ *     - is a single clause (no clause separator that would mark it as a
+ *       decision), AND
+ *     - carries enough lexical density: either two whitespace-separated
+ *       runs of letters, OR a continuous Unicode-letter run of ≥6
+ *       codepoints (a fallback for scripts without word spaces — Japanese,
+ *       Chinese, Thai).
+ *
+ *   The renderer prints the raw message back to the next LLM verbatim,
+ *   so the gate only needs a coarse "looks like a persona statement"
+ *   filter — no per-language keyword list.
  */
 
-const ROLE_PATTERNS: RegExp[] = [
-  /\b(act as|you are|behave like|pretend|role of|persona)\b/i,
-  /\b(senior|staff|principal|lead)\s+(engineer|developer|architect)\b/i,
-  // Turkish patterns
-  /\b(gibi davran|rolünde|olarak çalış)\b/i,
-];
+// Lower bound accommodates information-dense scripts (Chinese, Japanese,
+// Korean) where a complete persona sentence may use as few as 8 codepoints
+// — e.g. "你是高级工程师" — while still excluding bare single-token noise.
+const ROLE_MIN_CHARS = 8;
+const ROLE_MAX_CHARS = 120;
+const TWO_LEXICAL_TOKENS_PATTERN = /\p{L}+\s+\p{L}+/u;
+const CONTINUOUS_LETTER_RUN_PATTERN = /\p{L}{6,}/u;
+
+function looksLikeRole(trimmed: string): boolean {
+  // Role prompts are persona-prefix shaped: the FIRST SENTENCE declares the
+  // role (e.g. "You are a senior backend engineer. <long context...>").
+  // Apply the structural test to the first clause only — real-world role
+  // prompts often append context paragraphs that would blow the length cap
+  // if we tested the whole message. First-clause shape is the load-bearing
+  // signal across languages (English "You are X.", French "Tu es X.",
+  // Japanese "あなたは X です。" all parse the same way under a period split).
+  const firstClause = trimmed.split(/[.!\n。！]/u)[0].trim();
+  if (QUESTION_MARK_PATTERN.test(firstClause)) return false;
+  if (CLAUSE_SEPARATOR_PATTERN.test(firstClause)) return false;
+  if (!ALPHABETIC_PATTERN.test(firstClause)) return false;
+  const codepointLength = [...firstClause].length;
+  if (codepointLength < ROLE_MIN_CHARS || codepointLength > ROLE_MAX_CHARS) return false;
+  return (
+    TWO_LEXICAL_TOKENS_PATTERN.test(firstClause) ||
+    CONTINUOUS_LETTER_RUN_PATTERN.test(firstClause)
+  );
+}
 
 function extractRole(message: string): SessionEvent[] {
-  const isRole = ROLE_PATTERNS.some(p => p.test(message));
-  if (!isRole) return [];
+  const trimmed = message.trim();
+  if (!looksLikeRole(trimmed)) return [];
 
   return [{
     type: "role",
@@ -782,23 +941,58 @@ function extractRole(message: string): SessionEvent[] {
 /**
  * Category 13: intent
  * Session mode classification from user messages.
+ *
+ * Universal-rule detector (Hybrid C, issue #535):
+ *   investigate — message contains a question mark from any script:
+ *                 ASCII `?` U+003F, fullwidth `？` U+FF1F, Arabic `؟` U+061F,
+ *                 Spanish opening `¿` U+00BF.
+ *                 (Greek `;` U+037E and Armenian `՞` U+055E are excluded —
+ *                  Greek shares its codepoint with ASCII semicolon, which
+ *                  would produce false positives across the corpus.)
+ *
+ * Structural / Unicode-aware — no per-language keyword list.
  */
 
-const INTENT_PATTERNS: Array<{ mode: string; pattern: RegExp }> = [
-  { mode: "investigate", pattern: /\b(why|how does|explain|understand|what is|analyze|debug|look into)\b/i },
-  { mode: "implement",   pattern: /\b(create|add|build|implement|write|make|develop|fix)\b/i },
-  { mode: "discuss",     pattern: /\b(think about|consider|should we|what if|pros and cons|opinion)\b/i },
-  { mode: "review",      pattern: /\b(review|check|audit|verify|test|validate)\b/i },
-];
+const QUESTION_MARK_PATTERN = /[?？؟¿]/u;
+
+/**
+ * "Imperative tone" structural heuristic for implement intent:
+ *   - trimmed length < IMPERATIVE_MAX_CHARS codepoints (short directive,
+ *     not a discursive paragraph)
+ *   - contains no question mark from any script
+ *   - contains at least one alphabetic codepoint (filters pure punctuation noise)
+ *
+ * `[...str]` walks Unicode codepoints so CJK / Indic scripts are measured
+ * fairly against the budget rather than penalised by UTF-16 unit count.
+ */
+const ALPHABETIC_PATTERN = /\p{L}/u;
+const IMPERATIVE_MAX_CHARS = 60;
+
+function isImperativeTone(trimmed: string): boolean {
+  if (QUESTION_MARK_PATTERN.test(trimmed)) return false;
+  if (!ALPHABETIC_PATTERN.test(trimmed)) return false;
+  const codepointLength = [...trimmed].length;
+  return codepointLength > 0 && codepointLength < IMPERATIVE_MAX_CHARS;
+}
 
 function extractIntent(message: string): SessionEvent[] {
-  const match = INTENT_PATTERNS.find(({ pattern }) => pattern.test(message));
-  if (!match) return [];
+  const trimmed = message.trim();
+  if (!trimmed) return [];
+
+  let mode: string | undefined;
+
+  if (QUESTION_MARK_PATTERN.test(trimmed)) {
+    mode = "investigate";
+  } else if (isImperativeTone(trimmed)) {
+    mode = "implement";
+  }
+
+  if (!mode) return [];
 
   return [{
     type: "intent",
     category: "intent",
-    data: safeString(match.mode),
+    data: safeString(mode),
     priority: 4,
   }];
 }
@@ -806,33 +1000,39 @@ function extractIntent(message: string): SessionEvent[] {
 /**
  * Category 25: blocked-on
  * Detect when work is blocked on something, or when a blocker is resolved.
+ *
+ * Universal-rule detector (Hybrid C, issue #535):
+ *   Programming-domain error markers are script-agnostic — they are
+ *   emitted by tooling regardless of the user's spoken language. The
+ *   words "Error", "Exception", "Traceback" stay in their original
+ *   English form inside a Chinese / Arabic / Russian terminal log.
+ *
+ *   blocker matches:
+ *     - the literal "Error:" / "Exception:" / "Traceback" tokens, OR
+ *     - a Python-style frame line ("File ", `line:col`), OR
+ *     - a JS / Java-style stack frame ("at <ident>(...)" with a
+ *       `:line:col` suffix).
+ *
+ *   blocker_resolved matches:
+ *     - a Unicode check-mark glyph (✓ U+2713, ✔ U+2714, ✅ U+2705,
+ *       ☑ U+2611, 🎉 U+1F389), OR
+ *     - the structural marker "fixed: …" / "resolved: …" — these are
+ *       programming-domain conventions (git log, PR titles, CHANGELOG
+ *       entries) rather than natural-language phrases.
  */
 
-const BLOCKER_PATTERNS: RegExp[] = [
-  /\bblocked on\b/i,
-  /\bwaiting for\b/i,
-  /\bneed\s+\S+\s+before\b/i,
-  /\bcan'?t proceed until\b/i,
-  /\bdepends on\b/i,
-  /\bblocked\b/i,
-  // Turkish patterns
-  /\bbekliyor\b/i,
-  /\bbekliyorum\b/i,
-];
-
-const BLOCKER_RESOLVED_PATTERNS: RegExp[] = [
-  /\bunblocked\b/i,
-  /\bresolved\b/i,
-  /\bgot the\s+\S+/i,
-  /\bis ready now\b/i,
-  /\bcan proceed\b/i,
-];
+const BLOCKER_MARKERS_PATTERN = /(?:\bError\s*:|\bException\s*:|\bTraceback\b|\bat\s+\S+\s*\([^)]*:\d+:\d+\))/u;
+const BLOCKER_RESOLVED_CHECKMARK_PATTERN = /[✓✔✅☑🎉]/u;
+const BLOCKER_RESOLVED_MARKER_PATTERN = /^\s*(?:fixed|resolved)\s*:/iu;
 
 function extractBlocker(message: string): SessionEvent[] {
   const events: SessionEvent[] = [];
 
-  // Check resolution first — if both match, resolution takes priority
-  const isResolved = BLOCKER_RESOLVED_PATTERNS.some(p => p.test(message));
+  // Resolution takes precedence — if both shapes match, render the
+  // happier signal so the snapshot reflects the latest state.
+  const isResolved =
+    BLOCKER_RESOLVED_CHECKMARK_PATTERN.test(message) ||
+    BLOCKER_RESOLVED_MARKER_PATTERN.test(message);
   if (isResolved) {
     events.push({
       type: "blocker_resolved",
@@ -843,8 +1043,7 @@ function extractBlocker(message: string): SessionEvent[] {
     return events;
   }
 
-  const isBlocked = BLOCKER_PATTERNS.some(p => p.test(message));
-  if (isBlocked) {
+  if (BLOCKER_MARKERS_PATTERN.test(message)) {
     events.push({
       type: "blocker",
       category: "blocked-on",
@@ -881,15 +1080,11 @@ function extractData(message: string): SessionEvent[] {
 let lastError: { tool: string; error: string; callsSince: number } | null = null;
 
 function extractErrorResolution(input: HookInput): SessionEvent[] {
-  const { tool_name, tool_response, tool_output } = input;
+  const { tool_name, tool_response } = input;
   const response = String(tool_response ?? "");
-  const isErrorFlag = tool_output?.isError === true;
-  const isBashError =
-    tool_name === "Bash" &&
-    /exit code [1-9]|error:|Error:|FAIL|failed/i.test(response);
 
   // If this call is an error, store it and return
-  if (isBashError || isErrorFlag) {
+  if (isToolError(input)) {
     lastError = { tool: tool_name, error: response.slice(0, 200), callsSince: 0 };
     return [];
   }
@@ -906,10 +1101,14 @@ function extractErrorResolution(input: HookInput): SessionEvent[] {
     return [];
   }
 
+  const callSucceeded = !isToolError(input);
+  if (!callSucceeded) return [];
+
   // Check if this is a resolution: same tool, or Edit/Write after a Read error
   const sameTool = tool_name === lastError.tool;
   const editAfterReadError =
-    lastError.tool === "Read" && (tool_name === "Edit" || tool_name === "Write");
+    lastError.tool === "Read"
+    && (tool_name === "Edit" || tool_name === "Write" || tool_name === "apply_patch");
 
   if (sameTool || editAfterReadError) {
     const event: SessionEvent = {

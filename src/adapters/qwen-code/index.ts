@@ -15,12 +15,14 @@
 
 import {
   readFileSync,
+  writeFileSync,
   existsSync,
 } from "node:fs";
 import { resolve, join } from "node:path";
 import { homedir } from "node:os";
 
 import { ClaudeCodeBaseAdapter, type ClaudeCodeWireInput } from "../claude-code-base.js";
+import { EXTERNAL_MCP_MATCHER_PATTERN } from "./hooks.js";
 
 import {
   buildNodeCommand,
@@ -76,6 +78,9 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
       "mcp__plugin_context-mode_context-mode__ctx_execute",
       "mcp__plugin_context-mode_context-mode__ctx_execute_file",
       "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
+      // External MCP catch-all (#529). Negative-lookahead excludes context-mode's
+      // own server segments so the explicit entries above are not double-routed.
+      EXTERNAL_MCP_MATCHER_PATTERN,
     ].join("|");
 
     return {
@@ -134,7 +139,11 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
   }
 
   writeSettings(settings: Record<string, unknown>): void {
-    const { writeFileSync } = require("node:fs");
+    // Issue #511: use top-level static import (line 18) — never inline
+    // `require("node:fs")` in ESM-bundled sources. esbuild rewrites them to
+    // a `__require` shim that throws `Dynamic require of "node:fs" is not
+    // supported` under Node ESM/Bun (this adapter is pulled into both
+    // server.bundle.mjs and cli.bundle.mjs via adapter detect).
     writeFileSync(this.getSettingsPath(), JSON.stringify(settings, null, 2));
   }
 
@@ -285,6 +294,8 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
           "mcp__plugin_context-mode_context-mode__ctx_execute",
           "mcp__plugin_context-mode_context-mode__ctx_execute_file",
           "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
+          // External MCP catch-all (#529) — keep in sync with generateHookConfig above.
+          EXTERNAL_MCP_MATCHER_PATTERN,
         ].join("|"),
       },
       {

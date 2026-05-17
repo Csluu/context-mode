@@ -1628,10 +1628,13 @@ if (LIVE) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("ctx_upgrade tool: inline fallback for missing CLI", () => {
-  const serverSrc = readFileSync(
-    resolve(__dirname, "../../src/server.ts"),
-    "utf-8",
-  );
+  // After src/tools/MIGRATION.md extraction, ctx_upgrade lives in its own
+  // file. Read both server.ts (registration site) and upgrade.ts (handler
+  // body) so existing structural assertions stay meaningful.
+  const serverSrc =
+    readFileSync(resolve(__dirname, "../../src/server.ts"), "utf-8") +
+    "\n// ── tools/upgrade.ts ──\n" +
+    readFileSync(resolve(__dirname, "../../src/tools/upgrade.ts"), "utf-8");
 
   test("tries cli.bundle.mjs first", () => {
     expect(serverSrc).toContain("cli.bundle.mjs");
@@ -2465,7 +2468,7 @@ describe("runBatchCommands P0 hardening", () => {
 // runPool — shared concurrency primitive (PRD finding G)
 // ═══════════════════════════════════════════════════════════════════════════
 
-import { runPool, type PoolJob } from "../../src/concurrency/runPool.js";
+import { runPool, type PoolJob } from "../../src/runPool.js";
 
 describe("runPool primitive", () => {
   test("empty jobs returns empty settled array", async () => {

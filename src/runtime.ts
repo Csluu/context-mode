@@ -13,12 +13,16 @@ import { existsSync } from "node:fs";
  * Match is case-insensitive; `.exe` extension tolerated for Windows binaries.
  */
 const ALLOWED_SHELL_BASENAMES = /^(bash|sh|zsh|dash|pwsh|powershell|cmd)(\.exe)?$/i;
+const BUN_BASENAME = /^bun(\.exe)?$/i;
+
+function runtimeBasename(runtimePath: string): string {
+  const segments = runtimePath.split(/[\\/]/);
+  return segments[segments.length - 1] ?? runtimePath;
+}
 
 export function isAllowlistedShell(shellPath: string): boolean {
   // Cross-OS basename: split on either separator, take the last segment.
-  const segments = shellPath.split(/[\\/]/);
-  const base = segments[segments.length - 1];
-  return ALLOWED_SHELL_BASENAMES.test(base);
+  return ALLOWED_SHELL_BASENAMES.test(runtimeBasename(shellPath));
 }
 
 export type Language =
@@ -32,7 +36,8 @@ export type Language =
   | "php"
   | "perl"
   | "r"
-  | "elixir";
+  | "elixir"
+  | "csharp";
 
 export interface RuntimeInfo {
   command: string;
@@ -53,6 +58,7 @@ export interface RuntimeMap {
   perl: string | null;
   r: string | null;
   elixir: string | null;
+  csharp: string | null;
 }
 
 const isWindows = process.platform === "win32";
@@ -61,6 +67,47 @@ function commandExists(cmd: string): boolean {
   try {
     const check = isWindows ? `where ${cmd}` : `command -v ${cmd}`;
     execSync(check, { stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Stricter probe than commandExists() — also verifies the resolved binary
+ * actually runs. On Windows, `where python3` matches the Microsoft Store
+ * App Execution Alias stub at C:\Users\<u>\AppData\Local\Microsoft\WindowsApps\
+ * even when no real Python is installed; the stub exits non-zero (9009) and
+ * pops the Store. Filter those entries out and require `<cmd> --version` to
+ * exit 0 before declaring the runtime available (#455).
+ */
+function runnableExists(cmd: string): boolean {
+  if (isWindows) {
+    // Reject if every `where` hit lives under Microsoft\WindowsApps (Store stubs).
+    try {
+      const out = execSync(`where ${cmd}`, { encoding: "utf-8", stdio: "pipe" });
+      const hits = out.trim().split(/\r?\n/).map(p => p.trim()).filter(Boolean);
+      if (hits.length === 0) return false;
+      const realHits = hits.filter(p => !/\\Microsoft\\WindowsApps\\/i.test(p));
+      if (realHits.length === 0) return false;
+    } catch {
+      return false;
+    }
+  } else if (!commandExists(cmd)) {
+    return false;
+  }
+  // Probe with --version. On Windows, allow 5s for cold-start (MS Store stub
+  // fallthrough can be slow). On POSIX, 1500ms is plenty for a real binary
+  // and keeps cold detection of python3 → python → py under ~5s total (#454).
+  try {
+    // DEP0190 fix: avoid args array with shell:true on Windows.
+    // Use execSync with a command string when shell is required;
+    // keep execFileSync (no shell) on POSIX.
+    if (isWindows) {
+      execSync(`"${cmd}" --version`, { stdio: "pipe", timeout: 5000 });
+    } else {
+      execFileSync(cmd, ["--version"], { stdio: "pipe", timeout: 1500 });
+    }
     return true;
   } catch {
     return false;
@@ -76,10 +123,17 @@ function bunExists(): boolean {
 }
 
 function bunCommand(): string {
-  if (commandExists("bun")) return "bun";
+  // Prefer absolute .exe paths so spawn() can run with shell:false on Windows.
+  // `where bun` may resolve to a `bun.cmd` npm shim (#506) which CreateProcess
+  // cannot execute directly — return the real .exe wherever we can find one.
   for (const p of bunFallbackPaths()) {
     if (existsSync(p)) return p;
   }
+  // Bare name only if PATH resolution confirms it. On Windows this is
+  // typically a .cmd shim — the executor's needsShell list (which now
+  // includes "bun" — see #506) ensures shell:true so cmd.exe can resolve it.
+  if (commandExists("bun")) return "bun";
+  // Synthetic last-resort path for diagnostics/error messages.
   const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
   return isWindows ? `${home}\\.bun\\bin\\bun.exe` : `${home}/.bun/bin/bun`;
 }
@@ -89,9 +143,17 @@ function bunFallbackPaths(): string[] {
   const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
   if (isWindows) {
     const localAppData = process.env.LOCALAPPDATA ?? "";
+    const appData = process.env.APPDATA ?? "";
     return [
+      // Native bun installer locations (irm bun.sh/install.ps1).
       ...(home ? [`${home}\\.bun\\bin\\bun.exe`] : []),
       ...(localAppData ? [`${localAppData}\\bun\\bin\\bun.exe`] : []),
+      // npm i -g bun installs bun.exe under the npm prefix (typically
+      // %APPDATA%\npm\node_modules\bun\bin\bun.exe). Without this, npm
+      // installs were "found" via bun.cmd shim on PATH and the bare "bun"
+      // string was returned — spawn() then ENOENT'd because CreateProcess
+      // can't execute .cmd files (#506).
+      ...(appData ? [`${appData}\\npm\\node_modules\\bun\\bin\\bun.exe`] : []),
     ];
   }
   return home ? [`${home}/.bun/bin/bun`] : [];
@@ -131,14 +193,30 @@ function resolveWindowsBash(): string | null {
 
 function getVersion(cmd: string, args: string[] = ["--version"]): string {
   try {
-    return execFileSync(cmd, args, {
-      encoding: "utf-8",
-      shell: process.platform === "win32",
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 5000,
-    })
-      .trim()
-      .split(/\r?\n/)[0];
+    // DEP0190 fix: avoid args array with shell:true on Windows.
+    if (process.platform === "win32") {
+      // Hardening (PR #537 review): quote any cmd.exe metacharacter, not just
+      // whitespace. Current arg sources are internally controlled, but cheap
+      // defense-in-depth for future call sites.
+      const cmdStr = [cmd, ...args]
+        .map(a => /[\s"&|<>^()%!]/.test(a) ? JSON.stringify(a) : a)
+        .join(" ");
+      return execSync(cmdStr, {
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+        timeout: 5000,
+      })
+        .trim()
+        .split(/\r?\n/)[0];
+    } else {
+      return execFileSync(cmd, args, {
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+        timeout: 5000,
+      })
+        .trim()
+        .split(/\r?\n/)[0];
+    }
   } catch {
     return "unknown";
   }
@@ -171,11 +249,13 @@ export function detectRuntimes(): RuntimeMap {
         : commandExists("ts-node")
           ? "ts-node"
           : null,
-    python: commandExists("python3")
+    python: runnableExists("python3")
       ? "python3"
-      : commandExists("python")
+      : runnableExists("python")
         ? "python"
-        : null,
+        : runnableExists("py")
+          ? "py"
+          : null,
     shell: shellOverride ?? (isWin
       ? (resolveWindowsBash() ?? (commandExists("sh") ? "sh" : commandExists("powershell") ? "powershell" : "cmd.exe"))
       : commandExists("bash") ? "bash" : "sh"),
@@ -190,6 +270,7 @@ export function detectRuntimes(): RuntimeMap {
         ? "r"
         : null,
     elixir: commandExists("elixir") ? "elixir" : null,
+    csharp: commandExists("dotnet-script") ? "dotnet-script" : null,
   };
 }
 
@@ -252,6 +333,10 @@ export function getRuntimeSummary(runtimes: RuntimeMap): string {
     lines.push(
       `  Elixir:     ${runtimes.elixir} (${getVersion(runtimes.elixir)})`,
     );
+  if (runtimes.csharp)
+    lines.push(
+      `  C#:         ${runtimes.csharp} (${getVersion(runtimes.csharp)})`,
+    );
 
   if (!bunPreferred) {
     lines.push("");
@@ -274,6 +359,7 @@ export function getAvailableLanguages(runtimes: RuntimeMap): Language[] {
   if (runtimes.perl) langs.push("perl");
   if (runtimes.r) langs.push("r");
   if (runtimes.elixir) langs.push("elixir");
+  if (runtimes.csharp) langs.push("csharp");
   return langs;
 }
 
@@ -284,7 +370,7 @@ export function buildCommand(
 ): string[] {
   switch (language) {
     case "javascript":
-      return runtimes.javascript.endsWith("bun")
+      return BUN_BASENAME.test(runtimeBasename(runtimes.javascript))
         ? [runtimes.javascript, "run", filePath]
         : [runtimes.javascript, filePath];
 
@@ -294,7 +380,7 @@ export function buildCommand(
           "No TypeScript runtime available. Install one of: bun (recommended), tsx (npm i -g tsx), or ts-node.",
         );
       }
-      if (runtimes.typescript?.endsWith("bun")) return [runtimes.typescript, "run", filePath];
+      if (BUN_BASENAME.test(runtimeBasename(runtimes.typescript))) return [runtimes.typescript, "run", filePath];
       if (runtimes.typescript === "tsx") return ["tsx", filePath];
       return ["ts-node", filePath];
 
@@ -374,5 +460,13 @@ export function buildCommand(
         throw new Error( "Elixir not available. Install elixir.");
       }
       return ["elixir", filePath];
+
+    case "csharp":
+      if (!runtimes.csharp) {
+        throw new Error(
+          "C# not available. Install dotnet-script via `dotnet tool install -g dotnet-script`.",
+        );
+      }
+      return [runtimes.csharp, filePath];
   }
 }
