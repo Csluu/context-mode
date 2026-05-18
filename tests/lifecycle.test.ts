@@ -6,12 +6,14 @@
  */
 
 import { describe, test, assert } from "vitest";
-import { spawn, execSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { writeFileSync, unlinkSync } from "node:fs";
+import { createRequire } from "node:module";
 import { join } from "node:path";
 import { startLifecycleGuard, makeDefaultIsParentAlive } from "../src/lifecycle.js";
 
-const TSX_PATH = execSync("which tsx", { encoding: "utf-8" }).trim();
+const require = createRequire(import.meta.url);
+const TSX_CLI = require.resolve("tsx/cli");
 
 function spawnGuardChild(exitCode: number): { child: ReturnType<typeof spawn>; ready: Promise<void> } {
   const script = join(process.cwd(), `_lifecycle_test_${exitCode}.ts`);
@@ -24,7 +26,7 @@ startLifecycleGuard({
 process.stdout.write("READY");
 setInterval(() => {}, 1000);
 `);
-  const child = spawn(TSX_PATH, [script], {
+  const child = spawn(process.execPath, [TSX_CLI, script], {
     cwd: process.cwd(),
     stdio: ["pipe", "pipe", "pipe"],
   });

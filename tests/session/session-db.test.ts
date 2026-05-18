@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { afterAll, describe, expect, test } from "vitest";
 import { SessionDB } from "../../src/session/db.js";
+import { hashProjectDirCanonical, hashProjectDirLegacy, resolveSessionDbPath } from "../../src/session/db.js";
 import {
   cleanOrphanedWALFiles,
   defaultDBPath,
@@ -63,6 +64,30 @@ describe("Schema", () => {
     const count = db.getEventCount("non-existent");
     assert.equal(count, 0);
   });
+
+  test("resolveSessionDbPath migrates legacy WAL and SHM sidecars with main DB", () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), "context-mode-session-path-"));
+    try {
+      const projectDir = "C:\\Users\\Chris\\Project";
+      const legacyHash = hashProjectDirLegacy(projectDir);
+      const canonicalHash = hashProjectDirCanonical(projectDir);
+      if (legacyHash === canonicalHash) return;
+
+      const legacyPath = join(sessionsDir, `${legacyHash}.db`);
+      writeFileSync(legacyPath, "db", "utf8");
+      writeFileSync(`${legacyPath}-wal`, "wal", "utf8");
+      writeFileSync(`${legacyPath}-shm`, "shm", "utf8");
+
+      const canonicalPath = resolveSessionDbPath({ projectDir, sessionsDir });
+
+      assert.equal(canonicalPath, join(sessionsDir, `${canonicalHash}.db`));
+      assert.equal(existsSync(canonicalPath), true);
+      assert.equal(existsSync(`${canonicalPath}-wal`), true);
+      assert.equal(existsSync(`${canonicalPath}-shm`), true);
+    } finally {
+      rmSync(sessionsDir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ════════════════════════════════════════════
@@ -107,6 +132,30 @@ describe("Insert & Retrieve", () => {
     assert.equal(events[0].project_dir, "/workspace/repo");
     assert.equal(events[0].attribution_source, "event_path");
     assert.equal(events[0].attribution_confidence, 0.91);
+  });
+
+  test("insertEvent sanitizes trace-sensitive JSON fields before persistence", () => {
+    const db = createTestDB();
+    const sid = "sess-trace-sanitize";
+    const token = "ghp_abcdefghijklmnopqrstuvwxyzABCDE";
+
+    db.insertEvent(sid, makeEvent({
+      type: "route-decision",
+      category: "routing",
+      data: JSON.stringify({
+        command: `GITHUB_TOKEN=${token} pnpm test`,
+        rawCommand: `GITHUB_TOKEN=${token} pnpm test`,
+        nested: { rawOutput: `token ${token}` },
+      }),
+    }));
+
+    const [event] = db.getEvents(sid);
+    const payload = JSON.parse(event.data);
+    expect(payload.command).toContain("GITHUB_TOKEN=<redacted>");
+    expect(payload.command).not.toContain(token);
+    expect(payload.rawCommand).toBe("<redacted:trace-forbidden-field>");
+    expect(payload.nested.rawOutput).toBe("<redacted:trace-forbidden-field>");
+    expect(event.data).not.toContain(token);
   });
 
   test("getLatestAttributedProjectDir returns latest non-empty project", () => {
@@ -300,6 +349,16 @@ describe("Session Meta", () => {
     const stats = db.getSessionStats(sid);
     assert.equal(stats!.project_dir, "/project/root");
   });
+
+  test("latest session tie-breaks same-second started_at by insertion order", () => {
+    const db = createTestDB();
+
+    db.ensureSession("same-second-a", "/project/root");
+    db.ensureSession("same-second-b", "/project/root");
+
+    assert.equal(db.getLatestSessionId(), "same-second-b");
+    assert.equal(db.listSessions(2)[0].session_id, "same-second-b");
+  });
 });
 
 // ════════════════════════════════════════════
@@ -320,6 +379,25 @@ describe("Session Stats", () => {
     assert.ok(stats !== null);
     assert.equal(stats!.event_count, 3);
     assert.ok(stats!.last_event_at !== null, "last_event_at should be set");
+  });
+
+  test("bulkInsertEvents increments event_count once per inserted non-duplicate", () => {
+    const db = createTestDB();
+    const sid = "sess-bulk-count";
+
+    db.ensureSession(sid, "/project");
+    db.bulkInsertEvents(sid, [
+      makeEvent({ data: "a.ts" }),
+      makeEvent({ data: "b.ts" }),
+      makeEvent({ data: "c.ts" }),
+    ]);
+    assert.equal(db.getSessionStats(sid)!.event_count, 3);
+
+    db.bulkInsertEvents(sid, [
+      makeEvent({ data: "a.ts" }),
+      makeEvent({ data: "b.ts" }),
+    ]);
+    assert.equal(db.getSessionStats(sid)!.event_count, 3);
   });
 
   test("getSessionStats returns null for non-existent session", () => {
@@ -682,6 +760,20 @@ describe("Limit", () => {
     // Should be the first 3 (ordered by id ASC)
     assert.equal(limited[0].data, "file-0.ts");
     assert.equal(limited[2].data, "file-2.ts");
+  });
+
+  test("getLatestEvents returns newest rows in chronological order", () => {
+    const db = createTestDB();
+    const sid = "sess-latest-limit";
+
+    for (let i = 0; i < 5; i++) {
+      db.insertEvent(sid, makeEvent({ data: `file-${i}.ts` }));
+    }
+
+    const latest = db.getLatestEvents(sid, 2);
+    assert.equal(latest.length, 2);
+    assert.equal(latest[0].data, "file-3.ts");
+    assert.equal(latest[1].data, "file-4.ts");
   });
 });
 

@@ -17,7 +17,10 @@ import {
 } from "../routing-block.mjs";
 import { createToolNamer } from "./tool-naming.mjs";
 import { isMCPReady } from "./mcp-ready.mjs";
-import { existsSync, mkdirSync, rmSync, rmdirSync, readdirSync, unlinkSync, openSync, closeSync, statSync, constants as fsConstants } from "node:fs";
+import { existsSync, mkdirSync, rmSync, rmdirSync, readdirSync, unlinkSync, openSync, closeSync, readFileSync, writeFileSync, statSync, constants as fsConstants } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 /**
  * Guard for actions that redirect to MCP tools (#230).
@@ -29,9 +32,127 @@ function mcpRedirect(result) {
   if (!isMCPReady()) return null;
   return result;
 }
-import { tmpdir } from "node:os";
-import { resolve } from "node:path";
 
+const ROUTER_MODES = new Set(["off", "recommend", "rewrite"]);
+const STABLE_MUTATION_PLATFORMS = new Set([
+  "claude-code",
+  "cursor",
+  "openclaw",
+  "opencode",
+  "vscode-copilot",
+]);
+const EXPERIMENTAL_MUTATION_PLATFORMS = new Set([
+  "gemini-cli",
+  "jetbrains-copilot",
+  "qwen-code",
+]);
+let routeCommandImpl = null;
+let rewriteRegistryInitFailed = false;
+
+function hookRouterMode() {
+  if (process.env.CONTEXT_MODE_RAW === "1") return "off";
+  const requested = process.env.CONTEXT_MODE_ROUTER_MODE ?? process.env.CTX_MODE_ROUTER;
+  if (requested === "off") return "off";
+  if (process.env.CONTEXT_MODE_HOOK_REWRITE === "1") return "rewrite";
+  return ROUTER_MODES.has(requested) ? requested : "recommend";
+}
+
+function platformCanMutate(platform) {
+  if (!platform) return false;
+  const id = platform;
+  if (STABLE_MUTATION_PLATFORMS.has(id)) return true;
+  return process.env.CONTEXT_MODE_EXPERIMENTAL_HOOK_REWRITE === "1"
+    && EXPERIMENTAL_MUTATION_PLATFORMS.has(id);
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
+}
+
+function shellSplit(command) {
+  const args = [];
+  let cur = "";
+  let quote = null;
+  let escaped = false;
+  for (const ch of String(command).trim()) {
+    if (escaped) {
+      cur += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if ((ch === "'" || ch === "\"") && quote === null) {
+      quote = ch;
+      continue;
+    }
+    if (quote === ch) {
+      quote = null;
+      continue;
+    }
+    if (/\s/.test(ch) && quote === null) {
+      if (cur) args.push(cur);
+      cur = "";
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur) args.push(cur);
+  return args;
+}
+
+function cliBundlePath() {
+  return resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "cli.bundle.mjs");
+}
+
+function rewriteRegistryBundlePath() {
+  return resolve(dirname(fileURLToPath(import.meta.url)), "..", "rewrite-registry.bundle.mjs");
+}
+
+export async function initRewriteRegistry(bundlePath = rewriteRegistryBundlePath()) {
+  if (routeCommandImpl) return true;
+  if (rewriteRegistryInitFailed) return false;
+  try {
+    const mod = await import(pathToFileURL(bundlePath).href);
+    if (typeof mod.routeCommand !== "function") throw new Error("routeCommand export missing");
+    routeCommandImpl = mod.routeCommand;
+    return true;
+  } catch (err) {
+    rewriteRegistryInitFailed = true;
+    if (!process.env.CONTEXT_MODE_SUPPRESS_ROUTER_WARNING) {
+      process.stderr.write(
+        `[context-mode] WARNING: rewrite registry bundle unavailable — hook command rewrite disabled: ${err?.message ?? err}\n`,
+      );
+    }
+    return false;
+  }
+}
+
+function buildCliRunCommand(route, command) {
+  const args = [process.execPath, cliBundlePath(), "run"];
+  if (route?.parser) args.push("--parser", route.parser);
+  args.push("--", ...shellSplit(command));
+  return args.map(shellQuote).join(" ");
+}
+
+function routeGuidance(decision, t) {
+  const route = decision.route;
+  if (!route) return null;
+  const tool = t(route.tool);
+  const command = route.command ? ` command=${JSON.stringify(route.command)}` : "";
+  const parser = route.parser ? ` parser=${JSON.stringify(route.parser)}` : "";
+  return [
+    "<context_guidance>",
+    "  <tip>",
+    `    Recommended route: ${tool}${parser}${command}.`,
+    `    Reason: ${route.summary}`,
+    `    Safety: ${decision.safety?.reason ?? "n/a"}.`,
+    "  </tip>",
+    "</context_guidance>",
+  ].join("\n");
+}
 // Guidance throttle: show each advisory type at most once per session.
 // Hybrid approach:
 //   - In-memory Set for same-process (OpenCode ts-plugin, vitest)
@@ -48,6 +169,22 @@ import { resolve } from "node:path";
 // pass it to routePreToolUse so the marker directory stays consistent across
 // invocations of the same logical session.
 const _guidanceShown = new Set();
+const _guidanceCounters = new Map();
+
+const EXTERNAL_MCP_NUDGE_DEFAULT = 10;
+const EXTERNAL_MCP_NUDGE_MIN = 1;
+const EXTERNAL_MCP_NUDGE_MAX = 100;
+const EXTERNAL_MCP_NUDGE_ENV = "CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY";
+
+function getExternalMcpNudgeEvery() {
+  const raw = process.env[EXTERNAL_MCP_NUDGE_ENV];
+  if (raw == null || raw === "") return EXTERNAL_MCP_NUDGE_DEFAULT;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < EXTERNAL_MCP_NUDGE_MIN || parsed > EXTERNAL_MCP_NUDGE_MAX) {
+    return EXTERNAL_MCP_NUDGE_DEFAULT;
+  }
+  return parsed;
+}
 
 function defaultGuidanceId() {
   return process.env.VITEST_WORKER_ID
@@ -85,6 +222,38 @@ function guidanceOnce(type, content, sessionId) {
   return { action: "context", additionalContext: content };
 }
 
+function guidancePeriodic(type, content, sessionId, period) {
+  const safePeriod = Math.max(1, period | 0);
+  const id = sessionId ? `s-${sessionId}` : defaultGuidanceId();
+  const key = `${id}::${type}`;
+
+  let count = _guidanceCounters.get(key);
+  const dir = guidanceDirFor(sessionId);
+  const counterPath = resolve(dir, `${type}.count`);
+
+  if (count == null) {
+    try {
+      const parsed = Number.parseInt(readFileSync(counterPath, "utf8"), 10);
+      count = Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+    } catch {
+      count = 0;
+    }
+  }
+
+  const next = count + 1;
+  _guidanceCounters.set(key, next);
+
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(counterPath, String(next), "utf8");
+  } catch {
+    // Best effort: if the cross-process counter cannot persist, use in-memory state.
+  }
+
+  if ((next - 1) % safePeriod !== 0) return null;
+  return { action: "context", additionalContext: content };
+}
+
 /**
  * Robust recursive delete. On Windows, `fs.rmSync` on directories under a
  * tmpdir whose path contains non-ASCII characters (e.g. a Chinese / Japanese /
@@ -105,6 +274,7 @@ function rmSyncRobust(dir) {
 
 export function resetGuidanceThrottle(sessionId) {
   _guidanceShown.clear();
+  _guidanceCounters.clear();
   // Clear ppid-based dir (legacy / fallback callers) and the sessionId dir if given
   rmSyncRobust(guidanceDirFor());
   if (sessionId) {
@@ -274,6 +444,8 @@ let securityInitFailed = false;
  * repo's hooks/ directory.
  */
 export async function initSecurity(buildDir) {
+  await initRewriteRegistry();
+
   const { existsSync } = await import("node:fs");
   const { resolve, dirname } = await import("node:path");
   const { fileURLToPath, pathToFileURL } = await import("node:url");
@@ -499,6 +671,24 @@ function isExternalMcpTool(toolName) {
   return false;
 }
 
+function getShellCommand(toolInput) {
+  if (!toolInput || typeof toolInput !== "object") return "";
+  if (typeof toolInput.command === "string") return toolInput.command;
+  if (typeof toolInput.cmd === "string") return toolInput.cmd;
+  return "";
+}
+
+function getCodexConfigDir(env = process.env) {
+  const codexHome = env.CODEX_HOME;
+  if (codexHome && codexHome.trim() !== "") return resolve(codexHome);
+  return resolve(homedir(), ".codex");
+}
+
+function getPlatformSettingsPath(platform) {
+  if (platform === "codex") return resolve(getCodexConfigDir(), "settings.json");
+  return undefined;
+}
+
 /**
  * Route a PreToolUse event. Returns normalized decision object or null for passthrough.
  *
@@ -539,17 +729,18 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
 
   // Normalize platform-specific tool name to canonical
   const canonical = TOOL_ALIASES[toolName] ?? toolName;
+  const platformSettingsPath = getPlatformSettingsPath(platform);
 
   // ─── Bash: Stage 1 security check, then Stage 2 routing ───
   if (canonical === "Bash") {
-    const command = toolInput.command ?? "";
+    const command = getShellCommand(toolInput);
 
     // Stage 1: Security check against user's deny/allow patterns.
     // Only act when an explicit pattern matched. When no pattern matches,
     // evaluateCommand returns { decision: "ask" } with no matchedPattern —
     // in that case fall through so other hooks and the platform's native engine can decide.
     if (security) {
-      const policies = security.readBashPolicies(projectDir);
+      const policies = security.readBashPolicies(projectDir, platformSettingsPath);
       if (policies.length > 0) {
         const result = security.evaluateCommand(command, policies);
         if (result.decision === "deny") {
@@ -605,6 +796,12 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
       });
 
       if (hasDangerousSegment) {
+        if (platform === "codex") {
+          return mcpRedirect({
+            action: "deny",
+            reason: `context-mode: curl/wget blocked. Use ${t("ctx_execute")} or ${t("ctx_fetch_and_index")} instead. Codex hooks cannot safely rewrite this command.`,
+          });
+        }
         return mcpRedirect({
           action: "modify",
           updatedInput: {
@@ -636,6 +833,12 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
       /requests\.(get|post|put)\s*\(/i.test(noHeredoc) ||
       /http\.(get|request)\s*\(/i.test(noHeredoc)
     ) {
+      if (platform === "codex") {
+        return mcpRedirect({
+          action: "deny",
+          reason: `context-mode: Inline HTTP blocked. Use ${t("ctx_execute")} or ${t("ctx_fetch_and_index")} instead. Codex hooks cannot safely rewrite this command.`,
+        });
+      }
       return mcpRedirect({
         action: "modify",
         updatedInput: {
@@ -655,6 +858,33 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
           command: `echo "context-mode: Build tool redirected. Think in Code — use ${t("ctx_execute")}(language: \\"shell\\", code: \\"${safeCmd} 2>&1 | tail -30\\") to run and print only errors/summary. Do NOT retry with Bash."`,
         },
       });
+    }
+
+    const mode = hookRouterMode();
+    const adapterCanRewrite = platformCanMutate(platform);
+    if (routeCommandImpl && mode !== "off" && (mode === "rewrite" || !isStructurallyBounded(command))) {
+      const decision = routeCommandImpl(command, { mode, adapterCanRewrite });
+      if (decision.decision === "rewrite" && decision.route?.tool === "ctx_execute") {
+        const routed = buildCliRunCommand(decision.route, command);
+        return {
+          action: "modify",
+          updatedInput: { command: routed },
+          redirectMeta: {
+            tool: "Bash",
+            type: "bash-rewritten",
+            bytesAvoided: 4096,
+            commandSummary: command.slice(0, 200),
+          },
+        };
+      }
+
+      if (decision.decision === "recommend" || decision.decision === "classify-only") {
+        const guidance = routeGuidance(decision, t);
+        if (guidance) {
+          return guidanceOnce(`route-${decision.selectedRule ?? "unmatched"}`, guidance, sessionId)
+            ?? guidanceOnce("bash", bashGuidance, sessionId);
+        }
+      }
     }
 
     // Skip the routing nudge for commands whose output is structurally
@@ -741,7 +971,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
   if (matchesContextModeTool(toolName, "ctx_execute", "execute")) {
     if (security && toolInput.language === "shell") {
       const code = toolInput.code ?? "";
-      const policies = security.readBashPolicies(projectDir);
+      const policies = security.readBashPolicies(projectDir, platformSettingsPath);
       if (policies.length > 0) {
         const result = security.evaluateCommand(code, policies);
         if (result.decision === "deny") {
@@ -760,7 +990,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
     if (security) {
       // Check file path against Read deny patterns
       const filePath = toolInput.path ?? "";
-      const denyGlobs = security.readToolDenyPatterns("Read", projectDir);
+      const denyGlobs = security.readToolDenyPatterns("Read", projectDir, platformSettingsPath);
       const evalResult = security.evaluateFilePath(filePath, denyGlobs);
       if (evalResult.denied) {
         return { action: "deny", reason: `Blocked by security policy: file path matches Read deny pattern ${evalResult.matchedPattern}` };
@@ -770,7 +1000,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
       const lang = toolInput.language ?? "";
       const code = toolInput.code ?? "";
       if (lang === "shell") {
-        const policies = security.readBashPolicies(projectDir);
+        const policies = security.readBashPolicies(projectDir, platformSettingsPath);
         if (policies.length > 0) {
           const result = security.evaluateCommand(code, policies);
           if (result.decision === "deny") {
@@ -789,7 +1019,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
   if (matchesContextModeTool(toolName, "ctx_batch_execute", "batch_execute")) {
     if (security) {
       const commands = toolInput.commands ?? [];
-      const policies = security.readBashPolicies(projectDir);
+      const policies = security.readBashPolicies(projectDir, platformSettingsPath);
       if (policies.length > 0) {
         for (const entry of commands) {
           const cmd = entry.command ?? "";
@@ -806,14 +1036,14 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
     return null;
   }
 
-  // ─── External MCP tools: one-shot guidance about routing large payloads ─── (#529)
+  // ─── External MCP tools: periodic guidance about routing large payloads ─── (#529)
   // hooks/hooks.json registers a `mcp__(?!plugin_context-mode_)` matcher so this
   // branch fires for slack/telegram/gdrive/notion-style MCPs whose results would
   // otherwise spill into context. We don't deny or modify — the agent still needs
   // the tool's output; we just nudge it to pipe large results through ctx_execute.
   if (isExternalMcpTool(toolName)) {
     const externalMcpGuidance = platform ? createExternalMcpGuidance(t) : EXTERNAL_MCP_GUIDANCE;
-    return guidanceOnce("external-mcp", externalMcpGuidance, sessionId);
+    return guidancePeriodic("external-mcp", externalMcpGuidance, sessionId, getExternalMcpNudgeEvery());
   }
 
   // Unknown tool — pass through

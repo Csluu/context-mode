@@ -61,6 +61,8 @@ openclaw gateway restart
 
 After the restart, the agent's tool inventory should include `context-mode__ctx_execute`, `context-mode__ctx_search`, `context-mode__ctx_fetch_and_index`, and the rest of the `ctx_*` surface (OpenClaw prefixes MCP-sourced tools with the server name).
 
+The plugin may also register native OpenClaw `ctx_*` bridge stubs for compatibility with routing prompts. Those stubs are not the primary execution surface; they point callers back to the standalone MCP server/CLI. Prefer the MCP-prefixed `context-mode__ctx_*` tools for real agent work.
+
 ## Hook Registration
 
 The adapter uses two different registration APIs, matching OpenClaw's internal architecture:

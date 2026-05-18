@@ -483,29 +483,63 @@ describe("OpenClawPlugin", () => {
     });
   });
 
-  // ── SLICE OClaw-1: registerTool exposes 11 ctx_* MCP tools ────────
+  // ── SLICE OClaw-1: registerTool exposes ctx_* MCP tools ───────────
   describe("registerTool (SLICE OClaw-1 — sidecar MCP)", () => {
-    const EXPECTED_NAMES = [
+    const STABLE_EXPECTED_NAMES = [
       "ctx_execute",
       "ctx_execute_file",
+      "ctx_read",
       "ctx_index",
       "ctx_search",
       "ctx_fetch_and_index",
+      "ctx_fetch_run",
       "ctx_batch_execute",
+      "ctx_route",
       "ctx_stats",
+      "ctx_gain",
+      "ctx_discover",
       "ctx_doctor",
       "ctx_upgrade",
       "ctx_purge",
       "ctx_insight",
     ] as const;
 
-    it("registers all 11 ctx_* tools via api.registerTool", async () => {
+    const EXPERIMENTAL_NAMES = [
+      "ctx_guard",
+      "ctx_eval",
+      "ctx_trace",
+      "ctx_diff",
+      "ctx_cache",
+    ] as const;
+
+    function withExperimentalTools<T>(fn: () => Promise<T>): Promise<T> {
+      const previous = process.env.CTX_MODE_EXPERIMENTAL;
+      process.env.CTX_MODE_EXPERIMENTAL = "1";
+      return fn().finally(() => {
+        if (previous === undefined) delete process.env.CTX_MODE_EXPERIMENTAL;
+        else process.env.CTX_MODE_EXPERIMENTAL = previous;
+      });
+    }
+
+    it("registers stable ctx_* tools via api.registerTool", async () => {
       const mock = await createTestPlugin(join(tempDir, "register-tool"));
       const names = mock.tools.map((t) => t.name);
-      for (const expected of EXPECTED_NAMES) {
+      for (const expected of STABLE_EXPECTED_NAMES) {
         expect(names).toContain(expected);
       }
-      expect(mock.tools.length).toBeGreaterThanOrEqual(EXPECTED_NAMES.length);
+      for (const experimental of EXPERIMENTAL_NAMES) {
+        expect(names).not.toContain(experimental);
+      }
+      expect(mock.tools.length).toBeGreaterThanOrEqual(STABLE_EXPECTED_NAMES.length);
+    });
+
+    it("registers experimental tools only when CTX_MODE_EXPERIMENTAL=1", async () => {
+      const mock = await withExperimentalTools(() => createTestPlugin(join(tempDir, "register-tool-experimental")));
+      const names = mock.tools.map((t) => t.name);
+
+      for (const expected of [...STABLE_EXPECTED_NAMES, ...EXPERIMENTAL_NAMES]) {
+        expect(names).toContain(expected);
+      }
     });
 
     it("each tool definition has description + parameters schema", async () => {
@@ -526,6 +560,16 @@ describe("OpenClawPlugin", () => {
       expect(Array.isArray(out.content)).toBe(true);
       expect(out.content[0].type).toBe("text");
       expect(typeof out.content[0].text).toBe("string");
+    });
+
+    it("does not advertise invalid ctx_* CLI command names", async () => {
+      const mock = await withExperimentalTools(() => createTestPlugin(join(tempDir, "register-tool-cli-fallback")));
+      const tool = mock.tools.find((t) => t.name === "ctx_guard");
+      expect(tool).toBeDefined();
+      const out = await tool!.execute("call-1", {});
+
+      expect(out.content[0].text).toContain("context-mode guard");
+      expect(out.content[0].text).not.toContain("context-mode ctx_guard");
     });
   });
 

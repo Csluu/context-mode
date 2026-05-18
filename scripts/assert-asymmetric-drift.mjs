@@ -27,6 +27,7 @@ const BUNDLES = [
   { src: ["src/session"], bundle: "hooks/session-snapshot.bundle.mjs" },
   { src: ["src/session"], bundle: "hooks/session-db.bundle.mjs" },
   { src: ["src"], bundle: "hooks/security.bundle.mjs", excludeDirs: new Set(["adapters", "session"]) },
+  { src: ["src/routing"], bundle: "hooks/rewrite-registry.bundle.mjs" },
 ];
 
 function walkTs(dir, excludeDirs = new Set(), out = []) {

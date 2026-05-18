@@ -24,6 +24,8 @@ export interface ToolContext {
   readonly pluginRoot: string;
   /** Resolve the active session directory. */
   readonly getSessionDir: () => string;
+  /** Current adapter/platform id, used for adapter-specific output budgets. */
+  readonly getAdapterId?: () => string;
   /** Wrap a tool response with usage tracking. Returns the response unchanged. */
   readonly trackResponse: <T>(toolName: string, response: T) => T;
 }
@@ -35,6 +37,8 @@ export interface ToolContext {
  */
 export interface ToolDefinition<I = unknown, O = unknown> {
   readonly name: string;
+  /** Experimental tools are hidden from the public MCP surface unless CTX_MODE_EXPERIMENTAL=1. */
+  readonly experimental?: boolean;
   readonly config: {
     readonly title: string;
     readonly description: string;

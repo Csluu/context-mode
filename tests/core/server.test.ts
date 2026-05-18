@@ -1624,10 +1624,10 @@ if (LIVE) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ctx_upgrade: inline fallback for missing CLI files
+// ctx_upgrade: refuses unpinned inline fallback for missing CLI files
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe("ctx_upgrade tool: inline fallback for missing CLI", () => {
+describe("ctx_upgrade tool: no unpinned inline fallback for missing CLI", () => {
   // After src/tools/MIGRATION.md extraction, ctx_upgrade lives in its own
   // file. Read both server.ts (registration site) and upgrade.ts (handler
   // body) so existing structural assertions stay meaningful.
@@ -1642,22 +1642,24 @@ describe("ctx_upgrade tool: inline fallback for missing CLI", () => {
     expect(serverSrc).toMatch(/existsSync\(bundlePath\)/);
   });
 
+  test("MCP upgrade is disabled unless unpinned upgrades are explicitly allowed", () => {
+    expect(serverSrc).toContain("CONTEXT_MODE_ALLOW_UNPINNED_UPGRADE");
+    expect(serverSrc).toContain("Upgrade command disabled for this fork");
+  });
+
   test("tries build/cli.js second", () => {
     expect(serverSrc).toContain('resolve(pluginRoot, "build", "cli.js")');
   });
 
-  test("contains inline fallback with git clone when neither CLI file exists", () => {
-    // The fallback must generate an inline script with git clone via execFileSync
-    expect(serverSrc).toMatch(/git.*clone.*--depth.*1/);
-    // The inline script is written to a temp .mjs file
-    expect(serverSrc).toMatch(/\.ctx-upgrade-inline\.mjs/);
+  test("does not clone or npm install from an inline fallback when neither CLI file exists", () => {
+    expect(serverSrc).not.toMatch(/git.*clone.*--depth.*1/);
+    expect(serverSrc).not.toMatch(/\.ctx-upgrade-inline\.mjs/);
+    expect(serverSrc).toContain("Refusing the old inline fallback");
   });
 
-  test("inline fallback copies key files to plugin root", () => {
-    // The inline script must copy build artifacts back
-    expect(serverSrc).toMatch(/server\.bundle\.mjs/);
-    expect(serverSrc).toMatch(/cli\.bundle\.mjs/);
-    expect(serverSrc).toMatch(/npm.*install/);
+  test("fallback error names trusted reinstall instead of executing supply-chain steps", () => {
+    expect(serverSrc).toContain("trusted package-manager upgrade");
+    expect(serverSrc).toContain("pinned commit, checksum, or signature");
   });
 
   test("fallback only triggers when neither CLI file exists", () => {
@@ -1765,6 +1767,13 @@ describe("Platform-aware session paths via adapter", () => {
     );
     expect(statsMatch).not.toBeNull();
     expect(statsMatch![0]).not.toMatch(/["']\.claude["']/);
+  });
+
+  test("ctx_stats renders explicit scope and resolved session id metadata", () => {
+    expect(serverSrc).toContain("function prependStatsScopeHeader");
+    expect(serverSrc).toContain("ctx_stats scope:");
+    expect(serverSrc).toContain("function resolveStatsSessionId");
+    expect(serverSrc).toContain("latest project session_meta row");
   });
 
   // ── Adapter methods used for session paths ──
@@ -2709,8 +2718,7 @@ describe("classifyIp — SSRF guard IP classifier", () => {
     expect(classifyIp("::")).toBe("block");      // unspecified
   });
 
-  test("private (allow by default, block under strict mode): RFC1918 + loopback IPv4", () => {
-    // Allowed by default — developer's local dev server / internal network
+  test("private classifier marks RFC1918 + loopback IPv4 for policy blocking", () => {
     expect(classifyIp("127.0.0.1")).toBe("private");
     expect(classifyIp("127.255.255.255")).toBe("private");
     expect(classifyIp("10.0.0.5")).toBe("private");
@@ -2741,6 +2749,9 @@ describe("classifyIp — SSRF guard IP classifier", () => {
     expect(classifyIp("::ffff:127.0.0.1")).toBe("private");
     expect(classifyIp("::ffff:169.254.169.254")).toBe("block"); // IMDS via IPv4-mapped
     expect(classifyIp("::ffff:8.8.8.8")).toBe("public");
+    expect(classifyIp("::ffff:7f00:1")).toBe("private"); // compact 127.0.0.1
+    expect(classifyIp("::ffff:a9fe:a9fe")).toBe("block"); // compact 169.254.169.254
+    expect(classifyIp("::ffff:0808:0808")).toBe("public"); // compact 8.8.8.8
   });
 });
 
@@ -2761,9 +2772,9 @@ describe("SSRF guard — ssrfGuard policy in src/server.ts", () => {
     expect(serverSrc).toContain("link-local / IMDS / multicast / reserved");
   });
 
-  test("strict mode opt-in via CTX_FETCH_STRICT=1", () => {
-    expect(serverSrc).toContain('process.env.CTX_FETCH_STRICT === "1"');
-    expect(serverSrc).toContain('verdict === "private" && strict');
+  test("private network fetches require explicit CTX_FETCH_ALLOW_PRIVATE=1 opt-in", () => {
+    expect(serverSrc).toContain('process.env.CTX_FETCH_ALLOW_PRIVATE === "1"');
+    expect(serverSrc).toContain('verdict === "private" && !allowPrivate');
   });
 
   test("ssrfGuard runs BEFORE cache lookup (poisoned cache defense)", () => {

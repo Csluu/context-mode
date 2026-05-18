@@ -11,12 +11,17 @@
 
 import type { ToolContext, ToolDefinition } from "./types.js";
 
+export function experimentalToolsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (env.CTX_MODE_EXPERIMENTAL ?? env.CONTEXT_MODE_EXPERIMENTAL ?? "") === "1";
+}
+
 /**
  * Register a single tool definition against the MCP server in `ctx.server`.
  * The handler's return value is passed through `ctx.trackResponse`
  * automatically.
  */
 export function registerTool<I = unknown, O = unknown>(ctx: ToolContext, def: ToolDefinition<I, O>): void {
+  if (def.experimental && !experimentalToolsEnabled()) return;
   // `as never` here intentionally bypasses the SDK's per-call generic that
   // ties inputSchema to handler-input type. ToolDefinition keeps `inputSchema`
   // as `unknown` so it can hold any Zod schema without infecting consumers

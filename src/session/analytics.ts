@@ -426,7 +426,7 @@ export class AnalyticsEngine {
   queryAll(runtimeStats: RuntimeStats): FullReport {
     // ── Resolve latest session ID ──
     const latestSession = this.db.prepare(
-      "SELECT session_id FROM session_meta ORDER BY started_at DESC LIMIT 1",
+      "SELECT session_id FROM session_meta ORDER BY started_at DESC, rowid DESC LIMIT 1",
     ).get() as { session_id: string } | undefined;
     const sid = latestSession?.session_id ?? "";
 

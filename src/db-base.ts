@@ -23,6 +23,11 @@ import { join } from "node:path";
 // Types
 // ─────────────────────────────────────────────────────────
 
+export interface SQLiteOpenOptions {
+  readonly busyTimeoutMs?: number;
+  readonly retryDelays?: number[];
+}
+
 /**
  * Explicit interface for cached prepared statements that accept varying
  * parameter counts. better-sqlite3's generic `Statement` collapses under
@@ -414,11 +419,21 @@ export function defaultDBPath(prefix: string = "context-mode"): string {
 /**
  * Retry a DB operation with exponential backoff on SQLITE_BUSY errors.
  * Catches errors containing "SQLITE_BUSY" or "database is locked" and
- * retries up to 3 times with delays: 100ms, 500ms, 2000ms.
+ * retries with delays long enough to absorb multi-process startup bursts.
  * If all retries fail, throws a descriptive error.
  * Pass custom delays for testing (e.g., [0, 0, 0] to skip waits).
  */
-export function withRetry<T>(fn: () => T, delays: number[] = [100, 500, 2000]): T {
+function sleepSync(ms: number): void {
+  if (ms <= 0) return;
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    const start = Date.now();
+    while (Date.now() - start < ms) { /* fallback busy-wait */ }
+  }
+}
+
+export function withRetry<T>(fn: () => T, delays: number[] = [50, 100, 250, 500, 1000, 2000, 4000]): T {
   let lastError: Error | undefined;
   for (let attempt = 0; attempt <= delays.length; attempt++) {
     try {
@@ -430,9 +445,7 @@ export function withRetry<T>(fn: () => T, delays: number[] = [100, 500, 2000]): 
       }
       lastError = err instanceof Error ? err : new Error(msg);
       if (attempt < delays.length) {
-        const delay = delays[attempt];
-        const start = Date.now();
-        while (Date.now() - start < delay) { /* busy-wait for sync retry */ }
+        sleepSync(delays[attempt]);
       }
     }
   }
@@ -440,6 +453,23 @@ export function withRetry<T>(fn: () => T, delays: number[] = [100, 500, 2000]): 
     `SQLITE_BUSY: database is locked after ${delays.length} retries. ` +
     `Original error: ${lastError?.message}`
   );
+}
+
+function openDatabaseWithPragmas(
+  Database: typeof DatabaseConstructor,
+  dbPath: string,
+  opts: SQLiteOpenOptions = {},
+): DatabaseInstance {
+  return withRetry(() => {
+    const db = new Database(dbPath, { timeout: opts.busyTimeoutMs ?? 30000 });
+    try {
+      applyWALPragmas(db);
+      return db;
+    } catch (err) {
+      closeDB(db);
+      throw err;
+    }
+  }, opts.retryDelays);
 }
 
 // ─────────────────────────────────────────────────────────
@@ -516,6 +546,7 @@ const _liveDBs: Set<DatabaseInstance> = (() => {
 export abstract class SQLiteBase {
   readonly #dbPath: string;
   readonly #db: DatabaseInstance;
+  readonly #retryDelays: number[] | undefined;
 
   /**
    * Open (or create) a SQLite DB at `dbPath`.
@@ -537,22 +568,21 @@ export abstract class SQLiteBase {
    * block in tests/util/db-base-platform-gate.test.ts for the
    * regression-proof anchor (source-pin + behavioural).
    */
-  constructor(dbPath: string) {
+  constructor(dbPath: string, opts: SQLiteOpenOptions = {}) {
     const Database = loadDatabase();
     this.#dbPath = dbPath;
+    this.#retryDelays = opts.retryDelays;
     cleanOrphanedWALFiles(dbPath);
     let db: DatabaseInstance;
     try {
-      db = new Database(dbPath, { timeout: 30000 });
-      applyWALPragmas(db);
+      db = openDatabaseWithPragmas(Database, dbPath, opts);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (isSQLiteCorruptionError(msg)) {
         renameCorruptDB(dbPath);
         cleanOrphanedWALFiles(dbPath);
         try {
-          db = new Database(dbPath, { timeout: 30000 });
-          applyWALPragmas(db);
+          db = openDatabaseWithPragmas(Database, dbPath, opts);
         } catch (retryErr) {
           throw new Error(
             `Failed to create fresh DB after renaming corrupt file: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`
@@ -564,7 +594,7 @@ export abstract class SQLiteBase {
     }
     this.#db = db;
     _liveDBs.add(this.#db);
-    this.initSchema();
+    this.withRetry(() => this.initSchema());
     this.prepareStatements();
   }
 
@@ -591,7 +621,7 @@ export abstract class SQLiteBase {
   }
 
   protected withRetry<T>(fn: () => T): T {
-    return withRetry(fn);
+    return withRetry(fn, this.#retryDelays);
   }
 
   /**

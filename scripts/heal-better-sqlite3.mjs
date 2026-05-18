@@ -20,7 +20,8 @@
  *
  * Layered heal:
  *   A. Spawn prebuild-install via process.execPath — bypasses PATH/MSVC.
- *   B. `npm install better-sqlite3` (re-resolves tree, NOT `npm rebuild`).
+ *   B. `npm install better-sqlite3@<declared exact version>` (re-resolves
+ *      tree, NOT `npm rebuild`).
  *   C. Write actionable stderr message naming `npm install better-sqlite3`
  *      and the Windows / #408 context.
  *
@@ -41,10 +42,22 @@
  *   used — it returns the internal major ("18") on VS 2026, not the year.
  */
 
-import { existsSync as fsExistsSync } from "node:fs";
-import { execSync, execFileSync, spawnSync } from "node:child_process";
+import { existsSync as fsExistsSync, readFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { createRequire } from "node:module";
+
+function readBetterSqlite3InstallSpec(pkgRoot) {
+  try {
+    const pkg = JSON.parse(readFileSync(resolve(pkgRoot, "package.json"), "utf8"));
+    const spec = pkg.dependencies?.["better-sqlite3"]
+      ?? pkg.optionalDependencies?.["better-sqlite3"];
+    if (typeof spec === "string" && /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(spec)) {
+      return `better-sqlite3@${spec}`;
+    }
+  } catch { /* fall through */ }
+  return null;
+}
 
 /**
  * Conda installation path prefixes that must NEVER be selected as the
@@ -282,6 +295,10 @@ export function healBetterSqlite3Binding(pkgRoot) {
     const bsqRoot = resolve(pkgRoot, "node_modules", "better-sqlite3");
     const bindingPath = resolve(bsqRoot, "build", "Release", "better_sqlite3.node");
     const npmBin = process.platform === "win32" ? "npm.cmd" : "npm";
+    const betterSqlite3Spec = readBetterSqlite3InstallSpec(pkgRoot);
+    if (!betterSqlite3Spec) {
+      return { healed: false, reason: "package-version-unpinned" };
+    }
 
     // ── Conda defense (#533) ─────────────────────────────────────────
     // Resolve once up front; reuse across all child spawns. The probe
@@ -324,7 +341,7 @@ export function healBetterSqlite3Binding(pkgRoot) {
           npmBin,
           [
             "install",
-            "better-sqlite3",
+            betterSqlite3Spec,
             "--no-optional",
             "--no-save",
             "--no-audit",
@@ -393,13 +410,22 @@ export function healBetterSqlite3Binding(pkgRoot) {
       }
     } catch { /* best effort — try Layer B */ }
 
-    // ── Layer B: `npm install better-sqlite3` — NOT `npm rebuild` ──
+    // ── Layer B: `npm install better-sqlite3@<exact>` — NOT `npm rebuild` ──
     // Re-resolves tree and re-runs prebuild-install via the package's
     // own install script. Avoids the rebuild → node-gyp fall-through.
     try {
-      execSync(
-        `${npmBin} install better-sqlite3 --no-package-lock --no-save --silent`,
-        { cwd: pkgRoot, stdio: "pipe", timeout: 120000, shell: true, env: childEnv },
+      execFileSync(
+        npmBin,
+        [
+          "install",
+          betterSqlite3Spec,
+          "--no-package-lock",
+          "--no-save",
+          "--no-audit",
+          "--no-fund",
+          "--silent",
+        ],
+        { cwd: pkgRoot, stdio: "pipe", timeout: 120000, shell: process.platform === "win32", env: childEnv },
       );
       if (fsExistsSync(bindingPath)) {
         return { healed: true, reason: "npm-install" };
@@ -416,7 +442,7 @@ export function healBetterSqlite3Binding(pkgRoot) {
         "\n[context-mode] better-sqlite3 native binding could not be installed automatically.\n" +
         "  This is a known issue on Windows when prebuild-install is not on PATH (#408).\n" +
         condaHint +
-        "  Workaround: run `npm install better-sqlite3` from the plugin directory.\n\n",
+        `  Workaround: run \`npm install ${betterSqlite3Spec} --no-save\` from the plugin directory.\n\n`,
       );
     } catch { /* stderr unavailable — give up silently */ }
     if (condaActive && !safePython) {

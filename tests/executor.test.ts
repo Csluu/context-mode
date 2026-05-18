@@ -92,6 +92,23 @@ describe("Runtime Detection", () => {
     assert.ok(cmd[cmd.length - 1] === "/tmp/test.js");
   });
 
+  test("execute tees stdout and stderr chunks for sidecar capture before formatting", async () => {
+    const capturedStdout: Buffer[] = [];
+    const capturedStderr: Buffer[] = [];
+    const result = await executor.execute({
+      language: "javascript",
+      code: "console.log('capture-out'); console.error('capture-err');",
+      outputCapture: {
+        stdout: (chunk) => capturedStdout.push(Buffer.from(chunk)),
+        stderr: (chunk) => capturedStderr.push(Buffer.from(chunk)),
+      },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(Buffer.concat(capturedStdout).toString("utf8")).toContain("capture-out");
+    expect(Buffer.concat(capturedStderr).toString("utf8")).toContain("capture-err");
+  });
+
   test("buildCommand: throws for unavailable runtime", async () => {
     const noRuntimes: RuntimeMap = {
       javascript: "node",

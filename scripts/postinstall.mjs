@@ -69,7 +69,7 @@ const pkgRoot = resolve(__dirname, "..");
       "    npm install -g context-mode\n" +
       "\n" +
       "  Or: run under Bun\n" +
-      "    curl -fsSL https://bun.sh/install | bash\n" +
+      "    Review Bun's official installation instructions, then install context-mode with Bun:\n" +
       "    bun add -g context-mode\n" +
       "\n",
     );

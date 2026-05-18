@@ -203,6 +203,14 @@ interface ExecuteOptions {
   timeout?: number;
   /** Keep process running after timeout instead of killing it. */
   background?: boolean;
+  /**
+   * Optional stream tee for sidecar writers. Called as stdout/stderr chunks
+   * arrive, before the MCP server formats or buffers the final response.
+   */
+  outputCapture?: {
+    stdout?: (chunk: Buffer) => void;
+    stderr?: (chunk: Buffer) => void;
+  };
 }
 
 interface ExecuteFileOptions extends ExecuteOptions {
@@ -261,7 +269,7 @@ export class PolyglotExecutor {
   }
 
   async execute(opts: ExecuteOptions): Promise<ExecResult> {
-    const { language, code, timeout, background = false } = opts;
+    const { language, code, timeout, background = false, outputCapture } = opts;
     const tmpDir = mkdtempSync(join(OS_TMPDIR, ".ctx-mode-"));
 
     try {
@@ -270,7 +278,7 @@ export class PolyglotExecutor {
 
       // Rust: compile then run
       if (cmd[0] === "__rust_compile_run__") {
-        return await this.#compileAndRun(filePath, tmpDir, timeout);
+        return await this.#compileAndRun(filePath, tmpDir, timeout, outputCapture);
       }
 
       // Sandbox memory cap (#tier3). When CONTEXT_MODE_SANDBOX_MEM_MB is set,
@@ -294,7 +302,7 @@ export class PolyglotExecutor {
       // and other project-aware tools work naturally. Non-shell languages
       // run in the temp directory where their script file is written.
       const cwd = language === "shell" ? this.#projectRoot : tmpDir;
-      const result = await this.#spawn(cmd, cwd, tmpDir, timeout, background);
+      const result = await this.#spawn(cmd, cwd, tmpDir, timeout, background, outputCapture);
 
       // Skip tmpDir cleanup if process was backgrounded — it may still need files
       if (!result.backgrounded) {
@@ -313,14 +321,14 @@ export class PolyglotExecutor {
   }
 
   async executeFile(opts: ExecuteFileOptions): Promise<ExecResult> {
-    const { path: filePath, language, code, timeout } = opts;
+    const { path: filePath, language, code, timeout, outputCapture } = opts;
     const absolutePath = resolve(this.#projectRoot, filePath);
     const wrappedCode = this.#wrapWithFileContent(
       absolutePath,
       language,
       code,
     );
-    return this.execute({ language, code: wrappedCode, timeout });
+    return this.execute({ language, code: wrappedCode, timeout, outputCapture });
   }
 
   #writeScript(tmpDir: string, code: string, language: Language): string {
@@ -366,6 +374,7 @@ export class PolyglotExecutor {
     srcPath: string,
     cwd: string,
     timeout: number | undefined,
+    outputCapture?: ExecuteOptions["outputCapture"],
   ): Promise<ExecResult> {
     const binSuffix = isWin ? ".exe" : "";
     const binPath = srcPath.replace(/\.rs$/, "") + binSuffix;
@@ -391,7 +400,7 @@ export class PolyglotExecutor {
     }
 
     // Run
-    return this.#spawn([binPath], cwd, cwd, timeout);
+    return this.#spawn([binPath], cwd, cwd, timeout, false, outputCapture);
   }
 
   async #spawn(
@@ -400,6 +409,7 @@ export class PolyglotExecutor {
     sandboxTmpDir: string,
     timeout: number | undefined,
     background = false,
+    outputCapture?: ExecuteOptions["outputCapture"],
   ): Promise<ExecResult> {
     return new Promise((res) => {
       // Only .cmd/.bat shims need shell on Windows; real executables don't.
@@ -495,6 +505,7 @@ export class PolyglotExecutor {
       proc.stdout!.on("data", (chunk: Buffer) => {
         totalBytes += chunk.length;
         if (totalBytes <= this.#hardCapBytes) {
+          try { outputCapture?.stdout?.(chunk); } catch { /* capture is best-effort */ }
           stdoutChunks.push(chunk);
         } else if (!capExceeded) {
           capExceeded = true;
@@ -505,6 +516,7 @@ export class PolyglotExecutor {
       proc.stderr!.on("data", (chunk: Buffer) => {
         totalBytes += chunk.length;
         if (totalBytes <= this.#hardCapBytes) {
+          try { outputCapture?.stderr?.(chunk); } catch { /* capture is best-effort */ }
           stderrChunks.push(chunk);
         } else if (!capExceeded) {
           capExceeded = true;

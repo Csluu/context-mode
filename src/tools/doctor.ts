@@ -13,6 +13,7 @@ import { resolve } from "node:path";
 import { z } from "zod";
 
 import type { HookAdapter } from "../adapters/types.js";
+import { envConfig, resolveEffectiveConfig } from "../config/context-mode-config.js";
 import { PolyglotExecutor } from "../executor.js";
 import { loadDatabase } from "../db-base.js";
 import { detectRuntimes, getAvailableLanguages, hasBunRuntime, type Language, type RuntimeMap } from "../runtime.js";
@@ -40,6 +41,20 @@ const IDLE_AFFECTED_HOSTS: ReadonlySet<string> = new Set([
   "claude-code", "codex", "cursor", "gemini-cli",
   "vscode-copilot", "jetbrains-copilot", "antigravity", "zed",
 ]);
+
+function integrationTier(adapter: HookAdapter): string {
+  const caps = adapter.capabilities;
+  if (caps.preToolUse && caps.postToolUse && caps.canModifyArgs) {
+    return "tier 1 hook rewrite";
+  }
+  if (caps.preToolUse || caps.postToolUse || caps.canInjectSessionContext) {
+    return "tier 2 hook guidance";
+  }
+  if (adapter.paradigm === "mcp-only") {
+    return "tier 2 MCP-only";
+  }
+  return "tier 3 instruction-only";
+}
 
 /**
  * Structured repair action emitted alongside the human-readable status
@@ -139,6 +154,11 @@ export function makeCtxDoctor(deps: DoctorDeps): ToolDefinition<DoctorInput, { c
       // Hook scripts
       const diagnosticAdapter = await deps.getDiagnosticAdapter();
       if (diagnosticAdapter) {
+        lines.push(
+          `[OK] Integration tier: ${integrationTier(diagnosticAdapter)} — ${diagnosticAdapter.name} ` +
+          `(preToolUse=${diagnosticAdapter.capabilities.preToolUse}, canModifyArgs=${diagnosticAdapter.capabilities.canModifyArgs})`,
+        );
+
         for (const result of diagnosticAdapter.validateHooks(pluginRoot)) {
           const prefix = result.status === "pass" ? "[OK]" : result.status === "warn" ? "[WARN]" : "[FAIL]";
           const fix = result.fix ? ` — fix: ${result.fix}` : "";
@@ -159,6 +179,20 @@ export function makeCtxDoctor(deps: DoctorDeps): ToolDefinition<DoctorInput, { c
         }
       } else {
         lines.push("[WARN] Hooks: adapter detection unavailable");
+      }
+
+      // Router/config visibility. Keep this diagnostic local and non-fatal:
+      // bad env config should be visible in doctor without crashing the tool.
+      try {
+        const effective = resolveEffectiveConfig([
+          { name: "env", config: envConfig(process.env) },
+        ]);
+        lines.push(
+          `[OK] Router: mode=${effective.config.router.mode} ` +
+          `source=${effective.sources["router.mode"] ?? "default"}`,
+        );
+      } catch (err) {
+        lines.push(`[FAIL] Router: invalid config — ${err instanceof Error ? err.message : String(err)}`);
       }
 
       // Idle-shutdown sanity check (#592). Hosts in IDLE_AFFECTED_HOSTS do not

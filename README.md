@@ -83,7 +83,7 @@ Restart Claude Code (or run `/reload-plugins`).
 
 All checks should show `[x]`. The doctor validates runtimes, hooks, FTS5, and plugin registration.
 
-**Routing:** Automatic. The SessionStart hook injects routing instructions at runtime — no file is written to your project. The plugin registers all hooks (PreToolUse, PostToolUse, PreCompact, SessionStart) and 11 MCP tools — six sandbox tools (`ctx_batch_execute`, `ctx_execute`, `ctx_execute_file`, `ctx_index`, `ctx_search`, `ctx_fetch_and_index`) plus five meta-tools (`ctx_stats`, `ctx_doctor`, `ctx_upgrade`, `ctx_purge`, `ctx_insight`).
+**Routing:** Automatic. The SessionStart hook injects routing instructions at runtime — no file is written to your project. The plugin registers all hooks (PreToolUse, PostToolUse, PreCompact, SessionStart) and 16 stable MCP tools: the original execute/search/fetch/stats/admin tools plus `ctx_read`, `ctx_route`, `ctx_fetch_run`, `ctx_gain`, and `ctx_discover`. Experimental tools (`ctx_guard`, `ctx_eval`, `ctx_trace`, `ctx_diff`, `ctx_cache`) are hidden unless `CTX_MODE_EXPERIMENTAL=1` or `CONTEXT_MODE_EXPERIMENTAL=1`.
 
 | Slash Command | What it does |
 |---|---|
@@ -93,7 +93,7 @@ All checks should show `[x]`. The doctor validates runtimes, hooks, FTS5, and pl
 | `/context-mode:ctx-purge` | Permanently delete all indexed content from the knowledge base. |
 | `/context-mode:ctx-insight` | Personal analytics dashboard — 90 metrics, 37 insight patterns, 4 composite scores (productivity, quality, delegation, context health) across 23 event categories. Opens a local web UI. |
 
-> **Note:** Slash commands are a Claude Code plugin feature. On other platforms, type `ctx stats`, `ctx doctor`, `ctx upgrade`, or `ctx insight` in the chat — the model calls the MCP tool automatically. See [Utility Commands](#utility-commands).
+> **Note:** Slash commands are a Claude Code plugin feature. On other platforms, type `ctx stats`, `ctx gain`, `ctx discover`, `ctx doctor`, `ctx upgrade`, or `ctx insight` in the chat — the model calls the MCP tool automatically. See [Utility Commands](#utility-commands).
 
 **Status line (optional):** Claude Code's plugin manifest cannot declare a status line, so this is a one-time manual edit to `~/.claude/settings.json`:
 
@@ -115,7 +115,7 @@ After saving, restart Claude Code. The bar shows `$ saved this session · $ save
 claude mcp add context-mode -- npx -y context-mode
 ```
 
-This gives you all 11 MCP tools without automatic routing. The model can still use them — it just won't be nudged to prefer them over raw Bash/Read/WebFetch. Good for trying it out before committing to the full plugin.
+This gives you all stable MCP tools without automatic routing. The model can still use them — it just won't be nudged to prefer them over raw Bash/Read/WebFetch. Good for trying it out before committing to the full plugin.
 
 </details>
 
@@ -365,7 +365,7 @@ Restart Cursor. The plugin appears in **Settings → Plugins** as "Context Mode 
        "preToolUse": [
          {
            "command": "context-mode hook cursor pretooluse",
-           "matcher": "Shell|Read|Grep|WebFetch|Task|MCP:ctx_execute|MCP:ctx_execute_file|MCP:ctx_batch_execute"
+           "matcher": "Shell|Read|Grep|WebFetch|Task|MCP:ctx_.*"
          }
        ],
        "postToolUse": [
@@ -424,14 +424,17 @@ Full configs: [`configs/cursor/hooks.json`](configs/cursor/hooks.json) | [`confi
      "mcp": {
        "context-mode": {
          "type": "local",
-         "command": ["context-mode"]
+         "command": ["context-mode"],
+         "environment": {
+           "CONTEXT_MODE_IDLE_TIMEOUT_MS": "900000"
+         }
        }
      },
      "plugin": ["context-mode"]
    }
    ```
 
-   The `mcp` entry registers all 11 MCP tools. The `plugin` entry enables hooks — OpenCode calls the plugin's TypeScript functions directly before and after each tool execution, blocking dangerous commands and enforcing sandbox routing.
+   The `mcp` entry registers all stable MCP tools. The `plugin` entry enables hooks — OpenCode calls the plugin's TypeScript functions directly before and after each tool execution, blocking dangerous commands and enforcing sandbox routing.
 
 3. *(Optional)* Copy the routing rules file. The model needs an `AGENTS.md` file for routing awareness:
 
@@ -474,14 +477,17 @@ Full configs: [`configs/opencode/opencode.json`](configs/opencode/opencode.json)
      "mcp": {
        "context-mode": {
          "type": "local",
-         "command": ["context-mode"]
+         "command": ["context-mode"],
+         "environment": {
+           "CONTEXT_MODE_IDLE_TIMEOUT_MS": "900000"
+         }
        }
      },
      "plugin": ["context-mode"]
    }
    ```
 
-   The `mcp` entry registers all 11 MCP tools. The `plugin` entry enables hooks — KiloCode calls the plugin's TypeScript functions directly before and after each tool execution, blocking dangerous commands and enforcing sandbox routing.
+   The `mcp` entry registers all stable MCP tools. The `plugin` entry enables hooks — KiloCode calls the plugin's TypeScript functions directly before and after each tool execution, blocking dangerous commands and enforcing sandbox routing.
 
 3. *(Optional)* Copy the routing rules file. KiloCode shares the OpenCode plugin architecture, so the model needs an `AGENTS.md` file for routing awareness:
 
@@ -545,6 +551,27 @@ Full documentation: [`docs/adapters/openclaw.md`](docs/adapters/openclaw.md)
 
 **Install:**
 
+Preferred plugin install:
+
+```bash
+codex plugin marketplace add mksglu/context-mode
+```
+
+Enable plugin hooks while the Codex feature is still gated:
+
+```toml
+[features]
+plugin_hooks = true
+hooks = true
+```
+
+The Codex plugin manifest provides MCP via `.codex-plugin/mcp.json`, skills via
+`skills/`, and bundled hooks via `.codex-plugin/hooks.json`. No manual
+`[mcp_servers.context-mode]` block or `$CODEX_HOME/hooks.json` is needed when
+`plugin_hooks` is enabled and the plugin hooks are trusted.
+
+Manual fallback for Codex builds without `plugin_hooks`:
+
 1. Install context-mode globally:
 
    ```bash
@@ -563,14 +590,16 @@ Full documentation: [`docs/adapters/openclaw.md`](docs/adapters/openclaw.md)
 
    > **Feature flag note:** Current Codex builds expose hooks under `[features].hooks`
    > (or `codex --enable hooks`). Prefer `[features].hooks`; `[features].codex_hooks`
-   > remains accepted as a legacy alias in current Codex builds.
+   > remains accepted as a legacy alias in current Codex builds. Bundled plugin
+   > hooks additionally require `plugin_hooks` until Codex enables plugin hooks
+   > by default.
 
 3. Add hooks for routing enforcement and session tracking. Create `$CODEX_HOME/hooks.json` (or `~/.codex/hooks.json` when `CODEX_HOME` is unset):
 
    ```json
    {
      "hooks": {
-      "PreToolUse": [{ "matcher": "local_shell|shell|shell_command|exec_command|Bash|Shell|apply_patch|Edit|Write|grep_files|ctx_execute|ctx_execute_file|ctx_batch_execute|ctx_fetch_and_index|ctx_search|ctx_index|mcp__", "hooks": [{ "type": "command", "command": "context-mode hook codex pretooluse" }] }],
+      "PreToolUse": [{ "matcher": "local_shell|shell|shell_command|exec_command|Bash|Shell|apply_patch|Edit|Write|grep_files|ctx_.*|mcp__", "hooks": [{ "type": "command", "command": "context-mode hook codex pretooluse" }] }],
        "PostToolUse": [{ "hooks": [{ "type": "command", "command": "context-mode hook codex posttooluse" }] }],
        "SessionStart": [{ "hooks": [{ "type": "command", "command": "context-mode hook codex sessionstart" }] }],
        "PreCompact": [{ "hooks": [{ "type": "command", "command": "context-mode hook codex precompact" }] }],
@@ -597,9 +626,9 @@ Full documentation: [`docs/adapters/openclaw.md`](docs/adapters/openclaw.md)
 
 5. Restart Codex CLI.
 
-**Verify:** Start a session and type `ctx stats`. Context-mode tools should appear and respond.
+**Verify:** Start a session and type `ctx stats` to verify MCP. To verify hook routing, confirm Codex lists/trusts the context-mode plugin hooks, then run a command that matches the routing rules.
 
-**Routing:** MCP tools work. Hook-based routing is active when `$CODEX_HOME/hooks.json` or `~/.codex/hooks.json` is configured. The `AGENTS.md` file provides routing instructions for model awareness.
+**Routing:** MCP tools work after plugin install. Plugin hook routing is active only when `hooks` and `plugin_hooks` are enabled and Codex trusts the plugin hook commands. Manual hook routing is active when `$CODEX_HOME/hooks.json` or `~/.codex/hooks.json` is configured. The `AGENTS.md` file provides routing instructions for model awareness.
 
 </details>
 
@@ -632,7 +661,7 @@ Full documentation: [`docs/adapters/openclaw.md`](docs/adapters/openclaw.md)
    ```json
    {
      "hooks": {
-       "PreToolUse": [{ "matcher": "run_shell_command|read_file|read_many_files|grep_search|web_fetch|agent|mcp__plugin_context-mode_context-mode__ctx_execute|mcp__plugin_context-mode_context-mode__ctx_execute_file|mcp__plugin_context-mode_context-mode__ctx_batch_execute|mcp__(?!.*context-mode)", "hooks": [{ "type": "command", "command": "context-mode hook qwen-code pretooluse" }] }],
+       "PreToolUse": [{ "matcher": "run_shell_command|read_file|read_many_files|grep_search|web_fetch|agent|mcp__plugin_context-mode_context-mode__ctx_.*|mcp__(?!.*context-mode)", "hooks": [{ "type": "command", "command": "context-mode hook qwen-code pretooluse" }] }],
        "PostToolUse": [{ "matcher": "", "hooks": [{ "type": "command", "command": "context-mode hook qwen-code posttooluse" }] }],
        "SessionStart": [{ "matcher": "", "hooks": [{ "type": "command", "command": "context-mode hook qwen-code sessionstart" }] }],
        "PreCompact": [{ "matcher": "", "hooks": [{ "type": "command", "command": "context-mode hook qwen-code precompact" }] }],
@@ -731,7 +760,7 @@ Full configs: [`configs/antigravity/mcp_config.json`](configs/antigravity/mcp_co
      "description": "Context-mode hooks for context window protection",
      "hooks": {
        "preToolUse": [
-         { "matcher": "execute_bash|fs_read|@context-mode/ctx_execute|@context-mode/ctx_execute_file|@context-mode/ctx_batch_execute|@(?!context-mode/)", "command": "context-mode hook kiro pretooluse" }
+         { "matcher": "execute_bash|fs_read|@context-mode/ctx_.*|@(?!context-mode/)", "command": "context-mode hook kiro pretooluse" }
        ],
        "postToolUse": [
          { "matcher": "*", "command": "context-mode hook kiro posttooluse" }
@@ -966,10 +995,15 @@ npm install -g context-mode
 | `ctx_batch_execute` | Run multiple commands + search multiple queries in ONE call. Opt-in `concurrency: 1-8` for I/O-bound batches. | 986 KB → 62 KB |
 | `ctx_execute` | Run code in 12 languages. Only stdout enters context. | 56 KB → 299 B |
 | `ctx_execute_file` | Process files in sandbox. Raw content never leaves. | 45 KB → 155 B |
+| `ctx_read` | File map/outline/symbols/slice/full modes. Default for non-edit file inspection. | Large/repeated reads collapse |
+| `ctx_route` | Explain how a raw command should be routed before running it. | Prevents noisy path choices |
+| `ctx_fetch_run` | List/fetch redacted raw-output sidecars saved from previous runs. | Avoids rerunning for full output |
 | `ctx_index` | Chunk markdown into FTS5 with BM25 ranking. | 60 KB → 40 B |
 | `ctx_search` | Query indexed content with multiple queries in one call. | On-demand retrieval |
 | `ctx_fetch_and_index` | Fetch URL, chunk and index. 24h TTL cache — repeat calls skip network. `force: true` to bypass. Pass `requests: [{url, source}, ...]` + `concurrency: 1-8` for parallel multi-URL. | 60 KB → 40 B |
-| `ctx_stats` | Show context savings, call counts, and session statistics. | — |
+| `ctx_stats` | Show context use and session/lifetime statistics. | — |
+| `ctx_gain` | Show current-session savings from sandbox/index/cache/sidecars. | — |
+| `ctx_discover` | Report missed savings, bypass categories, and noisy-tool patterns. | — |
 | `ctx_doctor` | Diagnose installation: runtimes, hooks, FTS5, versions. | — |
 | `ctx_upgrade` | Upgrade to latest version from GitHub, rebuild, reconfigure hooks. | — |
 | `ctx_purge` | Permanently deletes all indexed content from the knowledge base. | — |
@@ -1148,7 +1182,7 @@ Detailed event data is also indexed into FTS5 for on-demand retrieval via `ctx_s
 
 **OpenClaw / Pi Agent** — High coverage. All tool lifecycle hooks (`after_tool_call`, `before_compaction`, `session_start`) fire via the native gateway plugin. User decisions aren't captured but file edits, git ops, errors, and tasks are fully tracked. Falls back to DB snapshot reconstruction if compaction hooks fail on older gateway versions. See [`docs/adapters/openclaw.md`](docs/adapters/openclaw.md).
 
-**Codex CLI** — MCP active, hooks require `[features].hooks = true`. Hook scripts (PreToolUse, PostToolUse, PreCompact, SessionStart, UserPromptSubmit, Stop) are implemented and tested; `PreCompact` remains runtime-gated on Codex builds that emit the event. PreToolUse deny routing works; input rewriting still depends on upstream `updatedInput` support ([openai/codex#18491](https://github.com/openai/codex/issues/18491)).
+**Codex CLI** — MCP active. Hooks require `[features].hooks = true`; bundled plugin hooks also require `[features].plugin_hooks = true` until Codex enables plugin hooks by default. Hook scripts (PreToolUse, PostToolUse, PreCompact, SessionStart, UserPromptSubmit, Stop) are implemented and tested; `PreCompact` remains runtime-gated on Codex builds that emit the event. PreToolUse deny routing works; input rewriting still depends on upstream `updatedInput` support ([openai/codex#18491](https://github.com/openai/codex/issues/18491)).
 
 **Antigravity** — No session support. No hooks, no event capture. Requires manually copying `GEMINI.md` to your project root. Auto-detected via MCP protocol handshake (`clientInfo.name`).
 
@@ -1183,11 +1217,11 @@ Detailed event data is also indexed into FTS5 for on-demand retrieval via `ctx_s
 >
 > **OpenClaw** runs context-mode as a native gateway plugin targeting Pi Agent sessions. Hooks register via `api.on()` (tool/lifecycle) and `api.registerHook()` (commands). All tool interception and compaction hooks are supported. See [`docs/adapters/openclaw.md`](docs/adapters/openclaw.md).
 >
-> **Codex CLI** hooks require `[features].hooks = true`. MCP tools work, and hook scripts activate through `$CODEX_HOME/hooks.json` or `~/.codex/hooks.json`. PreToolUse supports `permissionDecision: "deny"` only; input modification still needs upstream `updatedInput` support ([openai/codex#18491](https://github.com/openai/codex/issues/18491)). `additionalContext` is not supported in PreToolUse (context injection works via PostToolUse and SessionStart instead; the codex formatter handles this automatically). PreCompact stores resume snapshots before compaction on Codex builds that emit the event, SessionStart restores them, and UserPromptSubmit/Stop capture prompt and turn-end continuity events. See the Codex install section for setup. **Antigravity** and **Zed** do not support hooks. They rely solely on manually-copied routing instruction files (`AGENTS.md` / `GEMINI.md`) for enforcement (~60% compliance). See each platform's install section for copy instructions. Antigravity and Zed are auto-detected via MCP protocol handshake — no manual platform configuration needed.
+> **Codex CLI** hooks require `[features].hooks = true`. MCP tools work, and hook scripts activate either through bundled plugin hooks (`plugin_hooks = true` plus trusted plugin hooks) or through `$CODEX_HOME/hooks.json` / `~/.codex/hooks.json`. PreToolUse supports `permissionDecision: "deny"` only; input modification still needs upstream `updatedInput` support ([openai/codex#18491](https://github.com/openai/codex/issues/18491)). `additionalContext` is not supported in PreToolUse (context injection works via PostToolUse and SessionStart instead; the codex formatter handles this automatically). PreCompact stores resume snapshots before compaction on Codex builds that emit the event, SessionStart restores them, and UserPromptSubmit/Stop capture prompt and turn-end continuity events. See the Codex install section for setup. **Antigravity** and **Zed** do not support hooks. They rely solely on manually-copied routing instruction files (`AGENTS.md` / `GEMINI.md`) for enforcement (~60% compliance). See each platform's install section for copy instructions. Antigravity and Zed are auto-detected via MCP protocol handshake — no manual platform configuration needed.
 >
 > **Kiro** supports native `preToolUse` and `postToolUse` hooks for routing enforcement and tool event capture. `agentSpawn` (SessionStart equivalent) and `stop` are not yet wired. Requires manually copying `KIRO.md` to your project root. Kiro is auto-detected via MCP protocol handshake (`clientInfo.name`).
 >
-> **Pi Coding Agent** runs context-mode as an extension with full hook support. The extension registers `tool_call`, `tool_result`, `session_start`, and `session_before_compact` events, providing high session continuity coverage. The MCP server provides all 11 MCP tools.
+> **Pi Coding Agent** runs context-mode as an extension with full hook support. The extension registers `tool_call`, `tool_result`, `session_start`, and `session_before_compact` events, providing high session continuity coverage. The MCP server provides the stable context-mode MCP tools.
 >
 > **OMP (Oh My Pi)** runs context-mode as a plugin via `omp plugin install context-mode`. The plugin registers `tool_call`, `tool_result`, `session_start`, and `session_before_compact` events for hard-block routing and full session continuity. Storage isolated under `~/.omp/context-mode/` so OMP and Pi never share state. Auto-detected via `PI_CODING_AGENT_DIR` (default agent dir `~/.omp/agent`) or `~/.omp/` directory. See [issue #473](https://github.com/mksglu/context-mode/issues/473) for the storage-isolation history.
 
@@ -1223,6 +1257,8 @@ See [`docs/platform-support.md`](docs/platform-support.md) for the full capabili
 
 ```
 ctx stats       → context savings, call counts, session report
+ctx gain        → current-session savings from sandbox/index/cache/sidecars
+ctx discover    → missed savings, bypass categories, noisy-tool patterns
 ctx doctor      → diagnose runtimes, hooks, FTS5, versions
 ctx upgrade     → update from GitHub, rebuild, reconfigure hooks
 ctx purge       → permanently delete all indexed content from the knowledge base
@@ -1334,7 +1370,7 @@ Context Mode enforces the same permission rules you already use — but extends 
 }
 ```
 
-Add this to your project's `.claude/settings.json` (or `~/.claude/settings.json` for global rules). All platforms read security policies from Claude Code's settings format — even on Gemini CLI, VS Code Copilot, and OpenCode. Codex CLI security enforcement requires the Codex hooks in `$CODEX_HOME/hooks.json` or `~/.codex/hooks.json` to be configured.
+Add this to your project's `.claude/settings.json` (or `~/.claude/settings.json` for global rules). All platforms read security policies from Claude Code's settings format — even on Gemini CLI, VS Code Copilot, and OpenCode. Codex CLI security enforcement requires bundled plugin hooks or the manual Codex hooks in `$CODEX_HOME/hooks.json` / `~/.codex/hooks.json`.
 
 The pattern is `Tool(what to match)` where `*` means "anything".
 
@@ -1349,28 +1385,34 @@ Commands chained with `&&`, `;`, or `|` are split — each part is checked separ
 - **Schemes**: only `http:` and `https:` allowed (no `file://`, `gopher://`, `javascript:`, `data:`).
 - **Cloud metadata + link-local**: `169.254.0.0/16` (incl. AWS/GCP/Azure IMDS endpoint `169.254.169.254`) hard-blocked even if a hostname resolves to it (DNS-rebinding defense).
 - **Multicast / reserved**: `224.0.0.0/4`, `0.0.0.0/8`, IPv6 `ff00::/8`, `fe80::/10` blocked.
-- **Loopback + RFC1918** (`localhost`, `127.x`, `10.x`, `172.16-31.x`, `192.168.x`, IPv6 `::1`, `fc00::/7`) **allowed by default** so local dev servers + internal-network fetches keep working.
+- **Loopback + RFC1918** (`localhost`, `127.x`, `10.x`, `172.16-31.x`, `192.168.x`, IPv6 `::1`, `fc00::/7`) blocked by default.
 
-For hosted/CI environments where you want to block private targets too, set:
+For local dev servers or internal docs you explicitly trust, opt in:
 
 ```bash
-export CTX_FETCH_STRICT=1
+export CTX_FETCH_ALLOW_PRIVATE=1
 ```
 
-That blocks loopback + RFC1918 + ULA in addition to the always-blocked ranges. Useful when context-mode runs as a shared service, not on a developer's own machine.
+That allows loopback + RFC1918 + ULA in addition to public internet targets. Keep it unset when context-mode runs as a shared service or when untrusted web pages/prompts can influence URLs.
 
 `tool_input` for any `mcp__*` tool call is also redacted before persistence — keys matching `authorization`, `token`, `secret`, `password`, `api_key`, `cookie`, `signature`, `private_key` get masked to `[REDACTED]` so credentials in MCP arguments don't end up in the session DB.
 
 ### Lifecycle environment variables
 
-Two runtime knobs control how MCP server processes self-manage. Defaults are safe — only set these to opt-out of the leak-fix introduced in v1.0.132 ([#565](https://github.com/mksglu/context-mode/issues/565) / [#568](https://github.com/mksglu/context-mode/pull/568)).
+Two runtime knobs control how MCP server processes self-manage. Defaults are conservative: idle self-shutdown is disabled unless a host config explicitly opts in. OpenCode and KiloCode opt in because they open one MCP child per session/subagent; Claude Code, Codex, and editor MCP clients should not idle-exit by default because some hosts keep stale tool handles after MCP EOF.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CONTEXT_MODE_IDLE_TIMEOUT_MS` | `900000` (15 min) | An MCP child self-exits cleanly after this many milliseconds of stdin/request inactivity. Hosts like OpenCode and KiloCode open one MCP child per session and per subagent — without this, idle children accumulate to 25+ processes / 1.6 GB RSS in long-lived shells. Set to `0` to disable self-shutdown (rarely needed; useful only for daemons that must outlive their parent). |
-| `CONTEXT_MODE_STARTUP_SWEEP` | `1` (enabled) | At boot, a newly-spawned MCP child reaps any other context-mode MCP server pids that share its parent process (`sameParentOnly: true` — never touches MCP children of a different host). This reclaims accumulated siblings immediately instead of waiting for each idle timer to fire. Set to `0` or `false` to disable (useful when you intentionally want multiple concurrent MCP children under the same host, e.g. multi-tenant test runners). |
+| `CONTEXT_MODE_IDLE_TIMEOUT_MS` | `0` (disabled) | When set to a positive integer, an MCP child self-exits cleanly after this many milliseconds of stdin/request inactivity. OpenCode and KiloCode configs set `900000` (15 min) because those hosts can accumulate one MCP child per session/subagent. Leave disabled for hosts that do not auto-respawn after MCP EOF or ctx_* tools may go stale after idle. |
+| `CONTEXT_MODE_STARTUP_SWEEP` | unset (disabled) | When set to `1`, a newly-spawned MCP child reaps other context-mode MCP server pids that share its parent process (`sameParentOnly: true` — never touches MCP children of a different host). Keep disabled unless a host is proven to leak idle MCP siblings. |
 
-Both vars are read fresh at MCP server start — no restart of the host CLI is required, just spawn a new MCP child (open a new session) for changes to take effect. Invalid values (non-numeric `CONTEXT_MODE_IDLE_TIMEOUT_MS`, unrecognized `CONTEXT_MODE_STARTUP_SWEEP`) fall back to defaults silently.
+Both vars are read fresh at MCP server start — no restart of the host CLI is required, just spawn a new MCP child (open a new session) for changes to take effect. Invalid/non-numeric `CONTEXT_MODE_IDLE_TIMEOUT_MS` values fall back to `0` (disabled); unrecognized `CONTEXT_MODE_STARTUP_SWEEP` values fall back to disabled.
+
+### Routing-guidance environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY` | `10` | Cadence, in tool calls, at which the PreToolUse hook re-injects guidance for wrapping large external-MCP payloads in `ctx_execute`. Range `[1, 100]`; invalid values fall back to `10`. Set to `1` for every matching call, or higher for less frequent reminders. |
 
 ## Contributing
 

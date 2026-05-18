@@ -1,7 +1,7 @@
 /**
  * OpenClaw MCP tool registry.
  *
- * Catalogs the 11 ctx_* tools that OpenClaw plugin must register via
+ * Catalogs the ctx_* tools that OpenClaw plugin must register via
  * api.registerTool(...) so the routing block (which nudges agents toward
  * ctx_execute, ctx_search, etc.) actually has tools to call. Without this,
  * Phase 7 audit (v1.0.107-adapter-openclaw.json) flagged severity=CRITICAL —
@@ -14,13 +14,13 @@
  * OpenClaw signature is slightly different — see building-plugins.md:116
  *   api.registerTool({ name, description, parameters: TypeBox, execute(id, params) })
  *
- * Tool handlers are intentionally thin shims that delegate to the bundled CLI
- * (cli.bundle.mjs) — same fall-through pattern already used by ctx-doctor and
- * ctx-upgrade slash commands. This keeps the plugin's blast radius minimal:
- * we don't re-export the entire MCP server stack inside OpenClaw's process.
+ * Tool handlers are intentionally bridge stubs today. They register the ctx_*
+ * names so routing guidance is not dangling, then direct callers to the
+ * standalone MCP transport/CLI instead of re-exporting the whole server stack
+ * inside OpenClaw's process.
  *
- * The 11 tools mirror src/server.ts registerTool calls (lines 897, 1226, 1371,
- * 1497, 2034, 2256, 2440, 2501, 2592, 2712, 2808).
+ * The definitions mirror src/server.ts names and schemas enough for OpenClaw
+ * registration. Full execution remains owned by the standalone MCP server.
  */
 
 /** Minimal JSON-schema-like parameter spec accepted by OpenClaw registerTool. */
@@ -34,6 +34,7 @@ export interface OpenClawToolParameters {
 /** Tool definition shape returned to OpenClaw via api.registerTool. */
 export interface OpenClawToolDef {
   name: string;
+  experimental?: boolean;
   description: string;
   parameters: OpenClawToolParameters;
   execute: (
@@ -65,22 +66,34 @@ function safe(
   };
 }
 
-/** Stub handler — points users at the bundled CLI for full functionality. */
+/** Bridge stub — points users at the standalone MCP/CLI for full functionality. */
 function cliRedirect(toolName: string) {
+  const cliFallbacks: Record<string, string> = {
+    ctx_guard: "context-mode guard scan-fixtures --json",
+    ctx_eval: "context-mode eval all --json",
+    ctx_trace: "context-mode trace --latest --json",
+    ctx_diff: "context-mode diff --json",
+    ctx_cache: "context-mode cache explain -- <command>",
+    ctx_route: "context-mode route --explain <command>",
+  };
+  const fallback = cliFallbacks[toolName];
   return safe(async () => ({
     content: [
       {
         type: "text" as const,
-        text: `[context-mode] ${toolName} is exposed via the bundled context-mode CLI. Run 'context-mode ${toolName}' or invoke the MCP server directly. This OpenClaw stub registers the tool name so the routing block remains valid; full execution requires the standalone MCP transport.`,
+        text: fallback
+          ? `[context-mode] ${toolName} is registered in OpenClaw as a bridge stub. CLI fallback: '${fallback}'. Full execution requires the standalone MCP transport when no CLI equivalent exists.`
+          : `[context-mode] ${toolName} is registered in OpenClaw as a bridge stub. Invoke the standalone MCP transport directly; this tool has no complete CLI equivalent.`,
       },
     ],
   }));
 }
 
 /**
- * The 11 ctx_* tool definitions registered into OpenClaw via api.registerTool.
- * Names + descriptions mirror src/server.ts registerTool blocks 1:1 so prompts
- * referencing them (routing block, AGENTS.md) resolve to real callable tools.
+ * The ctx_* tool definitions registered into OpenClaw via api.registerTool.
+ * Names + descriptions mirror src/server.ts registerTool blocks so prompts
+ * referencing them (routing block, AGENTS.md) resolve to registered bridge
+ * tools even before OpenClaw supports direct MCP handler delegation.
  */
 export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
   {
@@ -114,6 +127,24 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
       additionalProperties: true,
     },
     execute: cliRedirect("ctx_execute_file"),
+  },
+  {
+    name: "ctx_read",
+    description:
+      "Read files using map, outline, symbols, slice, or full modes. Large full reads require a reason.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "File path" },
+        mode: { type: "string", description: "auto | map | outline | slice | symbols | full" },
+        start: { type: "number", description: "Start line for slice mode" },
+        end: { type: "number", description: "End line for slice mode" },
+        reason: { type: "string", description: "Reason for large full reads" },
+      },
+      required: ["path"],
+      additionalProperties: true,
+    },
+    execute: cliRedirect("ctx_read"),
   },
   {
     name: "ctx_index",
@@ -158,6 +189,21 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
     execute: cliRedirect("ctx_fetch_and_index"),
   },
   {
+    name: "ctx_fetch_run",
+    description: "List or fetch redacted raw-output sidecars created by context-mode runs.",
+    parameters: {
+      type: "object",
+      properties: {
+        runId: { type: "string", description: "Run id or prefix to fetch" },
+        latest: { type: "boolean", description: "Fetch latest artifact" },
+        list: { type: "boolean", description: "List recent artifacts" },
+        raw: { type: "boolean", description: "Include redacted raw preview" },
+      },
+      additionalProperties: true,
+    },
+    execute: cliRedirect("ctx_fetch_run"),
+  },
+  {
     name: "ctx_batch_execute",
     description:
       "Run multiple commands and search queries in ONE call. Primary research tool — replaces 30+ individual calls.",
@@ -172,6 +218,21 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
     execute: cliRedirect("ctx_batch_execute"),
   },
   {
+    name: "ctx_route",
+    description: "Classify a raw command and explain the context-mode routing decision without executing it.",
+    parameters: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "Raw command to classify" },
+        explain: { type: "boolean", description: "Return pretty JSON explanation" },
+        mode: { type: "string", description: "off | recommend | rewrite" },
+      },
+      required: ["command"],
+      additionalProperties: true,
+    },
+    execute: cliRedirect("ctx_route"),
+  },
+  {
     name: "ctx_stats",
     description: "Show context-mode session statistics — token consumption and per-tool breakdown.",
     parameters: {
@@ -180,6 +241,108 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
       additionalProperties: true,
     },
     execute: cliRedirect("ctx_stats"),
+  },
+  {
+    name: "ctx_gain",
+    description: "Summarize current-session context savings from indexed, sandboxed, cached, and sidecar output.",
+    parameters: {
+      type: "object",
+      properties: {
+        json: { type: "boolean", description: "Return machine-readable JSON" },
+      },
+      additionalProperties: true,
+    },
+    execute: cliRedirect("ctx_gain"),
+  },
+  {
+    name: "ctx_discover",
+    description: "Report noisy tools, sidecar volume, and bypass categories context-mode can or cannot observe.",
+    parameters: {
+      type: "object",
+      properties: {
+        json: { type: "boolean", description: "Return machine-readable JSON" },
+        minBytes: { type: "number", description: "Minimum returned bytes for noisy-tool findings" },
+      },
+      additionalProperties: true,
+    },
+    execute: cliRedirect("ctx_discover"),
+  },
+  {
+    name: "ctx_guard",
+    experimental: true,
+    description: "Scan output, sidecars, files, and fixtures for secrets, prompt-injection markers, and unsafe terminal controls.",
+    parameters: {
+      type: "object",
+      properties: {
+        mode: { type: "string", description: "scan-output | scan-sidecars | scan-file | scan-fixtures" },
+        text: { type: "string", description: "Text to scan" },
+        json: { type: "boolean", description: "Return machine-readable JSON" },
+      },
+      additionalProperties: true,
+    },
+    execute: cliRedirect("ctx_guard"),
+  },
+  {
+    name: "ctx_eval",
+    experimental: true,
+    description: "Run deterministic parser, router, redaction, and omission fixtures.",
+    parameters: {
+      type: "object",
+      properties: {
+        pack: { type: "string", description: "all | parsers | router | redaction | tool-broker | no-critical-omissions" },
+        fast: { type: "boolean", description: "Run fast fixture pack" },
+        json: { type: "boolean", description: "Return machine-readable JSON" },
+      },
+      additionalProperties: true,
+    },
+    execute: cliRedirect("ctx_eval"),
+  },
+  {
+    name: "ctx_trace",
+    experimental: true,
+    description: "Inspect local trace spans, why-big summaries, tool breakdowns, and parser activity.",
+    parameters: {
+      type: "object",
+      properties: {
+        latest: { type: "boolean", description: "Use latest session" },
+        session: { type: "string", description: "Session id" },
+        whyBig: { type: "boolean", description: "Explain large context use" },
+        json: { type: "boolean", description: "Return machine-readable JSON" },
+      },
+      additionalProperties: true,
+    },
+    execute: cliRedirect("ctx_trace"),
+  },
+  {
+    name: "ctx_diff",
+    experimental: true,
+    description: "Summarize Git changes with raw inventory preservation, semantic groups, and risk reason codes.",
+    parameters: {
+      type: "object",
+      properties: {
+        semantic: { type: "boolean", description: "Return semantic grouping" },
+        risk: { type: "boolean", description: "Return risk summary" },
+        rawSidecar: { type: "boolean", description: "Store redacted raw diff sidecar" },
+        json: { type: "boolean", description: "Return machine-readable JSON" },
+      },
+      additionalProperties: true,
+    },
+    execute: cliRedirect("ctx_diff"),
+  },
+  {
+    name: "ctx_cache",
+    experimental: true,
+    description: "Explain task-cache eligibility and explicitly run approved cache-serving canary commands.",
+    parameters: {
+      type: "object",
+      properties: {
+        mode: { type: "string", description: "explain | run | list | purge" },
+        command: { type: "string", description: "Command to explain" },
+        json: { type: "boolean", description: "Return machine-readable JSON" },
+      },
+      additionalProperties: true,
+    },
+    execute: cliRedirect("ctx_cache"),
   },
   {
     name: "ctx_doctor",
@@ -233,7 +396,16 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
   },
 ];
 
+export function openClawExperimentalToolsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (env.CTX_MODE_EXPERIMENTAL ?? env.CONTEXT_MODE_EXPERIMENTAL ?? "") === "1";
+}
+
+export function getOpenClawToolDefs(env: NodeJS.ProcessEnv = process.env): readonly OpenClawToolDef[] {
+  const experimental = openClawExperimentalToolsEnabled(env);
+  return OPENCLAW_TOOL_DEFS.filter((def) => !def.experimental || experimental);
+}
+
 /** Stable list of tool names — used by tests and manifest validation. */
-export const OPENCLAW_TOOL_NAMES: readonly string[] = OPENCLAW_TOOL_DEFS.map(
+export const OPENCLAW_TOOL_NAMES: readonly string[] = getOpenClawToolDefs().map(
   (def) => def.name,
 );

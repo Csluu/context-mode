@@ -38,6 +38,11 @@ describe("cli.bundle.mjs — marketplace install support", () => {
     expect(pkg.files).toContain("cli.bundle.mjs");
   });
 
+  it("package.json files field includes Codex plugin files", () => {
+    const pkg = JSON.parse(readFileSync(resolve(ROOT, "package.json"), "utf-8"));
+    expect(pkg.files).toContain(".codex-plugin");
+  });
+
   it("package.json bundle script builds cli.bundle.mjs", () => {
     const pkg = JSON.parse(readFileSync(resolve(ROOT, "package.json"), "utf-8"));
     expect(pkg.scripts.bundle).toContain("cli.bundle.mjs");
@@ -243,19 +248,22 @@ async function loadEnsureNativeCompat(): Promise<(pluginRoot: string) => void> {
   const helpers = helperMatch ? helperMatch[0] + "\n" : "";
 
   // Extract codesignBinary and probeNativeInChildProcess helpers if present
-  const codesignMatch = src.match(/^function codesignBinary\b[\s\S]*?^}/m);
+  const replaceBinaryMatch = src.match(/^function replaceActiveNativeBinaryFromCache\b[\s\S]*?^}/m);
+  const codesignMatch = src.match(/^(?:export\s+)?function codesignBinary\b[\s\S]*?^}/m);
   const probeMatch = src.match(/^function probeNativeInChildProcess\b[\s\S]*?^}/m);
+  const replaceBinary = replaceBinaryMatch ? replaceBinaryMatch[0] + "\n" : "";
   const codesign = codesignMatch ? codesignMatch[0] + "\n" : "";
   const probe = probeMatch ? probeMatch[0] + "\n" : "";
 
   const tmpFile = join(tmpdir(), `abi-test-${Date.now()}.mjs`);
   writeFileSync(tmpFile, [
-    'import { existsSync, copyFileSync } from "node:fs";',
+    'import { existsSync, copyFileSync, renameSync, unlinkSync } from "node:fs";',
     'import { resolve } from "node:path";',
     'import { createRequire } from "node:module";',
     'import { execSync } from "node:child_process";',
     helpers,
     codesign,
+    replaceBinary,
     probe,
     `${match[0]}`,
   ].join("\n"));
@@ -970,15 +978,21 @@ describe("Shell-free upgrade (#185)", () => {
     expect(upgradeBody).toContain("chmodSync");
   });
 
-  test("server.ts inline fallback uses execFileSync, not execSync", () => {
-    // The inline script template must use execFileSync
-    const inlineStart = SERVER_SOURCE.indexOf("Inline fallback");
-    expect(inlineStart).toBeGreaterThan(-1);
-    const inlineSection = SERVER_SOURCE.slice(inlineStart, SERVER_SOURCE.indexOf("cmd =", inlineStart + 500));
+  test("ctx_upgrade no longer ships an unpinned inline clone fallback", () => {
+    const upgradeTool = readFileSync(resolve(ROOT, "src/tools/upgrade.ts"), "utf-8");
+    expect(upgradeTool).toContain("Refusing the old inline fallback");
+    expect(upgradeTool).not.toMatch(/git.*clone.*--depth.*1/);
+    expect(upgradeTool).not.toContain(".ctx-upgrade-inline.mjs");
+  });
 
-    // Generated script lines must import execFileSync
-    expect(inlineSection).toContain("execFileSync");
-    expect(inlineSection).not.toMatch(/(?<!File)execSync/);
+  test("cli upgrade is gated before unpinned upstream fetch", () => {
+    const upgradeStart = CLI_SOURCE.indexOf("async function upgrade");
+    const upgradeBody = CLI_SOURCE.slice(upgradeStart);
+    const guardIdx = upgradeBody.indexOf("CONTEXT_MODE_ALLOW_UNPINNED_UPGRADE");
+    const cloneIdx = upgradeBody.indexOf('"git", ["clone", "--depth", "1"');
+    expect(guardIdx).toBeGreaterThan(-1);
+    expect(cloneIdx).toBeGreaterThan(-1);
+    expect(guardIdx).toBeLessThan(cloneIdx);
   });
 });
 

@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createRequire } from "node:module";
 import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, renameSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync } from "node:fs";
 import { execSync, spawnSync, type ChildProcess, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
-import { join, dirname, resolve, sep, isAbsolute } from "node:path";
+import { join, dirname, resolve, sep, isAbsolute, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir, cpus } from "node:os";
 import { request as httpsRequest } from "node:https";
@@ -42,7 +42,10 @@ import { purgeSession } from "./session/purge.js";
 import {
   emitCacheHitEvent,
   emitIndexWriteEvent,
+  emitParserRunEvent,
+  emitRouteDecisionEvent,
   emitSandboxExecuteEvent,
+  emitToolLatencyEvent,
 } from "./session/event-emit.js";
 import { persistToolCallCounter, restoreSessionStats } from "./session/persist-tool-calls.js";
 import { searchAllSources } from "./search/unified.js";
@@ -51,13 +54,28 @@ import { registerTool } from "./tools/registry.js";
 import type { ToolContext } from "./tools/types.js";
 import { makeCtxUpgrade } from "./tools/upgrade.js";
 import { makeCtxDoctor } from "./tools/doctor.js";
+import { makeCtxRoute } from "./tools/route.js";
+import { makeCtxFetchRun } from "./tools/fetch-run.js";
+import { makeCtxRead } from "./tools/read.js";
+import { makeCtxGain } from "./tools/gain.js";
+import { makeCtxDiscover } from "./tools/discover.js";
+import { makeCtxGuard } from "./tools/guard.js";
+import { makeCtxEval } from "./tools/eval.js";
+import { makeCtxTrace } from "./tools/trace.js";
+import { makeCtxDiff } from "./tools/diff.js";
+import { makeCtxCache } from "./tools/cache.js";
 import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
+import { applyToolResultBudget, getAdapterOutputBudget } from "./adapters/output-budget.js";
 import { resolveCodexConfigDir } from "./adapters/codex/paths.js";
 import { getHookScriptPaths } from "./util/hook-config.js";
 import { resolveClaudeConfigDir } from "./util/claude-config.js";
 import { resolveProjectDir } from "./util/project-dir.js";
 import { loadDatabase } from "./db-base.js";
 import { AnalyticsEngine, formatReport, getConversationStats, getContentBytesAllSessions, getLifetimeStats, getMultiAdapterLifetimeStats, getRealBytesStats, OPUS_INPUT_PRICE_PER_TOKEN } from "./session/analytics.js";
+import { writeRunArtifact } from "./artifacts/run-store.js";
+import { redactText } from "./filters/pipeline.js";
+import { getOutputParser, parseCommandOutput, renderParsedOutput } from "./parsers/registry.js";
+import type { ParserConfidence, ParserInput } from "./parsers/types.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
 const VERSION: string = (() => {
   for (const rel of ["../package.json", "./package.json"]) {
@@ -124,8 +142,9 @@ let _store: ContentStore | null = null;
 export function currentAttribution(): { sessionId?: string } | undefined {
   // CLAUDE_SESSION_ID env var is NOT propagated to MCP servers (only to hooks).
   // Cross-adapter resolution: every adapter (15 of them) sets *_PROJECT_DIR env
-  // and writes session_events via hooks. Read the most-recent session_id from
-  // THIS project's session DB. Works for claude-code/cursor/gemini-cli/codex/
+  // and writes session_meta via hooks. Read the most-recent session_id from
+  // THIS project's session DB, even before the first event has been inserted.
+  // Works for claude-code/cursor/gemini-cli/codex/
   // kiro/opencode/zed/kilo/openclaw/qwen-code/vscode-copilot/jetbrains-copilot/
   // omp/pi/antigravity — no adapter-specific transcript path required.
   const sessionId = process.env.CLAUDE_SESSION_ID ?? resolveSessionIdFromSessionDB();
@@ -157,7 +176,7 @@ export function resolveSessionIdFromSessionDB(opts?: {
     const db = new Database(dbPath, { readonly: true, fileMustExist: true });
     try {
       const row = db.prepare(
-        "SELECT session_id FROM session_events ORDER BY created_at DESC LIMIT 1"
+        "SELECT session_id FROM session_meta ORDER BY started_at DESC, rowid DESC LIMIT 1"
       ).get() as { session_id?: string } | undefined;
       const sid = row?.session_id;
       if (sid) __cachedSessionId = { sid, checkedAt: now };
@@ -199,6 +218,7 @@ function maybeIndexSessionEvents(store: ContentStore): void {
 // hardcoded configDir detection in tool handlers.
 
 let _detectedAdapter: HookAdapter | null = null;
+let _detectedPlatform: PlatformId = "unknown";
 
 // Tracks the ctx_insight dashboard child so shutdown can terminate it.
 // See ctx_insight handler + shutdown() in main().
@@ -545,6 +565,11 @@ function trackResponse(toolName: string, response: ToolResult): ToolResult {
       `⚠️ context-mode v${VERSION} outdated → v${_latestVersion} available. Upgrade: ${hint}\n\n` +
       response.content[0].text;
   }
+  response = redactToolResult(response);
+  response = applyToolResultBudget(
+    response,
+    getAdapterOutputBudget(_detectedPlatform),
+  );
 
   const bytes = response.content.reduce(
     (sum, c) => sum + Buffer.byteLength(c.text),
@@ -575,9 +600,11 @@ function trackResponse(toolName: string, response: ToolResult): ToolResult {
     || toolName === "ctx_execute_file"
     || toolName === "ctx_batch_execute"
   ) {
+    const sessionId = currentAttribution()?.sessionId;
     setImmediate(() =>
       emitSandboxExecuteEvent({
         sessionDbPath: getSessionDbPath(),
+        sessionId,
         toolName,
         bytesReturned: bytes,
       })
@@ -594,9 +621,11 @@ function trackIndexed(bytes: number, source: string = "unknown"): void {
   // these are bytes that would have flooded context if the user had
   // Read'd the source instead of indexing.
   if (bytes > 0) {
+    const sessionId = currentAttribution()?.sessionId;
     setImmediate(() =>
       emitIndexWriteEvent({
         sessionDbPath: getSessionDbPath(),
+        sessionId,
         source,
         bytesAvoided: bytes,
       })
@@ -609,6 +638,16 @@ function recordToolLatency(toolName: string, latencyMs: number): void {
   sessionStats.latencyMs[toolName] = (sessionStats.latencyMs[toolName] || 0) + rounded;
   sessionStats.latencyMaxMs[toolName] = Math.max(sessionStats.latencyMaxMs[toolName] || 0, rounded);
   persistStats();
+  const sessionId = currentAttribution()?.sessionId;
+  setImmediate(() =>
+      emitToolLatencyEvent({
+        sessionDbPath: getSessionDbPath(),
+        sessionId,
+        toolName,
+        latencyMs: rounded,
+        adapter: _detectedPlatform,
+      })
+  );
 }
 
 // ─────────────────────────────────────────────────────────
@@ -815,6 +854,16 @@ function checkNonShellDenyPolicy(
     // Fail-open
   }
   return null;
+}
+
+function redactToolResult(response: ToolResult): ToolResult {
+  return {
+    ...response,
+    content: response.content.map((item) => ({
+      ...item,
+      text: redactText(item.text).text,
+    })),
+  };
 }
 
 /**
@@ -1213,9 +1262,13 @@ server.registerTool(
           "Use ctx_search(queries: [...]) to retrieve specific sections. Example: 'failing tests', 'HTTP 500 errors'." +
           "\n\nTIP: Use specific technical terms, not just concepts. Check 'Searchable terms' in the response for available vocabulary.",
         ),
+      parser: z
+        .string()
+        .optional()
+        .describe("Optional explicit output parser. Supported examples: generic-failure, failure-focus, git-status, git-diff, rg, grep, vitest, pytest. Unknown or failed parsers fail open and return normal output with a diagnostic."),
     }),
   },
-  async ({ language, code, timeout, background, intent }) => {
+  async ({ language, code, timeout, background, intent, parser }) => {
     // Security: deny-only firewall
     if (language === "shell") {
       const denied = checkDenyPolicy(code, "execute");
@@ -1349,11 +1402,42 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
         const { isError, output } = classifyNonZeroExit({
           language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
         });
-        if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-          trackIndexed(Buffer.byteLength(output));
+        if (parser && parser.trim().length > 0) {
           return trackResponse("ctx_execute", {
             content: [
-              { type: "text" as const, text: intentSearch(output, intent, isError ? `execute:${language}:error` : `execute:${language}`) },
+              {
+                type: "text" as const,
+                text: renderParsedExecuteOutput({
+                  parser,
+                  language,
+                  code,
+                  stdout: result.stdout,
+                  stderr: result.stderr,
+                  exitCode: result.exitCode,
+                  fallbackText: output,
+                  status: isError ? "failed" : "unknown",
+                }),
+              },
+            ],
+            isError,
+          });
+        }
+        if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
+          trackIndexed(Buffer.byteLength(output));
+          const text = intentSearch(output, intent, isError ? `execute:${language}:error` : `execute:${language}`);
+          return trackResponse("ctx_execute", {
+            content: [
+              {
+                type: "text" as const,
+                text: appendRunSidecarNote(text, {
+                  command: executionCommandShape(language, code),
+                  stdout: output,
+                  status: isError ? "failed" : "unknown",
+                  exitCode: result.exitCode,
+                  parser: "intent-search",
+                  summary: `Intent search for ${intent}`,
+                }),
+              },
             ],
             isError,
           });
@@ -1361,9 +1445,20 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
         // Auto-index large error output into FTS5 — no data loss
         if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
           trackIndexed(Buffer.byteLength(output));
+          const text = intentSearch(output, "errors failures exceptions", isError ? `execute:${language}:error` : `execute:${language}`);
           return trackResponse("ctx_execute", {
             content: [
-              { type: "text" as const, text: intentSearch(output, "errors failures exceptions", isError ? `execute:${language}:error` : `execute:${language}`) },
+              {
+                type: "text" as const,
+                text: appendRunSidecarNote(text, {
+                  command: executionCommandShape(language, code),
+                  stdout: output,
+                  status: isError ? "failed" : "unknown",
+                  exitCode: result.exitCode,
+                  parser: "failure-focus",
+                  summary: "Large non-zero output indexed and sidecar saved",
+                }),
+              },
             ],
             isError,
           });
@@ -1378,19 +1473,57 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
 
       const stdout = result.stdout || "(no output)";
 
+      if (parser && parser.trim().length > 0) {
+        return trackResponse("ctx_execute", {
+          content: [
+            {
+              type: "text" as const,
+              text: renderParsedExecuteOutput({
+                parser,
+                language,
+                code,
+                stdout: result.stdout,
+                stderr: result.stderr,
+                exitCode: result.exitCode,
+                fallbackText: stdout,
+                status: "succeeded",
+              }),
+            },
+          ],
+        });
+      }
+
       // Intent-driven search: if intent provided and output is large enough
       if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
         trackIndexed(Buffer.byteLength(stdout));
+        const text = intentSearch(stdout, intent, `execute:${language}`);
         return trackResponse("ctx_execute", {
           content: [
-            { type: "text" as const, text: intentSearch(stdout, intent, `execute:${language}`) },
+            {
+              type: "text" as const,
+              text: appendRunSidecarNote(text, {
+                command: executionCommandShape(language, code),
+                stdout,
+                status: "succeeded",
+                parser: "intent-search",
+                summary: `Intent search for ${intent}`,
+              }),
+            },
           ],
         });
       }
 
       // Auto-index large stdout into FTS5 — return pointer, not raw content
       if (Buffer.byteLength(stdout) > LARGE_OUTPUT_THRESHOLD) {
-        return trackResponse("ctx_execute", indexStdout(stdout, `execute:${language}`));
+        const indexed = indexStdout(stdout, `execute:${language}`);
+        indexed.content[0].text = appendRunSidecarNote(indexed.content[0].text, {
+          command: executionCommandShape(language, code),
+          stdout,
+          status: "succeeded",
+          parser: "large-output",
+          summary: "Large stdout indexed and sidecar saved",
+        });
+        return trackResponse("ctx_execute", indexed);
       }
 
       return trackResponse("ctx_execute", {
@@ -1420,7 +1553,7 @@ function indexStdout(
 ): { content: Array<{ type: "text"; text: string }> } {
   const store = getStore();
   trackIndexed(Buffer.byteLength(stdout));
-  const indexed = store.index({ content: stdout, source, attribution: currentAttribution() });
+  const indexed = store.index({ content: redactText(stdout).text, source, attribution: currentAttribution() });
   return {
     content: [
       {
@@ -1429,6 +1562,194 @@ function indexStdout(
       },
     ],
   };
+}
+
+function executionCommandShape(language: string, code: string): string {
+  const firstLine = code.trim().split(/\r?\n/, 1)[0] ?? "";
+  return `${language}: ${firstLine.slice(0, 180)}`;
+}
+
+function renderParsedExecuteOutput(opts: {
+  parser: string;
+  language: string;
+  code: string;
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  fallbackText: string;
+  status: "succeeded" | "failed" | "unknown";
+}): string {
+  const parserName = opts.parser.trim();
+  const parserInput: ParserInput = {
+    command: executionCommandShape(opts.language, opts.code),
+    stdout: opts.stdout,
+    stderr: opts.stderr,
+    exitCode: opts.exitCode,
+  };
+  const parserImpl = getOutputParser(parserName);
+      if (!parserImpl) {
+        const text = appendRunSidecarNote(
+          [
+        `Parser unavailable: ${parserName}. Output kept out of context; fetch the redacted sidecar only if needed.`,
+        "",
+        `Parser diagnostic: parser not found: ${parserName}`,
+      ].join("\n"),
+      {
+        command: parserInput.command,
+        stdout: opts.stdout,
+        stderr: opts.stderr,
+        status: opts.status,
+        exitCode: opts.exitCode,
+        parser: parserName,
+        parserConfidence: 0,
+        parserConfidenceLevel: "low",
+        summary: `Parser not found: ${parserName}`,
+      },
+    );
+    emitParserTelemetry({
+      parser: parserName,
+      status: "unknown",
+      exitCode: opts.exitCode,
+      stdout: opts.stdout,
+      stderr: opts.stderr,
+      returnedText: text,
+      parserConfidence: { score: 0, level: "low", reason: "parser registry lookup failed" },
+      adapter: _detectedPlatform,
+      diagnostics: [`parser not found: ${parserName}`],
+    });
+    return text;
+  }
+
+  const parsed = parseCommandOutput(parserName, parserInput);
+  const parseFailed = parsed.diagnostics?.some((diagnostic) => diagnostic.startsWith("parser failed:")) ?? false;
+  if (parseFailed) {
+    const text = appendRunSidecarNote(
+      [
+        `Parser failed: ${parserName}. Output kept out of context; fetch the redacted sidecar only if needed.`,
+        "",
+        `Parser diagnostic: ${parsed.diagnostics?.join("; ") ?? "parser failed"}`,
+      ].join("\n"),
+      {
+        command: parserInput.command,
+        stdout: opts.stdout,
+        stderr: opts.stderr,
+        status: opts.status,
+        exitCode: opts.exitCode,
+        parser: parserName,
+        parserConfidence: parsed.confidence.score,
+        parserConfidenceLevel: parsed.confidence.level,
+        summary: parsed.summary,
+      },
+    );
+    emitParserTelemetry({
+      parser: parserName,
+      status: "unknown",
+      exitCode: opts.exitCode,
+      stdout: opts.stdout,
+      stderr: opts.stderr,
+      returnedText: text,
+      parserConfidence: parsed.confidence,
+      adapter: _detectedPlatform,
+      diagnostics: parsed.diagnostics,
+    });
+    return text;
+  }
+
+  const text = appendRunSidecarNote(renderParsedOutput(parsed, {
+    maxImportantItems: getAdapterOutputBudget(_detectedPlatform).maxImportantItems,
+  }), {
+    command: parserInput.command,
+    stdout: opts.stdout,
+    stderr: opts.stderr,
+    status: parsed.status,
+    exitCode: opts.exitCode,
+    parser: parsed.parser,
+    parserConfidence: parsed.confidence.score,
+    parserConfidenceLevel: parsed.confidence.level,
+    summary: parsed.summary,
+  });
+  emitParserTelemetry({
+    parser: parsed.parser,
+    status: parsed.status,
+    exitCode: opts.exitCode,
+    stdout: opts.stdout,
+    stderr: opts.stderr,
+    returnedText: text,
+    parserConfidence: parsed.confidence,
+    adapter: _detectedPlatform,
+    diagnostics: parsed.diagnostics,
+  });
+  return text;
+}
+
+function emitParserTelemetry(opts: {
+  parser: string;
+  status: string;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  returnedText: string;
+  parserConfidence?: ParserConfidence;
+  adapter?: string;
+  diagnostics?: readonly string[];
+}): void {
+  const rawBytes = Buffer.byteLength(opts.stdout) + Buffer.byteLength(opts.stderr);
+  const returnedBytes = Buffer.byteLength(opts.returnedText);
+  const sessionId = currentAttribution()?.sessionId;
+  setImmediate(() =>
+    emitParserRunEvent({
+      sessionDbPath: getSessionDbPath(),
+      sessionId,
+      parser: opts.parser,
+      status: opts.status,
+      exitCode: opts.exitCode,
+      rawBytes,
+      returnedBytes,
+      parserConfidence: opts.parserConfidence?.score,
+      parserConfidenceLevel: opts.parserConfidence?.level,
+      adapter: opts.adapter,
+      diagnostics: opts.diagnostics,
+    })
+  );
+}
+
+function appendRunSidecarNote(
+  text: string,
+  opts: {
+    command: string;
+    stdout?: string;
+    stderr?: string;
+    status: "succeeded" | "failed" | "unknown";
+    exitCode?: number;
+    parser?: string;
+    parserConfidence?: number;
+    parserConfidenceLevel?: string;
+    summary?: string;
+  },
+): string {
+  try {
+    const artifact = writeRunArtifact({
+      projectDir: getProjectDir(),
+      command: opts.command,
+      stdout: opts.stdout,
+      stderr: opts.stderr,
+      status: opts.status,
+      exitCode: opts.exitCode,
+      parser: opts.parser,
+      parserConfidence: opts.parserConfidence,
+      parserConfidenceLevel: opts.parserConfidenceLevel,
+      summary: opts.summary,
+    });
+    return [
+      text,
+      "",
+      "Full redacted output saved:",
+      relative(getProjectDir(), artifact.metadata.rawPath).replace(/\\/g, "/"),
+      `Use ctx_fetch_run({ runId: "${artifact.metadata.runId}", raw: true })`,
+    ].join("\n");
+  } catch {
+    return text;
+  }
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1444,12 +1765,13 @@ function intentSearch(
   source: string,
   maxResults: number = 5,
 ): string {
-  const totalLines = stdout.split("\n").length;
-  const totalBytes = Buffer.byteLength(stdout);
+  const safeStdout = redactText(stdout).text;
+  const totalLines = safeStdout.split("\n").length;
+  const totalBytes = Buffer.byteLength(safeStdout);
 
   // Index into the PERSISTENT store so user can ctx_search() later
   const persistent = getStore();
-  const indexed = persistent.indexPlainText(stdout, source, undefined, currentAttribution());
+  const indexed = persistent.indexPlainText(safeStdout, source, undefined, currentAttribution());
 
   // Search the persistent store directly (porter → trigram → fuzzy)
   let results = persistent.searchWithFallback(intent, maxResults, source);
@@ -1716,7 +2038,15 @@ server.registerTool(
         } catch { /* ignore — file read errors handled by store */ }
       }
       const store = getStore();
-      const result = store.index({ content, path: resolvedPath, source: source ?? resolvedPath, attribution: currentAttribution() });
+      const safeContent = content === undefined
+        ? (resolvedPath ? redactText(readFileSync(resolvedPath, "utf8")).text : undefined)
+        : redactText(content).text;
+      const result = store.index({
+        content: safeContent,
+        path: resolvedPath,
+        source: source ?? resolvedPath,
+        attribution: currentAttribution(),
+      });
 
       return trackResponse("ctx_index", {
         content: [
@@ -1887,6 +2217,7 @@ server.registerTool(
 
       const MAX_TOTAL = 40 * 1024; // 40KB total cap
       let totalSize = 0;
+      let remainingSearchMatches = getAdapterOutputBudget(_detectedPlatform).maxSearchMatches;
       const sections: string[] = [];
 
       // Open SessionDB once before the loop (Blocker 4: avoid open/close per query)
@@ -1910,12 +2241,17 @@ server.registerTool(
           sections.push(`## ${q}\n(output cap reached)\n`);
           continue;
         }
+        if (remainingSearchMatches <= 0) {
+          sections.push(`## ${q}\n(adapter search-match budget reached)\n`);
+          continue;
+        }
 
         let results;
+        const queryLimit = Math.min(effectiveLimit, remainingSearchMatches);
         if (sort === "timeline") {
           results = searchAllSources({
             query: q,
-            limit: effectiveLimit,
+            limit: queryLimit,
             store,
             sort,
             source,
@@ -1926,8 +2262,9 @@ server.registerTool(
             adapter: _detectedAdapter ?? undefined,
           });
         } else {
-          results = store.searchWithFallback(q, effectiveLimit, source, contentType);
+          results = store.searchWithFallback(q, queryLimit, source, contentType);
         }
+        remainingSearchMatches -= results.length;
 
         if (results.length === 0) {
           sections.push(`## ${q}\nNo results found.`);
@@ -2333,13 +2670,9 @@ type FetchOneResult =
  *   - IPv6 link-local fe80::/10
  *   - Multicast (224+ IPv4, ff00::/8 IPv6) and reserved (0.0.0.0/8) ranges
  *
- * **ALLOW by default** (legitimate developer use cases dominate):
- *   - localhost, 127.x.x.x, ::1 (local dev servers — Next.js, Vite, Postgres, …)
- *   - 10.x, 172.16-31.x, 192.168.x RFC1918 private (developer's internal network)
- *
- * **STRICT MODE** opt-in via env var: `CTX_FETCH_STRICT=1`
- *   - Blocks loopback + RFC1918 too
- *   - For hosted/CI environments where the runtime isn't the user's own machine
+ * **PRIVATE NETWORKS** (loopback + RFC1918):
+ *   - Blocked by default for MCP fetches.
+ *   - Opt in with `CTX_FETCH_ALLOW_PRIVATE=1` for local dev servers/internal docs.
  *
  * DNS resolution is performed against the resolved IP (not just URL parse) so a
  * hostname like `evil.com` pointing to 169.254.169.254 is rejected — defends
@@ -2368,7 +2701,7 @@ async function ssrfGuard(rawUrl: string): Promise<FetchOneResult | null> {
     };
   }
 
-  const strict = process.env.CTX_FETCH_STRICT === "1";
+  const allowPrivate = process.env.CTX_FETCH_ALLOW_PRIVATE === "1";
 
   // 2. DNS resolve + check IP ranges (hard-block + optional strict-mode block)
   try {
@@ -2384,11 +2717,11 @@ async function ssrfGuard(rawUrl: string): Promise<FetchOneResult | null> {
           reason: "exit",
         };
       }
-      if (verdict === "private" && strict) {
+      if (verdict === "private" && !allowPrivate) {
         return {
           kind: "fetch_error",
           url: rawUrl,
-          error: `URL "${parsed.hostname}" resolves to private IP ${rec.address} — blocked under CTX_FETCH_STRICT=1`,
+          error: `URL "${parsed.hostname}" resolves to private IP ${rec.address} — set CTX_FETCH_ALLOW_PRIVATE=1 to allow local/private fetches`,
           reason: "exit",
         };
       }
@@ -2429,6 +2762,19 @@ export function classifyIp(rawIp: string): "block" | "private" | "public" {
     // IPv4-mapped IPv6 (`::ffff:127.0.0.1`) — recurse through IPv4 classifier
     const v4MappedMatch = lower.match(/^::ffff:([\d.]+)$/);
     if (v4MappedMatch) return classifyIp(v4MappedMatch[1]);
+    const v4MappedHexMatch = lower.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (v4MappedHexMatch) {
+      const hi = parseInt(v4MappedHexMatch[1], 16);
+      const lo = parseInt(v4MappedHexMatch[2], 16);
+      if (hi >= 0 && hi <= 0xffff && lo >= 0 && lo <= 0xffff) {
+        return classifyIp([
+          (hi >> 8) & 0xff,
+          hi & 0xff,
+          (lo >> 8) & 0xff,
+          lo & 0xff,
+        ].join("."));
+      }
+    }
     // Hard-block
     if (lower === "::") return "block"; // unspecified
     if (lower.startsWith("fe8") || lower.startsWith("fe9") ||
@@ -2538,19 +2884,20 @@ function indexFetched(f: { url: string; source?: string; markdown: string; heade
   // still finds both via LIKE-mode source filter on the `source` substring.
   const storageLabel = composeFetchCacheKey(f.source, f.url);
   const attribution = currentAttribution();
+  const safeMarkdown = redactText(f.markdown).text;
   let indexed: IndexResult;
   if (f.header === "__CM_CT__:json") {
-    indexed = store.indexJSON(f.markdown, storageLabel, undefined, attribution);
+    indexed = store.indexJSON(safeMarkdown, storageLabel, undefined, attribution);
   } else if (f.header === "__CM_CT__:text") {
-    indexed = store.indexPlainText(f.markdown, storageLabel, undefined, attribution);
+    indexed = store.indexPlainText(safeMarkdown, storageLabel, undefined, attribution);
   } else {
-    indexed = store.index({ content: f.markdown, source: storageLabel, attribution });
+    indexed = store.index({ content: safeMarkdown, source: storageLabel, attribution });
   }
   // Track AFTER the FTS5 write succeeds — failed indexes shouldn't inflate the counter.
   trackIndexed(Buffer.byteLength(f.markdown));
-  const preview = f.markdown.length > FETCH_PREVIEW_LIMIT
-    ? f.markdown.slice(0, FETCH_PREVIEW_LIMIT) + "\n\n…[truncated — use ctx_search() for full content]"
-    : f.markdown;
+  const preview = safeMarkdown.length > FETCH_PREVIEW_LIMIT
+    ? safeMarkdown.slice(0, FETCH_PREVIEW_LIMIT) + "\n\n…[truncated — use ctx_search() for full content]"
+    : safeMarkdown;
   return {
     label: indexed.label,
     totalChunks: indexed.totalChunks,
@@ -2687,9 +3034,11 @@ server.registerTool(
         // had the TTL window missed. Best-effort, off the hot path.
         const cachedBytes = v.estimatedBytes;
         const cachedLabel = v.label;
+        const sessionId = currentAttribution()?.sessionId;
         setImmediate(() =>
           emitCacheHitEvent({
             sessionDbPath: getSessionDbPath(),
+            sessionId,
             source: cachedLabel,
             bytesAvoided: cachedBytes,
           })
@@ -2920,7 +3269,7 @@ server.registerTool(
         .map((c) => c.label)
         .join(",")
         .slice(0, 80)}`;
-      const indexed = store.index({ content: stdout, source, attribution: currentAttribution() });
+      const indexed = store.index({ content: redactText(stdout).text, source, attribution: currentAttribution() });
 
       // Build section inventory — direct query by source_id (no FTS5 MATCH needed)
       const allSections = store.getChunksBySource(indexed.sourceId);
@@ -3041,6 +3390,46 @@ function formatStatsSessionList(sessionDbPath: string, limit: number): string {
   }
 }
 
+function resolveStatsSessionId(sdb: import("./session/analytics.js").DatabaseAdapter): { sessionId?: string; source: string } {
+  const envSessionId = process.env.CLAUDE_SESSION_ID;
+  if (envSessionId) return { sessionId: envSessionId, source: "CLAUDE_SESSION_ID" };
+  try {
+    const row = sdb.prepare(
+      "SELECT session_id FROM session_meta WHERE session_id LIKE '________-____-____-____-____________' ORDER BY started_at DESC, rowid DESC LIMIT 1",
+    ).get() as { session_id: string } | undefined;
+    if (row?.session_id) return { sessionId: row.session_id, source: "latest project session_meta row" };
+  } catch { /* ctx_stats must never fail on session-id detection */ }
+  try {
+    const row = sdb.prepare(
+      "SELECT session_id FROM session_meta ORDER BY started_at DESC, rowid DESC LIMIT 1",
+    ).get() as { session_id: string } | undefined;
+    if (row?.session_id) return { sessionId: row.session_id, source: "latest project session_meta row (non-uuid)" };
+  } catch { /* ctx_stats must never fail on session-id detection */ }
+  return { source: "unresolved" };
+}
+
+function prependStatsScopeHeader(text: string, opts: {
+  scope: "session" | "lifetime" | "all";
+  projectDir?: string;
+  sessionDbPath?: string;
+  sessionId?: string;
+  sessionIdSource?: string;
+  hasSessionDb: boolean;
+}): string {
+  const scopeLine = opts.scope === "session"
+    ? "current session only"
+    : opts.scope === "lifetime"
+      ? "lifetime only; current-session section omitted"
+      : "current session + lifetime";
+  const lines = [
+    `ctx_stats scope: ${opts.scope} (${scopeLine})`,
+    `session id: ${opts.sessionId ?? "unresolved"}${opts.sessionIdSource ? ` (${opts.sessionIdSource})` : ""}`,
+    `session DB: ${opts.hasSessionDb ? opts.sessionDbPath ?? "resolved" : "not found for this project"}`,
+  ];
+  if (opts.projectDir) lines.push(`project: ${opts.projectDir}`);
+  return `${lines.join("\n")}\n\n${text}`;
+}
+
 server.registerTool(
   "ctx_stats",
   {
@@ -3093,6 +3482,7 @@ server.registerTool(
       if (existsSync(sessionDbPath)) {
         const Database = loadDatabase();
         const sdb = new Database(sessionDbPath, { readonly: true });
+        const statsSession = resolveStatsSessionId(sdb);
         try {
           const engine = new AnalyticsEngine(sdb);
           const report = engine.queryAll(sessionStats);
@@ -3118,18 +3508,12 @@ server.registerTool(
           // narrative 5-section "kitap gibi" layout (timeline, ladder, receipt,
           // example cost, auto-memory). Without these, formatReport falls back
           // to the legacy active-session header. Best-effort — failures absorbed.
-          // Resolve session_id: prefer env (CLAUDE_SESSION_ID), else most-recent
-          // UUID session_id from session_events in this DB.
+          // Resolve session_id once and expose its source in the report header
+          // so users can distinguish "this chat" from project/lifetime stats.
           let conversation;
           let realBytes;
           try {
-            let sid = process.env.CLAUDE_SESSION_ID;
-            if (!sid) {
-              const row = sdb.prepare(
-                "SELECT session_id FROM session_events WHERE session_id LIKE '________-____-____-____-____________' ORDER BY created_at DESC LIMIT 1"
-              ).get() as { session_id: string } | undefined;
-              sid = row?.session_id;
-            }
+            const sid = statsSession.sessionId;
             if (sid) {
               conversation = getConversationStats({ sessionId: sid, sessionsDir: getSessionDir(), worktreeHash: dbHash });
               // v1.0.133 Slice 3: pass contentDbPath so getRealBytesStats can
@@ -3166,6 +3550,14 @@ server.registerTool(
           // includes v1.0.115's transcript heuristic which reads the literal
           // cwd from Claude Code's session jsonl.
           text = formatReport(report, VERSION, _latestVersion, { lifetime, mcpUsage, multiAdapter, conversation, realBytes, cwd: projectDir });
+          text = prependStatsScopeHeader(text, {
+            scope,
+            projectDir,
+            sessionDbPath,
+            sessionId: statsSession.sessionId,
+            sessionIdSource: statsSession.source,
+            hasSessionDb: true,
+          });
         } finally {
           sdb.close();
         }
@@ -3178,6 +3570,13 @@ server.registerTool(
         let multiAdapter;
         try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
         text = formatReport(report, VERSION, _latestVersion, { lifetime, multiAdapter });
+        text = prependStatsScopeHeader(text, {
+          scope,
+          projectDir,
+          sessionDbPath,
+          sessionIdSource: "no project session DB",
+          hasSessionDb: false,
+        });
       }
     } catch {
       // Session DB not available or incompatible — build minimal report from runtime stats
@@ -3188,6 +3587,11 @@ server.registerTool(
       let multiAdapter;
       try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
       text = formatReport(report, VERSION, _latestVersion, (lifetime || multiAdapter) ? { lifetime, multiAdapter } : undefined);
+      text = prependStatsScopeHeader(text, {
+        scope,
+        sessionIdSource: "ctx_stats fallback path",
+        hasSessionDb: false,
+      });
     }
 
     return trackResponse("ctx_stats", {
@@ -3196,23 +3600,48 @@ server.registerTool(
   },
 );
 
-// ── ctx-doctor: extracted to src/tools/doctor.ts (per src/tools/MIGRATION.md)
-const _toolCtxDoctor: ToolContext = {
+// ── extracted tools (per src/tools/MIGRATION.md)
+const _toolCtx: ToolContext = {
   server,
   pluginRoot: existsSync(resolve(__pkg_dir, "package.json")) ? __pkg_dir : dirname(__pkg_dir),
   getSessionDir,
+  getAdapterId: () => _detectedPlatform,
   trackResponse: trackResponse as ToolContext["trackResponse"],
 };
-registerTool(_toolCtxDoctor, makeCtxDoctor({ VERSION, getDiagnosticAdapter }));
-
-// ── ctx-upgrade: extracted to src/tools/upgrade.ts (per src/tools/MIGRATION.md)
-const _toolCtxUpgrade: ToolContext = {
-  server,
-  pluginRoot: existsSync(resolve(__pkg_dir, "package.json")) ? __pkg_dir : dirname(__pkg_dir),
-  getSessionDir,
-  trackResponse: trackResponse as ToolContext["trackResponse"],
-};
-registerTool(_toolCtxUpgrade, makeCtxUpgrade({ buildNodeCommand, killProcessOnPort }));
+registerTool(_toolCtx, makeCtxDoctor({ VERSION, getDiagnosticAdapter }));
+registerTool(_toolCtx, makeCtxUpgrade({ buildNodeCommand, killProcessOnPort }));
+registerTool(_toolCtx, makeCtxRoute({
+  onDecision: ({ command, decision }) => {
+    const sessionId = currentAttribution()?.sessionId;
+    setImmediate(() =>
+      emitRouteDecisionEvent({
+        sessionDbPath: getSessionDbPath(),
+        sessionId,
+        command,
+        decision: decision.decision,
+        selectedRule: decision.selectedRule,
+        parser: decision.route?.parser,
+        confidence: decision.confidence,
+        adapter: _detectedPlatform,
+        safetyReason: decision.safety.reason,
+        adapterCapabilityReason: decision.adapterCapabilityReason,
+        diagnostics: decision.diagnostics,
+      })
+    );
+  },
+}));
+registerTool(_toolCtx, makeCtxFetchRun({ getProjectDir }));
+registerTool(_toolCtx, makeCtxRead({
+  getProjectDir,
+  checkFilePath: (path) => checkFilePathDenyPolicy(path, "ctx_read"),
+}));
+registerTool(_toolCtx, makeCtxGain({ getProjectDir, getSessionStats: () => sessionStats }));
+registerTool(_toolCtx, makeCtxDiscover({ getProjectDir, getSessionStats: () => sessionStats }));
+registerTool(_toolCtx, makeCtxGuard({ getProjectDir }));
+registerTool(_toolCtx, makeCtxEval());
+registerTool(_toolCtx, makeCtxTrace({ getProjectDir }));
+registerTool(_toolCtx, makeCtxDiff({ getProjectDir }));
+registerTool(_toolCtx, makeCtxCache({ getProjectDir }));
 
 // ── ctx-purge: explicit knowledge base wipe ─────────────────────────────────
 //
@@ -3943,6 +4372,7 @@ async function main() {
     const { detectPlatform, getAdapter } = await import("./adapters/detect.js");
     const clientInfo = server.server.getClientVersion();
     const signal = detectPlatform(clientInfo ?? undefined);
+    _detectedPlatform = signal.platform;
     _detectedAdapter = await getAdapter(signal.platform);
     if (clientInfo) {
       console.error(`MCP client: ${clientInfo.name} v${clientInfo.version} → ${signal.platform}`);

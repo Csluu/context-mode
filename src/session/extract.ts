@@ -713,7 +713,35 @@ function extractDecision(input: HookInput): SessionEvent[] {
     ? String((questions[0] as Record<string, unknown>)["question"] ?? "")
     : "";
 
-  const answer = safeString(String(input.tool_response ?? ""));
+  const rawResponse = String(input.tool_response ?? "");
+  let answerText = "";
+  try {
+    const parsed = JSON.parse(rawResponse) as { answers?: Record<string, unknown> };
+    const answers = parsed?.answers;
+    if (answers && typeof answers === "object") {
+      const toAnswerText = (value: unknown): string => {
+        if (typeof value === "string") return value;
+        if (Array.isArray(value)) {
+          return value.filter((v): v is string => typeof v === "string").join(" | ");
+        }
+        return "";
+      };
+
+      const matched = questionText ? toAnswerText(answers[questionText]) : "";
+      if (matched) {
+        answerText = matched;
+      } else {
+        const values = Object.values(answers)
+          .map(toAnswerText)
+          .filter((v) => v.length > 0);
+        answerText = values.join(" | ");
+      }
+    }
+  } catch {
+    // Non-JSON responses are not persisted here; raw responses can echo full request payloads.
+  }
+
+  const answer = safeString(answerText);
   const summary = questionText
     ? `Q: ${safeString(questionText)} → A: ${answer}`
     : `answer: ${answer}`;

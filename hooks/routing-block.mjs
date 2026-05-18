@@ -24,19 +24,28 @@ export function createRoutingBlock(t, options = {}) {
   <tool_selection_hierarchy>
     0. MEMORY: ${t("ctx_search")}(sort: "timeline")
        - After resume, check prior context before asking user.
-    1. GATHER: ${t("ctx_batch_execute")}(commands, queries)
+    1. FILE MAPS: ${t("ctx_read")}(path, mode)
+       - First choice for file exploration, repeated reads, symbol maps, outlines, and bounded slices.
+       - Read is still correct for exact edit context.
+    2. ROUTING: ${t("ctx_route")}(command, explain: true)
+       - Classify noisy commands before running them: git diff, tests, broad rg, logs, long shell output.
+    3. GATHER: ${t("ctx_batch_execute")}(commands, queries)
        - Primary research tool. Runs commands, auto-indexes, searches. ONE call replaces many steps.
        - Each command: {label: "section header", command: "shell command"}
        - label becomes FTS5 chunk title — descriptive labels improve search.
-    2. FOLLOW-UP: ${t("ctx_search")}(queries: ["q1", "q2", ...])
+    4. FOLLOW-UP: ${t("ctx_search")}(queries: ["q1", "q2", ...])
        - All follow-up questions. ONE call, many queries (default relevance mode).
-    3. PROCESSING: ${t("ctx_execute")}(language, code) | ${t("ctx_execute_file")}(path, language, code)
+    5. PROCESSING: ${t("ctx_execute")}(language, code) | ${t("ctx_execute_file")}(path, language, code)
        - API calls, log analysis, data processing.
+    6. SIDECARS: ${t("ctx_fetch_run")}(list: true | latest: true | runId, raw: true)
+       - Retrieve saved raw artifacts. Do not rerun only to see full output.
+    7. MEASURE: ${t("ctx_gain")}() | ${t("ctx_discover")}()
+       - Show current-session savings and missed-savings/bypass findings.
   </tool_selection_hierarchy>
 
   <forbidden_actions>
     - NO Bash for commands producing >20 lines output.
-    - NO Read for analysis — use ${t("ctx_execute_file")}. Read IS correct for files you intend to Edit.
+    - NO Read for analysis — use ${t("ctx_read")}(path, mode: "map" | "outline" | "symbols" | "slice"). Read IS correct for files you intend to Edit.
     - NO WebFetch — use ${t("ctx_fetch_and_index")}.
     - Bash ONLY for git/mkdir/rm/mv/navigation.
     - NO ${t("ctx_execute")} or ${t("ctx_execute_file")} for file creation/modification.
@@ -62,16 +71,22 @@ export function createRoutingBlock(t, options = {}) {
 ${includeCommands ? `
   <ctx_commands>
     "ctx stats" | "ctx-stats" | "/ctx-stats" | context savings question
-    → Call stats MCP tool, display full output verbatim.
+    → Call ${t("ctx_stats")} MCP tool, display full output verbatim. Use session scope by default.
+
+    "ctx gain" | "ctx-gain" | "/ctx-gain"
+    → Call ${t("ctx_gain")}, display current-session savings summary.
+
+    "ctx discover" | "ctx-discover" | "/ctx-discover"
+    → Call ${t("ctx_discover")}, display bypass/noisy-tool findings.
 
     "ctx doctor" | "ctx-doctor" | "/ctx-doctor" | diagnose context-mode
-    → Call doctor MCP tool, run returned shell command, display as checklist.
+    → Call ${t("ctx_doctor")} MCP tool, run returned shell command, display as checklist.
 
     "ctx upgrade" | "ctx-upgrade" | "/ctx-upgrade" | update context-mode
-    → Call upgrade MCP tool, run returned shell command, display as checklist.
+    → Call ${t("ctx_upgrade")} MCP tool, run returned shell command, display as checklist.
 
     "ctx purge" | "ctx-purge" | "/ctx-purge" | wipe/reset knowledge base
-    → Call purge MCP tool with confirm: true. Warn: irreversible.
+    → Call ${t("ctx_purge")} MCP tool with confirm: true and explicit scope/session. Warn: irreversible.
 
     After /clear or /compact: knowledge base preserved. Tell user: "context-mode knowledge base preserved. Use \`ctx purge\` to start fresh."
   </ctx_commands>
@@ -80,7 +95,7 @@ ${includeCommands ? `
 }
 
 export function createReadGuidance(t) {
-  return '<context_guidance>\n  <tip>\n    Reading to Edit? Read is correct — Edit needs content in context.\n    Reading to analyze/explore? Use ' + t("ctx_execute_file") + '(path, language, code) — only printed summary enters context.\n  </tip>\n</context_guidance>';
+  return '<context_guidance>\n  <tip>\n    Reading to Edit? Read is correct — Edit needs content in context.\n    Reading to analyze/explore? Use ' + t("ctx_read") + '(path, mode: "map" | "outline" | "symbols" | "slice") first. Use ' + t("ctx_execute_file") + '(path, language, code) only for custom analysis.\n  </tip>\n</context_guidance>';
 }
 
 export function createGrepGuidance(t) {

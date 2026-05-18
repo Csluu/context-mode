@@ -717,6 +717,8 @@ All platforms support utility commands via MCP meta-tools:
 | Command | What it does |
 |---------|-------------|
 | `ctx stats` | Show context savings, call counts, and session statistics |
+| `ctx gain` | Show current-session savings from sandbox/index/cache/sidecars |
+| `ctx discover` | Show missed savings, bypass categories, and noisy-tool patterns |
 | `ctx doctor` | Diagnose installation: runtimes, hooks, FTS5, versions |
 | `ctx upgrade` | Update from GitHub, rebuild, reconfigure hooks |
 | `ctx purge` | Permanently deletes all indexed content from the knowledge base |

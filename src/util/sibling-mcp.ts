@@ -320,10 +320,11 @@ export async function killSiblingMcpServers(
  * idle siblings, this sweep reclaims them at boot rather than waiting for
  * the idle timeout to fire on each one independently.
  *
- * Gated by env (default-on but easy to disable):
+ * Gated by env (default-off; enable only for hosts proven to leak idle MCP
+ * siblings):
  *
- *   CONTEXT_MODE_STARTUP_SWEEP=0   → disabled
- *   CONTEXT_MODE_STARTUP_SWEEP=1   → enabled (default)
+ *   CONTEXT_MODE_STARTUP_SWEEP=1   → enabled
+ *   unset / 0 / false              → disabled
  *
  * Safety:
  *   - `sameParentOnly: true` — never touches MCP children of a different host.
@@ -339,7 +340,7 @@ export async function startupSiblingSweep(
 ): Promise<KillReport> {
   const empty: KillReport = { terminatedBySigterm: 0, terminatedBySigkill: 0, totalKilled: 0 };
   const raw = env.CONTEXT_MODE_STARTUP_SWEEP;
-  if (raw === "0" || raw === "false") return empty;
+  if (!/^(1|true)$/i.test(String(raw ?? ""))) return empty;
 
   try {
     const pids = discoverSiblingMcpPids({

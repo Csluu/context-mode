@@ -8,7 +8,7 @@
 | Metric | Value |
 |--------|-------|
 | Total scenarios | 21 |
-| Tools benchmarked | `ctx_execute_file` (summarize) + `ctx_index`/`ctx_search` (knowledge retrieval) |
+| Tools benchmarked | `ctx_execute_file` (summarize), `ctx_read` (file maps/slices), and `ctx_index`/`ctx_search` (knowledge retrieval) |
 | Smart truncation | Head + tail preservation (60/40 split) |
 | Total raw data processed | 376 KB |
 | Total context consumed | 16.5 KB |
@@ -22,6 +22,7 @@
 | Documentation, API refs | `ctx_index` + `ctx_search` | Need exact code examples — not summaries |
 | Skills prompts | `ctx_index` + `ctx_search` | Large prompts eat context; search on-demand |
 | MCP tool signatures | `ctx_index` + `ctx_search` | Need exact tool names and parameters |
+| Source files for exploration | `ctx_read` | Need map/outline/symbols/slices without raw full-file reads |
 | Log files, test output | `ctx_execute_file` | Need aggregate stats, not raw lines |
 | CSV data, analytics | `ctx_execute_file` | Need computed metrics |
 | Build output | `ctx_execute_file` | Need error counts, not full logs |
@@ -30,6 +31,8 @@
 ## Part 1: `ctx_execute_file` — Structured Data Processing
 
 *Best for: logs, test output, CSV, build output — data where summaries are more useful than raw content.*
+
+For source-code exploration, prefer `ctx_read` first. Use `ctx_execute_file` when you need custom computation over the file contents.
 
 | Scenario | Source | Raw Size | Context | Savings | Time |
 |----------|--------|----------|---------|---------|------|

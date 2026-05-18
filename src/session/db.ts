@@ -7,13 +7,14 @@
  */
 
 import { SQLiteBase, defaultDBPath } from "../db-base.js";
-import type { PreparedStatement } from "../db-base.js";
+import type { PreparedStatement, SQLiteOpenOptions } from "../db-base.js";
 import type { SessionEvent } from "../types.js";
 import type { ProjectAttribution } from "./project-attribution.js";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync, renameSync } from "node:fs";
 import { join } from "node:path";
+import { redactCommandShape } from "../routing/command-classifier.js";
 
 // ─────────────────────────────────────────────────────────
 // Worktree isolation
@@ -70,6 +71,44 @@ function gitOutput(projectDir: string, args: string[]): string {
       stdio: ["ignore", "pipe", "ignore"],
     },
   ).trim();
+}
+
+const FORBIDDEN_EVENT_DATA_KEYS = new Set([
+  "rawcommand",
+  "raw_command",
+  "rawoutput",
+  "raw_output",
+  "rawstdout",
+  "raw_stdout",
+  "rawstderr",
+  "raw_stderr",
+  "rawstdin",
+  "raw_stdin",
+]);
+
+function sanitizeEventDataValue(key: string, value: unknown): unknown {
+  const normalizedKey = key.toLowerCase();
+  if (FORBIDDEN_EVENT_DATA_KEYS.has(normalizedKey)) return "<redacted:trace-forbidden-field>";
+  if (normalizedKey === "command" && typeof value === "string") return redactCommandShape(value);
+  if (Array.isArray(value)) return value.map((item) => sanitizeEventDataValue("", item));
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [childKey, childValue] of Object.entries(value)) {
+      out[childKey] = sanitizeEventDataValue(childKey, childValue);
+    }
+    return out;
+  }
+  return value;
+}
+
+function sanitizeEventDataForPersistence(data: string): string {
+  try {
+    const parsed = JSON.parse(data) as unknown;
+    if (!parsed || typeof parsed !== "object") return data;
+    return JSON.stringify(sanitizeEventDataValue("", parsed));
+  } catch {
+    return data;
+  }
 }
 
 function getCurrentWorktreeRoot(projectDir: string): string | null {
@@ -267,6 +306,13 @@ export function resolveSessionPath(opts: {
   if (existsSync(legacyPath)) {
     try {
       renameSync(legacyPath, canonicalPath);
+      for (const sidecar of ["-wal", "-shm"]) {
+        const legacySidecar = `${legacyPath}${sidecar}`;
+        const canonicalSidecar = `${canonicalPath}${sidecar}`;
+        if (existsSync(legacySidecar) && !existsSync(canonicalSidecar)) {
+          renameSync(legacySidecar, canonicalSidecar);
+        }
+      }
     } catch {
       // Race or permission issue — caller will create canonicalPath on first
       // write. Better to lose this rename than to throw and break ctx_stats.
@@ -366,6 +412,7 @@ const S = {
   checkDuplicate: "checkDuplicate",
   evictLowestPriority: "evictLowestPriority",
   updateMetaLastEvent: "updateMetaLastEvent",
+  updateMetaLastEvents: "updateMetaLastEvents",
   ensureSession: "ensureSession",
   getSessionStats: "getSessionStats",
   incrementCompactCount: "incrementCompactCount",
@@ -382,6 +429,9 @@ const S = {
   getToolCallTotals: "getToolCallTotals",
   getToolCallByTool: "getToolCallByTool",
   getEventBytesSummary: "getEventBytesSummary",
+  listSessions: "listSessions",
+  getEventsSince: "getEventsSince",
+  getLatestEvents: "getLatestEvents",
 } as const;
 
 // ─────────────────────────────────────────────────────────
@@ -401,8 +451,8 @@ export class SessionDB extends SQLiteBase {
    */
   private declare stmts: Map<string, PreparedStatement>;
 
-  constructor(opts?: { dbPath?: string }) {
-    super(opts?.dbPath ?? defaultDBPath("session"));
+  constructor(opts?: { dbPath?: string } & SQLiteOpenOptions) {
+    super(opts?.dbPath ?? defaultDBPath("session"), opts);
   }
 
   /** Shorthand to retrieve a cached statement. */
@@ -446,6 +496,7 @@ export class SessionDB extends SQLiteBase {
       CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id);
       CREATE INDEX IF NOT EXISTS idx_session_events_type ON session_events(session_id, type);
       CREATE INDEX IF NOT EXISTS idx_session_events_priority ON session_events(session_id, priority);
+      CREATE INDEX IF NOT EXISTS idx_session_events_created_at ON session_events(created_at, id);
 
       CREATE TABLE IF NOT EXISTS session_meta (
         session_id TEXT PRIMARY KEY,
@@ -576,6 +627,10 @@ export class SessionDB extends SQLiteBase {
       `UPDATE session_meta
        SET last_event_at = datetime('now'), event_count = event_count + 1
        WHERE session_id = ?`);
+    p(S.updateMetaLastEvents,
+      `UPDATE session_meta
+       SET last_event_at = datetime('now'), event_count = event_count + ?
+       WHERE session_id = ?`);
 
     // ── Meta ──
     p(S.ensureSession,
@@ -584,6 +639,10 @@ export class SessionDB extends SQLiteBase {
     p(S.getSessionStats,
       `SELECT session_id, project_dir, started_at, last_event_at, event_count, compact_count
        FROM session_meta WHERE session_id = ?`);
+
+    p(S.listSessions,
+      `SELECT session_id, project_dir, started_at, last_event_at, event_count, compact_count
+       FROM session_meta ORDER BY started_at DESC, rowid DESC LIMIT ?`);
 
     p(S.incrementCompactCount,
       `UPDATE session_meta SET compact_count = compact_count + 1 WHERE session_id = ?`);
@@ -667,6 +726,20 @@ export class SessionDB extends SQLiteBase {
       `SELECT COALESCE(SUM(bytes_avoided), 0) AS bytes_avoided,
               COALESCE(SUM(bytes_returned), 0) AS bytes_returned
        FROM session_events WHERE session_id = ?`);
+
+    p(S.getEventsSince,
+      `SELECT id, session_id, type, category, priority, data,
+              project_dir, attribution_source, attribution_confidence,
+              bytes_avoided, bytes_returned,
+              source_hook, created_at, data_hash
+       FROM session_events WHERE created_at >= ? ORDER BY created_at DESC, id DESC LIMIT ?`);
+
+    p(S.getLatestEvents,
+      `SELECT id, session_id, type, category, priority, data,
+              project_dir, attribution_source, attribution_confidence,
+              bytes_avoided, bytes_returned,
+              source_hook, created_at, data_hash
+       FROM session_events WHERE session_id = ? ORDER BY id DESC LIMIT ?`);
   }
 
   // ═══════════════════════════════════════════
@@ -689,9 +762,10 @@ export class SessionDB extends SQLiteBase {
     attribution?: Partial<ProjectAttribution>,
     bytes?: EventBytes,
   ): void {
+    const eventData = sanitizeEventDataForPersistence(event.data);
     // SHA256-based dedup hash (first 16 hex chars = 8 bytes of entropy)
     const dataHash = createHash("sha256")
-      .update(event.data)
+      .update(eventData)
       .digest("hex")
       .slice(0, 16)
       .toUpperCase();
@@ -735,7 +809,7 @@ export class SessionDB extends SQLiteBase {
         event.type,
         event.category,
         event.priority,
-        event.data,
+        eventData,
         projectDir,
         attributionSource,
         attributionConfidence,
@@ -780,8 +854,9 @@ export class SessionDB extends SQLiteBase {
     // Pre-compute hashes + normalized attribution outside the transaction
     // so the SQL transaction holds only DB work (shorter lock window).
     const prepared = events.map((event, i) => {
+      const eventData = sanitizeEventDataForPersistence(event.data);
       const dataHash = createHash("sha256")
-        .update(event.data)
+        .update(eventData)
         .digest("hex")
         .slice(0, 16)
         .toUpperCase();
@@ -803,6 +878,7 @@ export class SessionDB extends SQLiteBase {
       const bytesReturned = clampNonNegativeInt(eventBytes?.bytesReturned);
       return {
         event,
+        eventData,
         dataHash,
         projectDir,
         attributionSource,
@@ -814,6 +890,7 @@ export class SessionDB extends SQLiteBase {
 
     const transaction = this.db.transaction(() => {
       let cnt = (this.stmt(S.getEventCount).get(sessionId) as { cnt: number }).cnt;
+      let inserted = 0;
       for (const row of prepared) {
         const dup = this.stmt(S.checkDuplicate).get(
           sessionId, DEDUP_WINDOW, row.event.type, row.dataHash,
@@ -829,7 +906,7 @@ export class SessionDB extends SQLiteBase {
           row.event.type,
           row.event.category,
           row.event.priority,
-          row.event.data,
+          row.eventData,
           row.projectDir,
           row.attributionSource,
           row.attributionConfidence,
@@ -838,8 +915,9 @@ export class SessionDB extends SQLiteBase {
           sourceHook,
           row.dataHash,
         );
+        inserted++;
       }
-      this.stmt(S.updateMetaLastEvent).run(sessionId);
+      if (inserted > 0) this.stmt(S.updateMetaLastEvents).run(inserted, sessionId);
     });
 
     this.withRetry(() => transaction());
@@ -958,7 +1036,7 @@ export class SessionDB extends SQLiteBase {
    * `projectDir` is the session origin directory, not per-event attribution.
    */
   ensureSession(sessionId: string, projectDir: string): void {
-    this.stmt(S.ensureSession).run(sessionId, projectDir);
+    this.withRetry(() => this.stmt(S.ensureSession).run(sessionId, projectDir));
   }
 
   /**
@@ -973,7 +1051,7 @@ export class SessionDB extends SQLiteBase {
    * Increment the compact_count for a session (tracks snapshot rebuilds).
    */
   incrementCompactCount(sessionId: string): void {
-    this.stmt(S.incrementCompactCount).run(sessionId);
+    this.withRetry(() => this.stmt(S.incrementCompactCount).run(sessionId));
   }
 
   // ═══════════════════════════════════════════
@@ -984,7 +1062,7 @@ export class SessionDB extends SQLiteBase {
    * Upsert a resume snapshot for a session. Resets consumed flag on update.
    */
   upsertResume(sessionId: string, snapshot: string, eventCount?: number): void {
-    this.stmt(S.upsertResume).run(sessionId, snapshot, eventCount ?? 0);
+    this.withRetry(() => this.stmt(S.upsertResume).run(sessionId, snapshot, eventCount ?? 0));
   }
 
   /**
@@ -999,7 +1077,7 @@ export class SessionDB extends SQLiteBase {
    * Mark the resume snapshot as consumed (already injected into conversation).
    */
   markResumeConsumed(sessionId: string): void {
-    this.stmt(S.markResumeConsumed).run(sessionId);
+    this.withRetry(() => this.stmt(S.markResumeConsumed).run(sessionId));
   }
 
   /**
@@ -1025,7 +1103,7 @@ export class SessionDB extends SQLiteBase {
   claimLatestUnconsumedResume(
     currentSessionId: string,
   ): { sessionId: string; snapshot: string } | null {
-    const row = this.stmt(S.claimLatestUnconsumedResume).get(currentSessionId) as
+    const row = this.withRetry(() => this.stmt(S.claimLatestUnconsumedResume).get(currentSessionId)) as
       | { session_id: string; snapshot: string }
       | undefined;
     if (!row) return null;
@@ -1040,11 +1118,35 @@ export class SessionDB extends SQLiteBase {
   getLatestSessionId(): string | null {
     try {
       const row = this.db.prepare(
-        "SELECT session_id FROM session_meta ORDER BY started_at DESC LIMIT 1",
+        "SELECT session_id FROM session_meta ORDER BY started_at DESC, rowid DESC LIMIT 1",
       ).get() as { session_id?: string } | undefined;
       return row?.session_id ?? null;
     } catch {
       return null;
+    }
+  }
+
+  listSessions(limit = 50): SessionMeta[] {
+    try {
+      return this.stmt(S.listSessions).all(limit) as SessionMeta[];
+    } catch {
+      return [];
+    }
+  }
+
+  getEventsSince(sinceSqlTimestamp: string, limit = 5000): StoredEvent[] {
+    try {
+      return this.stmt(S.getEventsSince).all(sinceSqlTimestamp, limit) as StoredEvent[];
+    } catch {
+      return [];
+    }
+  }
+
+  getLatestEvents(sessionId: string, limit = 1000): StoredEvent[] {
+    try {
+      return (this.stmt(S.getLatestEvents).all(sessionId, limit) as StoredEvent[]).reverse();
+    } catch {
+      return [];
     }
   }
 
@@ -1060,7 +1162,7 @@ export class SessionDB extends SQLiteBase {
   incrementToolCall(sessionId: string, tool: string, bytesReturned: number = 0): void {
     const safeBytes = Number.isFinite(bytesReturned) && bytesReturned > 0 ? Math.round(bytesReturned) : 0;
     try {
-      this.stmt(S.incrementToolCall).run(sessionId, tool, safeBytes);
+      this.withRetry(() => this.stmt(S.incrementToolCall).run(sessionId, tool, safeBytes));
     } catch {
       // best-effort: counter must never throw and break the parent call
     }
@@ -1107,11 +1209,12 @@ export class SessionDB extends SQLiteBase {
    * Delete all data for a session (events, meta, resume).
    */
   deleteSession(sessionId: string): void {
-    this.db.transaction(() => {
+    const transaction = this.db.transaction(() => {
       this.stmt(S.deleteEvents).run(sessionId);
       this.stmt(S.deleteResume).run(sessionId);
       this.stmt(S.deleteMeta).run(sessionId);
-    })();
+    });
+    this.withRetry(() => transaction());
   }
 
   /**

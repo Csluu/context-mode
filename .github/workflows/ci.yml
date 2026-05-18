@@ -86,6 +86,9 @@ jobs:
         if: runner.os == 'Linux'
         run: npm run benchmark:check
 
+      - name: Skip manifest audit
+        if: runner.os == 'Linux'
+        run: npm run skip:audit:strict
+
       - name: Doctor (verify server starts)
         run: npx tsx src/cli.ts doctor
-        continue-on-error: true

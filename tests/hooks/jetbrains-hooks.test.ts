@@ -168,7 +168,8 @@ describe("JetBrains Copilot hooks", () => {
 
       expect(result.exitCode).toBe(0);
       const out = JSON.parse(result.stdout);
-      expect(out.hookSpecificOutput.additionalContext).toContain("ctx_batch_execute");
+      expect(out.hookSpecificOutput.additionalContext).toContain("Recommended route");
+      expect(out.hookSpecificOutput.additionalContext).toContain("context-mode_ctx_execute");
     });
 
     test("handles empty input gracefully (no crash)", () => {

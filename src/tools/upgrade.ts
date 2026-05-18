@@ -7,7 +7,7 @@
  * explicit factory arguments (`UpgradeDeps`) plus the shared `ToolContext`.
  */
 
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
 
 import { z } from "zod";
@@ -28,7 +28,7 @@ export interface UpgradeDeps {
 }
 
 const description =
-  "Upgrade context-mode to the latest version. Returns a shell command to execute. " +
+  "Upgrade context-mode to the latest version when explicitly enabled. Returns a shell command to execute. " +
   "You MUST run the returned command using your shell tool (Bash, shell_execute, " +
   "run_in_terminal, etc.) and display the output as a checklist. " +
   "Tell the user to restart their session after upgrade.";
@@ -42,6 +42,23 @@ export function makeCtxUpgrade(deps: UpgradeDeps): ToolDefinition {
       inputSchema: z.object({}),
     },
     handler: async (_input: unknown, ctx: ToolContext): Promise<{ content: Array<{ type: "text"; text: string }> }> => {
+      if (process.env.CONTEXT_MODE_ALLOW_UNPINNED_UPGRADE !== "1") {
+        return {
+          content: [{
+            type: "text" as const,
+            text: [
+              "## ctx-upgrade",
+              "",
+              "Upgrade command disabled for this fork.",
+              "",
+              "`context-mode upgrade` currently fetches mutable upstream state. To avoid supply-chain drift, this MCP tool will not hand agents an upgrade command unless `CONTEXT_MODE_ALLOW_UNPINNED_UPGRADE=1` is set.",
+              "",
+              "For this private fork, upgrade from a reviewed local checkout instead: pull the intended commit, run tests, then rebuild/install from that checkout.",
+            ].join("\n"),
+          }],
+        };
+      }
+
       const pluginRoot = ctx.pluginRoot;
       const bundlePath = resolve(pluginRoot, "cli.bundle.mjs");
       const fallbackPath = resolve(pluginRoot, "build", "cli.js");
@@ -77,44 +94,20 @@ export function makeCtxUpgrade(deps: UpgradeDeps): ToolDefinition {
       } else if (existsSync(fallbackPath)) {
         cmd = `${deps.buildNodeCommand(fallbackPath)} upgrade${platformFlag}`;
       } else {
-        // Inline fallback: neither CLI file exists (marketplace installs).
-        // Emit a self-contained node script that clones, builds, copies.
-        // Written to a .mjs file rather than `node -e '...'` to avoid quote
-        // escaping pain across cmd.exe / PowerShell / bash.
-        const repoUrl = "https://github.com/mksglu/context-mode.git";
-        const scriptLines = [
-          `import{execFileSync}from"node:child_process";`,
-          `import{cpSync,rmSync,existsSync,mkdtempSync,readFileSync,writeFileSync}from"node:fs";`,
-          `import{join}from"node:path";`,
-          `import{tmpdir}from"node:os";`,
-          `const P=${JSON.stringify(pluginRoot)};`,
-          `const T=mkdtempSync(join(tmpdir(),"ctx-upgrade-"));`,
-          `try{`,
-          `console.log("- [x] Starting inline upgrade (no CLI found)");`,
-          `execFileSync("git",["clone","--depth","1","${repoUrl}",T],{stdio:"inherit"});`,
-          `console.log("- [x] Cloned latest source");`,
-          `execFileSync(process.platform==="win32"?"npm.cmd":"npm",["install"],{cwd:T,stdio:"inherit",shell:process.platform==="win32"});`,
-          `execFileSync(process.platform==="win32"?"npm.cmd":"npm",["run","build"],{cwd:T,stdio:"inherit",shell:process.platform==="win32"});`,
-          `console.log("- [x] Built from source");`,
-          `const pkg=JSON.parse(readFileSync(join(T,"package.json"),"utf8"));`,
-          `const items=[...(Array.isArray(pkg.files)?pkg.files:[]),"src","package.json"];`,
-          `for(const item of items){const from=join(T,item);const to=join(P,item);if(existsSync(from)){rmSync(to,{recursive:true,force:true});cpSync(from,to,{recursive:true,force:true});}}`,
-          `writeFileSync(join(P,".mcp.json"),JSON.stringify({mcpServers:{"context-mode":{command:"node",args:["\${CLAUDE_PLUGIN_ROOT}/start.mjs"]}}},null,2)+"\\n");`,
-          `console.log("- [x] Copied package files");`,
-          `execFileSync(process.platform==="win32"?"npm.cmd":"npm",["install","--production"],{cwd:P,stdio:"inherit",shell:process.platform==="win32"});`,
-          `console.log("- [x] Installed production dependencies");`,
-          `console.log("## context-mode upgrade complete");`,
-          `}catch(e){`,
-          `console.error("- [ ] Upgrade failed:",e.message);`,
-          `process.exit(1);`,
-          `}finally{`,
-          `try{rmSync(T,{recursive:true,force:true})}catch{}`,
-          `}`,
-        ].join("\n");
-
-        const tmpScript = resolve(pluginRoot, ".ctx-upgrade-inline.mjs");
-        writeFileSync(tmpScript, scriptLines);
-        cmd = deps.buildNodeCommand(tmpScript);
+        return {
+          content: [{
+            type: "text" as const,
+            text: [
+              "## ctx-upgrade",
+              "",
+              "Upgrade unavailable: neither `cli.bundle.mjs` nor `build/cli.js` exists in this install.",
+              "",
+              "Refusing the old inline fallback because it cloned the latest GitHub branch and ran `npm install` without a pinned commit, checksum, or signature.",
+              "",
+              "Use a trusted package-manager upgrade or reinstall from a reviewed local checkout instead.",
+            ].join("\n"),
+          }],
+        };
       }
 
       const text = [

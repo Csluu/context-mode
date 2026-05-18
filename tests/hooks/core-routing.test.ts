@@ -33,6 +33,8 @@ let routePreToolUse: (
   toolName: string,
   toolInput: Record<string, unknown>,
   projectDir?: string,
+  platform?: string,
+  sessionId?: string,
 ) => {
   action: string;
   reason?: string;
@@ -41,6 +43,7 @@ let routePreToolUse: (
 } | null;
 
 let resetGuidanceThrottle: () => void;
+let initSecurity: (buildDir: string) => Promise<boolean>;
 let ROUTING_BLOCK: string;
 let createRoutingBlock: (t: any, options?: { includeCommands?: boolean }) => string;
 let READ_GUIDANCE: string;
@@ -50,6 +53,7 @@ beforeAll(async () => {
   const mod = await import("../../hooks/core/routing.mjs");
   routePreToolUse = mod.routePreToolUse;
   resetGuidanceThrottle = mod.resetGuidanceThrottle;
+  initSecurity = mod.initSecurity;
 
   const constants = await import("../../hooks/routing-block.mjs");
   ROUTING_BLOCK = constants.ROUTING_BLOCK;
@@ -96,6 +100,34 @@ describe("routePreToolUse", () => {
       expect((result!.updatedInput as Record<string, string>).command).toContain(
         "curl/wget blocked",
       );
+    });
+
+    it("denies Codex exec_command cmd payloads like Bash command payloads", () => {
+      const result = routePreToolUse(
+        "exec_command",
+        { cmd: "curl https://example.com" },
+        undefined,
+        "codex",
+        "codex-cmd-curl",
+      );
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("deny");
+      expect(result!.reason).toContain(
+        "curl/wget blocked",
+      );
+    });
+
+    it("denies Codex inline HTTP instead of returning an unsupported modify action", () => {
+      const result = routePreToolUse(
+        "exec_command",
+        { cmd: 'node -e "fetch(\'https://api.example.com/data\')"' },
+        undefined,
+        "codex",
+        "codex-inline-http",
+      );
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("deny");
+      expect(result!.reason).toContain("Inline HTTP blocked");
     });
 
     it("denies wget commands with modify action", () => {
@@ -495,6 +527,52 @@ describe("routePreToolUse", () => {
     });
   });
 
+  describe("Codex exec_command security policy", () => {
+    let projectDir: string;
+    let codexDir: string;
+    let previousCodexHome: string | undefined;
+    let previousPlatform: string | undefined;
+
+    beforeAll(async () => {
+      await initSecurity(resolve(process.cwd(), "build"));
+    });
+
+    beforeEach(() => {
+      projectDir = mkdtempSync(join(tmpdir(), "ctx-codex-exec-project-"));
+      codexDir = mkdtempSync(join(tmpdir(), "ctx-codex-home-"));
+      writeFileSync(
+        join(codexDir, "settings.json"),
+        JSON.stringify({ permissions: { deny: ["Bash(echo blocked)"] } }),
+        "utf-8",
+      );
+      previousCodexHome = process.env.CODEX_HOME;
+      previousPlatform = process.env.CONTEXT_MODE_PLATFORM;
+      process.env.CODEX_HOME = codexDir;
+      process.env.CONTEXT_MODE_PLATFORM = "codex";
+    });
+
+    afterEach(() => {
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      if (previousPlatform === undefined) delete process.env.CONTEXT_MODE_PLATFORM;
+      else process.env.CONTEXT_MODE_PLATFORM = previousPlatform;
+      try { rmSync(projectDir, { recursive: true, force: true }); } catch {}
+      try { rmSync(codexDir, { recursive: true, force: true }); } catch {}
+    });
+
+    it("denies Codex exec_command cmd payloads from .codex settings", () => {
+      const result = routePreToolUse(
+        "exec_command",
+        { cmd: "echo blocked" },
+        projectDir,
+        "codex",
+        "codex-cmd-policy",
+      );
+      expect(result?.action).toBe("deny");
+      expect(result?.reason).toContain("deny pattern");
+    });
+  });
+
   // ─── Routing block content ──────────────────────────────
 
   describe("routing block content", () => {
@@ -551,6 +629,51 @@ describe("routePreToolUse", () => {
         query: "vitest documentation",
       });
       expect(result).toBeNull();
+    });
+  });
+
+  describe("External MCP tools", () => {
+    it("re-fires guidance every N calls with the default cadence", () => {
+      const calls = Array.from({ length: 22 }, (_, i) =>
+        routePreToolUse(`mcp__slack__tool_${i}`, {}),
+      );
+
+      const fired = calls.map((c) => c?.action === "context");
+      const expected = calls.map((_, i) => i % 10 === 0);
+      expect(fired).toEqual(expected);
+    });
+
+    it("honors CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY", () => {
+      const prev = process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY;
+      try {
+        process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY = "3";
+        const calls = Array.from({ length: 7 }, (_, i) =>
+          routePreToolUse(`mcp__notion__tool_${i}`, {}),
+        );
+        expect(calls.map((c) => c?.action === "context")).toEqual([
+          true,
+          false,
+          false,
+          true,
+          false,
+          false,
+          true,
+        ]);
+      } finally {
+        if (prev === undefined) delete process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY;
+        else process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY = prev;
+      }
+    });
+
+    it("resetGuidanceThrottle resets the periodic external MCP counter", () => {
+      const first = routePreToolUse("mcp__slack__post_message", {});
+      expect(first?.action).toBe("context");
+      const second = routePreToolUse("mcp__slack__list_users", {});
+      expect(second).toBeNull();
+
+      resetGuidanceThrottle();
+      const afterReset = routePreToolUse("mcp__slack__list_users", {});
+      expect(afterReset?.action).toBe("context");
     });
   });
 });

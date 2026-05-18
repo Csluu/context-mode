@@ -1,7 +1,7 @@
 ---
 name: context-mode
 description: |
-  Use context-mode tools (ctx_execute, ctx_execute_file) instead of Bash/cat when processing
+  Use context-mode tools (ctx_read, ctx_route, ctx_execute, ctx_execute_file) instead of Bash/cat when processing
   large outputs. Triggers: "analyze logs", "summarize output", "process data",
   "parse JSON", "filter results", "extract errors", "check build output",
   "analyze dependencies", "process API response", "large file analysis",
@@ -35,7 +35,7 @@ Bash whitelist (safe to run directly):
 - **Package management**: `npm install`, `npm publish`, `pip install`
 - **Simple output**: `echo`, `printf`
 
-**Everything else → `ctx_execute` or `ctx_execute_file`.** Any command that reads, queries, fetches, lists, logs, tests, builds, diffs, inspects, or calls an external service. This includes ALL CLIs (gh, aws, kubectl, docker, terraform, wrangler, fly, heroku, gcloud, etc.) — there are thousands and we cannot list them all.
+**Everything else -> `ctx_route`, `ctx_read`, `ctx_execute`, or `ctx_execute_file`.** Any command that reads, queries, fetches, lists, logs, tests, builds, diffs, inspects, or calls an external service. This includes ALL CLIs (gh, aws, kubectl, docker, terraform, wrangler, fly, heroku, gcloud, etc.) — there are thousands and we cannot list them all.
 
 **When uncertain, use context-mode.** Every KB of unnecessary context reduces the quality and speed of the entire session.
 
@@ -48,7 +48,7 @@ About to run a command / read a file / call an API?
 │   └── Use Bash
 │
 ├── Output MIGHT be large or you're UNSURE?
-│   └── Use context-mode ctx_execute or ctx_execute_file
+│   └── Use ctx_route first for noisy commands, then ctx_execute or ctx_batch_execute
 │
 ├── Fetching web documentation or HTML page?
 │   └── Use ctx_fetch_and_index → ctx_search
@@ -79,7 +79,7 @@ About to run a command / read a file / call an API?
 │       └── Save to file via ctx_execute, then ctx_execute_file(path)
 │
 └── Reading a file to analyze/summarize (not edit)?
-    └── Use ctx_execute_file (file loads into FILE_CONTENT, not context)
+    └── Use ctx_read map/outline/symbols first, then ctx_read slice for needed ranges
 ```
 
 ## When to Use Each Tool
@@ -91,6 +91,9 @@ About to run a command / read a file / call an API?
 | Run tests | `ctx_execute` | `npm test`, `pytest`, `go test ./...` |
 | Git operations | `ctx_execute` | `git log --oneline -50`, `git diff HEAD~5` |
 | Docker/K8s inspection | `ctx_execute` | `docker stats --no-stream`, `kubectl describe pod` |
+| Explain noisy command routing | `ctx_route` | `git diff`, broad `rg`, test runs, logs |
+| Explore source file | `ctx_read` | Map/outline/symbols/slice without raw full-file read |
+| Fetch saved raw output | `ctx_fetch_run` | Read redacted sidecar instead of rerunning a command |
 | Read a log file | `ctx_execute_file` | Parse access.log, error.log, build output |
 | Read a data file | `ctx_execute_file` | Analyze CSV, JSON, YAML, XML |
 | Read source code to analyze | `ctx_execute_file` | Count functions, find patterns, extract metrics |
@@ -100,7 +103,9 @@ About to run a command / read a file / call an API?
 | Playwright console/network | `browser_*(filename)` → `ctx_execute_file(path)` | Save to file, analyze in sandbox |
 | MCP output (already in context) | Use directly | Don't re-index — it's already loaded |
 | MCP output (need multi-query) | `ctx_execute` to save → `ctx_index(path)` → `ctx_search` | Save to file first, index server-side |
-| Wipe indexed KB content | `ctx_purge(confirm: true)` | Permanently deletes all indexed content |
+| Wipe indexed KB content | `ctx_purge(confirm: true, scope: "project")` | Permanently deletes all indexed content |
+| Show current-session savings | `ctx_gain` | Context saved by sandbox/index/cache/sidecars |
+| Find missed savings | `ctx_discover` | Bypass/noisy-tool audit |
 
 ## Automatic Triggers
 

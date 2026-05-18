@@ -1,0 +1,3 @@
+# Completion checklist
+
+Before completing code changes, run the narrow relevant Vitest files first, then npm run typecheck or npm run build depending on blast radius. For tool/schema changes, include MCP schema/OpenClaw metadata tests if present. For parser/sidecar/security changes, run parser, sidecar, redaction/security, and release-report fixture tests relevant to the change. Report any skipped gates clearly.

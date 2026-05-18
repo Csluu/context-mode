@@ -4,9 +4,11 @@
  *
  * Usage:
  *   context-mode                              → Start MCP server (stdio)
+ *   context-mode run -- <command>             → Run a command through parser/sidecar wrapper
  *   context-mode doctor                       → Diagnose runtime issues, hooks, FTS5, version
  *   context-mode upgrade                      → Fix hooks, permissions, and settings
  *   context-mode hook <platform> <event>      → Dispatch a hook script (used by platform hook configs)
+ *   context-mode hook test --adapter <id>     → Self-test hook routing/rewrite behavior
  *
  * Platform auto-detection: CLI detects which platform is running
  * (Claude Code, Gemini CLI, OpenCode, etc.) and uses the appropriate adapter.
@@ -14,7 +16,7 @@
 
 import * as p from "@clack/prompts";
 import color from "picocolors";
-import { execFileSync, execSync, execFile as nodeExecFile, type ExecSyncOptions } from "node:child_process";
+import { execFileSync, execSync, execFile as nodeExecFile, spawnSync, type ExecSyncOptions } from "node:child_process";
 import { readFileSync, writeFileSync, cpSync, accessSync, existsSync, readdirSync, rmSync, closeSync, openSync, chmodSync, mkdirSync, constants } from "node:fs";
 import { request as httpsRequest } from "node:https";
 import { resolve, dirname, join } from "node:path";
@@ -55,6 +57,18 @@ function browserOpenArgv(
 
 // ── Adapter imports ──────────────────────────────────────
 import { detectPlatform, getAdapter } from "./adapters/detect.js";
+import { getAdapterOutputBudget } from "./adapters/output-budget.js";
+import { explainRoute, routeCommand } from "./routing/rewrite-registry.js";
+import { writeRunArtifact } from "./artifacts/run-store.js";
+import { parseCommandOutput, renderParsedOutput } from "./parsers/registry.js";
+import { runCtxEval, type RunEvalOptions } from "./eval/harness.js";
+import { readTrace, explainWhyBig } from "./trace/summary.js";
+import { collectGitTextDiff, renderDiffSummary } from "./diff/git-text.js";
+import { explainTaskCache, renderCacheExplain } from "./cache/explain.js";
+import { listTaskCacheEntries, purgeTaskCache, renderTaskCacheList, runTaskCached } from "./cache/run.js";
+import { makeCtxGuard } from "./tools/guard.js";
+import { experimentalToolsEnabled } from "./tools/registry.js";
+import type { ToolContext } from "./tools/types.js";
 
 /* -------------------------------------------------------
  * Hook dispatcher — `context-mode hook <platform> <event>`
@@ -158,8 +172,41 @@ if (args[0] === "doctor") {
     p.log.error(color.red(message));
     process.exit(1);
   });
+} else if (args[0] === "hook" && args[1] === "test") {
+  hookSelfTest(args.slice(2)).then((code) => process.exit(code));
 } else if (args[0] === "hook") {
   hookDispatch(args[1], args[2]);
+} else if (args[0] === "run") {
+  process.exit(runWrappedCommand(args.slice(1)));
+} else if (args[0] === "route" && args[1] === "--explain") {
+  const command = args.slice(2).join(" ");
+  if (!command) {
+    console.error("Usage: context-mode route --explain <command>");
+    process.exit(2);
+  }
+  console.log(explainRoute(command, { mode: "recommend", adapterCanRewrite: false }));
+} else if (args[0] === "rewrite") {
+  const command = args.slice(1).join(" ");
+  if (!command) {
+    console.error("Usage: context-mode rewrite <command>");
+    process.exit(2);
+  }
+  console.log(JSON.stringify(routeCommand(command, { mode: "rewrite", adapterCanRewrite: true }), null, 2));
+} else if (args[0] === "guard") {
+  requireExperimentalCliCommand("guard");
+  cliGuard(args.slice(1)).then((code) => process.exit(code));
+} else if (args[0] === "eval") {
+  requireExperimentalCliCommand("eval");
+  process.exit(cliEval(args.slice(1)));
+} else if (args[0] === "trace") {
+  requireExperimentalCliCommand("trace");
+  cliTrace(args.slice(1)).then((code) => process.exit(code));
+} else if (args[0] === "diff") {
+  requireExperimentalCliCommand("diff");
+  process.exit(cliDiff(args.slice(1)));
+} else if (args[0] === "cache") {
+  requireExperimentalCliCommand("cache");
+  process.exit(cliCache(args.slice(1)));
 } else if (args[0] === "insight") {
   insight(args[1] ? Number(args[1]) : 4747);
 } else if (args[0] === "statusline") {
@@ -188,6 +235,14 @@ export function toUnixPath(p: string): string {
  */
 const isWin = process.platform === "win32";
 
+function requireExperimentalCliCommand(command: string): void {
+  if (experimentalToolsEnabled()) return;
+  console.error(
+    `context-mode ${command} is experimental. Set CTX_MODE_EXPERIMENTAL=1 to use it.`,
+  );
+  process.exit(2);
+}
+
 export function npmExecFile(args: string[], opts: Record<string, unknown> = {}): void {
   execFileSync(isWin ? "npm.cmd" : "npm", args, {
     ...opts,
@@ -206,6 +261,391 @@ export function npmExec(command: string, opts: Record<string, unknown> = {}): vo
     ...(isWin ? { shell: true } : {}),
   } as unknown as ExecSyncOptions;
   execSync(isWin ? command.replace(/^npm /, "npm.cmd ") : command, execOpts);
+}
+
+interface ParsedRunArgs {
+  parser?: string;
+  raw: boolean;
+  command: string;
+  argv?: string[];
+  shell: boolean;
+}
+
+function quoteCommandPart(value: string): string {
+  if (/^[A-Za-z0-9_./:=@+-]+$/.test(value)) return value;
+  return JSON.stringify(value);
+}
+
+function parseRunArgs(runArgs: string[]): ParsedRunArgs | null {
+  let parser: string | undefined;
+  let raw = false;
+  const commandParts: string[] = [];
+  let passthrough = false;
+
+  for (let i = 0; i < runArgs.length; i++) {
+    const arg = runArgs[i];
+    if (passthrough) {
+      commandParts.push(arg);
+      continue;
+    }
+    if (arg === "--") {
+      passthrough = true;
+      continue;
+    }
+    if (arg === "--parser") {
+      parser = runArgs[++i];
+      if (!parser) return null;
+      continue;
+    }
+    if (arg === "--raw" || arg === "--full") {
+      raw = true;
+      continue;
+    }
+    commandParts.push(arg);
+  }
+
+  if (commandParts.length === 0) return null;
+  if (commandParts.length === 1) {
+    const command = commandParts[0].trim();
+    return command ? { parser, raw, command, shell: true } : null;
+  }
+  return {
+    parser,
+    raw,
+    command: commandParts.map(quoteCommandPart).join(" "),
+    argv: commandParts,
+    shell: false,
+  };
+}
+
+function runWrappedCommand(runArgs: string[]): number {
+  const parsed = parseRunArgs(runArgs);
+  if (!parsed) {
+    console.error("Usage: context-mode run [--parser <name>] [--raw] -- <command>");
+    return 2;
+  }
+
+  const child = parsed.shell
+    ? spawnSync(parsed.command, {
+      shell: true,
+      cwd: process.cwd(),
+      env: process.env,
+      stdio: ["inherit", "pipe", "pipe"],
+      encoding: "utf8",
+      maxBuffer: 20 * 1024 * 1024,
+    })
+    : spawnSync(parsed.argv?.[0] ?? parsed.command, parsed.argv?.slice(1) ?? [], {
+    shell: false,
+    cwd: process.cwd(),
+    env: process.env,
+    stdio: ["inherit", "pipe", "pipe"],
+    encoding: "utf8",
+    maxBuffer: 20 * 1024 * 1024,
+  });
+  const stdout = typeof child.stdout === "string" ? child.stdout : "";
+  const stderr = typeof child.stderr === "string" ? child.stderr : "";
+  const exitCode = typeof child.status === "number"
+    ? child.status
+    : child.signal
+      ? 128
+      : 1;
+  const rawError = child.error ? `${child.error.message}\n` : "";
+  const effectiveStderr = rawError + stderr;
+
+  if (parsed.raw) {
+    if (stdout) process.stdout.write(stdout);
+    if (effectiveStderr) process.stderr.write(effectiveStderr);
+    return exitCode;
+  }
+
+  const inferredParser = parsed.parser ?? routeCommand(parsed.command, {
+    mode: "recommend",
+    adapterCanRewrite: false,
+  }).route?.parser;
+  if (!inferredParser) {
+    console.error("context-mode run requires --parser <name> or --raw for commands without a known compact parser.");
+    return 2;
+  }
+
+  const parsedOutput = parseCommandOutput(inferredParser, {
+    command: parsed.command,
+    stdout,
+    stderr: effectiveStderr,
+    exitCode,
+  });
+  const artifact = writeRunArtifact({
+    projectDir: process.cwd(),
+    command: parsed.command,
+    stdout,
+    stderr: effectiveStderr,
+    status: exitCode === 0 ? "succeeded" : "failed",
+    exitCode,
+    parser: parsedOutput.parser,
+    parserConfidence: parsedOutput.confidence.score,
+    parserConfidenceLevel: parsedOutput.confidence.level,
+    summary: parsedOutput.summary,
+  });
+
+  process.stdout.write([
+    renderParsedOutput(parsedOutput, {
+      maxImportantItems: getAdapterOutputBudget("unknown").maxImportantItems,
+    }),
+    "",
+    `Full raw output: ${artifact.metadata.rawPath}`,
+    "",
+  ].join("\n"));
+  return exitCode;
+}
+
+function hasFlag(argv: readonly string[], flag: string): boolean {
+  return argv.includes(flag);
+}
+
+function valueAfter(argv: readonly string[], flag: string): string | undefined {
+  const idx = argv.indexOf(flag);
+  return idx >= 0 ? argv[idx + 1] : undefined;
+}
+
+function afterDashDash(argv: readonly string[]): string[] {
+  const idx = argv.indexOf("--");
+  return idx >= 0 ? argv.slice(idx + 1) : [];
+}
+
+function firstPositionalAfterMode(argv: readonly string[]): string | undefined {
+  for (const arg of argv.slice(1)) {
+    if (!arg.startsWith("-")) return arg;
+  }
+  return undefined;
+}
+
+function cliToolContext(): ToolContext {
+  return {
+    server: {} as ToolContext["server"],
+    pluginRoot: getPluginRoot(),
+    getSessionDir: () => process.cwd(),
+    trackResponse: (_tool, response) => response,
+  };
+}
+
+async function cliGuard(argv: string[]): Promise<number> {
+  const mode = argv[0] ?? "scan-output";
+  if (!["scan-output", "scan-file", "scan-sidecars", "scan-fixtures"].includes(mode)) {
+    console.error("Usage: context-mode guard <scan-output|scan-file|scan-sidecars|scan-fixtures> [--json]");
+    return 2;
+  }
+  const tool = makeCtxGuard({ getProjectDir: () => process.cwd() });
+  const result = await tool.handler({
+    mode: mode as "scan-output" | "scan-file" | "scan-sidecars" | "scan-fixtures",
+    text: valueAfter(argv, "--text") ?? afterDashDash(argv).join(" "),
+    path: valueAfter(argv, "--path") ?? (mode === "scan-file" ? firstPositionalAfterMode(argv) : undefined),
+    runId: valueAfter(argv, "--run-id"),
+    latest: hasFlag(argv, "--latest"),
+    limit: valueAfter(argv, "--limit") ? Number(valueAfter(argv, "--limit")) : undefined,
+    json: hasFlag(argv, "--json"),
+    includePreview: hasFlag(argv, "--include-preview"),
+  }, cliToolContext());
+  console.log(result.content[0]?.text ?? "");
+  return result.isError ? 1 : 0;
+}
+
+function cliEval(argv: string[]): number {
+  const packArg = (argv[0] && !argv[0].startsWith("--")) ? argv[0] : "all";
+  const report = runCtxEval({
+    pack: packArg as RunEvalOptions["pack"],
+    fast: !hasFlag(argv, "--full"),
+  });
+  console.log(JSON.stringify(report, null, 2));
+  return report.failed ? 1 : 0;
+}
+
+async function cliTrace(argv: string[]): Promise<number> {
+  const detection = detectPlatform();
+  const adapter = await getAdapter(detection.platform);
+  const report = readTrace({
+    projectDir: process.cwd(),
+    sessionsDir: adapter.getSessionDir(),
+    session: valueAfter(argv, "--session") ?? (hasFlag(argv, "--latest") ? "latest" : undefined),
+    lastDays: valueAfter(argv, "--last-days") ? Number(valueAfter(argv, "--last-days")) : undefined,
+    limit: valueAfter(argv, "--limit") ? Number(valueAfter(argv, "--limit")) : undefined,
+  });
+  if (hasFlag(argv, "--json")) console.log(JSON.stringify(report, null, 2));
+  else if (hasFlag(argv, "--why-big")) console.log(explainWhyBig(report).join("\n"));
+  else if (hasFlag(argv, "--tool-breakdown")) {
+    console.log(report.rollups.byTool.map((item) =>
+      `${item.tool}: count=${item.count} returned=${item.bytesReturned}B`
+    ).join("\n"));
+  }
+  else console.log(JSON.stringify({ scope: report.scope, rollups: report.rollups, warnings: report.warnings }, null, 2));
+  return report.available ? 0 : 1;
+}
+
+function cliDiff(argv: string[]): number {
+  const result = collectGitTextDiff({
+    repoDir: process.cwd(),
+    staged: hasFlag(argv, "--staged"),
+    semantic: hasFlag(argv, "--semantic"),
+    includeRaw: false,
+  });
+  console.log(hasFlag(argv, "--json") ? JSON.stringify(result, null, 2) : renderDiffSummary(result));
+  return result.provider.status === "failed" ? 1 : 0;
+}
+
+function cliCache(argv: string[]): number {
+  if (argv[0] === "list") {
+    const entries = listTaskCacheEntries(process.cwd());
+    const payload = { schemaVersion: 1, servingEnabled: true, entries: entries.map((row) => ({ path: row.path, ...row.entry })) };
+    console.log(hasFlag(argv, "--json") ? JSON.stringify(payload, null, 2) : renderTaskCacheList(process.cwd()));
+    return 0;
+  }
+  if (argv[0] === "purge") {
+    const dryRun = hasFlag(argv, "--dry-run") || !hasFlag(argv, "--confirm");
+    const purged = purgeTaskCache(process.cwd(), dryRun);
+    const payload = { schemaVersion: 1, servingEnabled: true, dryRun, ...purged };
+    console.log(hasFlag(argv, "--json") ? JSON.stringify(payload, null, 2) : `ctx_cache purge: ${dryRun ? "would delete" : "deleted"} ${purged.entries} entr${purged.entries === 1 ? "y" : "ies"} (${purged.bytes}B)`);
+    return 0;
+  }
+  if (argv[0] === "run") {
+    const command = afterDashDash(argv).join(" ") || argv.slice(1).join(" ");
+    if (!command) {
+      console.error("Usage: context-mode cache run -- <command>");
+      return 2;
+    }
+    const result = runTaskCached({ command, cwd: process.cwd() });
+    if (hasFlag(argv, "--json")) {
+      console.log(JSON.stringify({
+        ...result,
+        stdout: undefined,
+        stderr: undefined,
+        stdoutBytes: Buffer.byteLength(result.stdout),
+        stderrBytes: Buffer.byteLength(result.stderr),
+      }, null, 2));
+    } else {
+      if (result.stdout) process.stdout.write(result.stdout);
+      if (result.stderr) process.stderr.write(result.stderr);
+    }
+    return result.exitCode;
+  }
+  if (argv[0] !== "explain") {
+    console.error("Usage: context-mode cache <explain|run|list|purge> [--json] -- <command>");
+    return 2;
+  }
+  const command = afterDashDash(argv).join(" ") || argv.slice(1).join(" ");
+  if (!command) {
+    console.error("Usage: context-mode cache explain -- <command>");
+    return 2;
+  }
+  const result = explainTaskCache({ command, cwd: process.cwd() });
+  console.log(hasFlag(argv, "--json") ? JSON.stringify(result, null, 2) : renderCacheExplain(result));
+  return 0;
+}
+
+interface HookSelfTestOptions {
+  adapter: string;
+  command: string;
+  json: boolean;
+  rewrite: boolean;
+}
+
+function parseHookSelfTestArgs(testArgs: string[]): HookSelfTestOptions | null {
+  let adapter = "";
+  let command = "rg __context_mode_hook_test__ .";
+  let json = false;
+  let rewrite = false;
+
+  for (let i = 0; i < testArgs.length; i++) {
+    const arg = testArgs[i];
+    if (arg === "--adapter") {
+      adapter = testArgs[++i] ?? "";
+      continue;
+    }
+    if (arg === "--command") {
+      command = testArgs[++i] ?? "";
+      continue;
+    }
+    if (arg === "--json") {
+      json = true;
+      continue;
+    }
+    if (arg === "--rewrite") {
+      rewrite = true;
+      continue;
+    }
+    if (arg === "--") {
+      command = testArgs.slice(i + 1).join(" ").trim();
+      break;
+    }
+  }
+
+  if (!adapter || !command) return null;
+  return { adapter, command, json, rewrite };
+}
+
+async function hookSelfTest(testArgs: string[]): Promise<number> {
+  const opts = parseHookSelfTestArgs(testArgs);
+  if (!opts) {
+    console.error("Usage: context-mode hook test --adapter <id> [--rewrite] [--json] [--command <command>]");
+    return 2;
+  }
+
+  const routingPath = resolve(getPluginRoot(), "hooks", "core", "routing.mjs");
+  const routing = await import(pathToFileURL(routingPath).href) as {
+    initRewriteRegistry?: () => Promise<boolean>;
+    resetGuidanceThrottle?: (sessionId?: string) => void;
+    routePreToolUse: (
+      toolName: string,
+      toolInput: Record<string, unknown>,
+      projectDir?: string,
+      platform?: string,
+      sessionId?: string,
+    ) => { action?: string; reason?: string; updatedInput?: Record<string, unknown>; additionalContext?: string } | null;
+  };
+  const routerReady = routing.initRewriteRegistry ? await routing.initRewriteRegistry() : false;
+  const sessionId = `hook-test-${process.pid}`;
+  routing.resetGuidanceThrottle?.(sessionId);
+
+  const previousRewrite = process.env.CONTEXT_MODE_HOOK_REWRITE;
+  if (opts.rewrite) process.env.CONTEXT_MODE_HOOK_REWRITE = "1";
+  try {
+    const decision = routing.routePreToolUse(
+      "Bash",
+      { command: opts.command },
+      process.cwd(),
+      opts.adapter,
+      sessionId,
+    );
+    const payload = {
+      adapter: opts.adapter,
+      command: opts.command,
+      routerReady,
+      observed: true,
+      rewriteRequested: opts.rewrite,
+      action: decision?.action ?? "pass-through",
+      recommended: decision?.action === "context" && /Recommended route/.test(decision.additionalContext ?? ""),
+      rewritten: decision?.action === "modify",
+      updatedInput: decision?.updatedInput,
+      reason: decision?.reason,
+      additionalContext: decision?.additionalContext,
+    };
+
+    if (opts.json) {
+      console.log(JSON.stringify(payload, null, 2));
+    } else {
+      console.log([
+        "context-mode hook test",
+        `adapter: ${payload.adapter}`,
+        `command: ${payload.command}`,
+        `router ready: ${payload.routerReady ? "yes" : "no"}`,
+        `observed: ${payload.observed ? "yes" : "no"}`,
+        `action: ${payload.action}`,
+        `recommended: ${payload.recommended ? "yes" : "no"}`,
+        `rewritten: ${payload.rewritten ? "yes" : "no"}`,
+      ].join("\n"));
+    }
+    return 0;
+  } finally {
+    if (previousRewrite === undefined) delete process.env.CONTEXT_MODE_HOOK_REWRITE;
+    else process.env.CONTEXT_MODE_HOOK_REWRITE = previousRewrite;
+  }
 }
 
 /**
@@ -784,6 +1224,16 @@ async function insight(port: number) {
 
 async function upgrade(opts?: { platform?: string }) {
   if (process.stdout.isTTY) console.clear();
+
+  if (process.env.CONTEXT_MODE_ALLOW_UNPINNED_UPGRADE !== "1") {
+    p.intro(color.bgCyan(color.black(" context-mode upgrade ")));
+    p.log.warn(
+      color.yellow("Upgrade disabled for this fork") +
+        color.dim(" — this command fetches mutable upstream Git state. Set CONTEXT_MODE_ALLOW_UNPINNED_UPGRADE=1 only when you intentionally accept that risk."),
+    );
+    process.exitCode = 1;
+    return;
+  }
 
   // Issue #542 — when the MCP ctx_upgrade handler threads through an
   // explicit --platform <id> (resolved from live clientInfo), trust it

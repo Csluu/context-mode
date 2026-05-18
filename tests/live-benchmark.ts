@@ -6,7 +6,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { readFileSync, existsSync, rmSync } from "node:fs";
+import { readFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -317,9 +317,23 @@ async function main() {
   const allPreserved = results.every((r) => r.exactCodePreserved);
   console.log(`Code examples preserved: ${allPreserved ? "YES" : "PARTIAL"}`);
 
+  const payload = { results, totalRaw, totalSearch };
+
   // JSON output for markdown generation
   console.log("\n--- JSON ---");
-  console.log(JSON.stringify({ results, totalRaw, totalSearch }, null, 2));
+  console.log(JSON.stringify(payload, null, 2));
+
+  const jsonOutIndex = process.argv.indexOf("--json-out");
+  if (jsonOutIndex >= 0) {
+    const outPath = process.argv[jsonOutIndex + 1];
+    if (!outPath) {
+      console.error("--json-out requires a file path");
+      process.exit(1);
+    }
+    mkdirSync(dirname(outPath), { recursive: true });
+    writeFileSync(outPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+    console.log(`Benchmark JSON written: ${outPath}`);
+  }
 
   if (process.argv.includes("--check")) {
     const failures = checkRegression(results);

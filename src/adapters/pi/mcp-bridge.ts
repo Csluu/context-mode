@@ -127,6 +127,109 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 // initialize/list, but still bounded so a hung server can't block Pi.
 const DEFAULT_CALL_TIMEOUT_MS = 120_000;
 
+class PiTextComponent {
+  private text: string;
+
+  constructor(text = "") {
+    this.text = text;
+  }
+
+  setText(text: string): void {
+    this.text = text;
+  }
+
+  invalidate(): void {
+    // Stateless renderer: no cached layout to invalidate.
+  }
+
+  render(width: number): string[] {
+    if (!this.text || this.text.trim() === "") return [];
+    return this.text
+      .replace(/\t/g, "   ")
+      .split(/\r?\n/)
+      .map((line) => truncateAnsiLine(line, Math.max(1, width)));
+  }
+}
+
+const ANSI_PATTERN = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
+
+function truncateAnsiLine(line: string, maxWidth: number): string {
+  if (maxWidth <= 0) return "";
+  let output = "";
+  let visible = 0;
+  let index = 0;
+  ANSI_PATTERN.lastIndex = 0;
+  for (;;) {
+    const match = ANSI_PATTERN.exec(line);
+    const end = match?.index ?? line.length;
+    const chunk = line.slice(index, end);
+    for (const char of chunk) {
+      if (visible >= maxWidth) return output;
+      output += char;
+      visible++;
+    }
+    if (!match) return output;
+    output += match[0];
+    index = ANSI_PATTERN.lastIndex;
+  }
+}
+
+interface PiRenderTheme {
+  bold(text: string): string;
+  fg(color: string, text: string): string;
+}
+
+interface PiRenderContext {
+  lastComponent?: unknown;
+}
+
+function createContextModeCallRenderer(toolName: string) {
+  return (_args: unknown, theme: PiRenderTheme, context: PiRenderContext) => {
+    const text =
+      context.lastComponent instanceof PiTextComponent
+        ? context.lastComponent
+        : new PiTextComponent();
+    text.setText(theme.fg("toolTitle", theme.bold(toolName)));
+    return text;
+  };
+}
+
+function createContextModeResultRenderer(toolName: string) {
+  return (
+    result: MCPCallResult,
+    { expanded, isPartial }: { expanded: boolean; isPartial: boolean },
+    theme: PiRenderTheme,
+    context: PiRenderContext,
+  ) => {
+    const text =
+      context.lastComponent instanceof PiTextComponent
+        ? context.lastComponent
+        : new PiTextComponent();
+    if (isPartial) {
+      text.setText(theme.fg("warning", "indexing/searching..."));
+      return text;
+    }
+    const output = (result.content ?? [])
+      .filter((c) => c?.type === "text" && typeof c.text === "string")
+      .map((c) => c.text as string)
+      .join("\n");
+    if (expanded) {
+      text.setText(theme.fg("toolOutput", output));
+      return text;
+    }
+    const firstLine = output
+      .split(/\r?\n/)
+      .find((line) => line.trim().length > 0)
+      ?.trim();
+    const status =
+      firstLine && firstLine.length <= 180
+        ? firstLine
+        : `${toolName} completed`;
+    text.setText(theme.fg("toolOutput", status));
+    return text;
+  };
+}
+
 /**
  * Minimal stdio JSON-RPC client targeting the context-mode MCP server.
  *
@@ -146,6 +249,7 @@ export class MCPStdioClient {
   private buffer = "";
   private initialized = false;
   private exited = false;
+  private respawnPromise: Promise<void> | null = null;
   /**
    * Live env passed to the spawned child — exposed (read-only intent)
    * so tests can pin the fork-bomb-prevention env counter (#516)
@@ -260,13 +364,20 @@ export class MCPStdioClient {
     }
   }
 
-  request<T = unknown>(
+  async request<T = unknown>(
     method: string,
     params: unknown,
     timeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS,
   ): Promise<T> {
+    if (this.exited) {
+      if (!this.respawnPromise) {
+        this.respawnPromise = this.respawn().finally(() => {
+          this.respawnPromise = null;
+        });
+      }
+      await this.respawnPromise;
+    }
     if (!this.child) throw new Error("MCP client not started");
-    if (this.exited) return Promise.reject(new Error("MCP server has exited"));
     const id = ++this.requestId;
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -315,19 +426,8 @@ export class MCPStdioClient {
   }
 
   async callTool(name: string, args: unknown): Promise<MCPCallResult> {
-    // Respawn-on-idle-exit (#583). The MCP server gained an idle
-    // self-shutdown in 1.0.132 (#565/#568, src/lifecycle.ts). When the
-    // Pi-spawned child exits cleanly after the idle window, Pi keeps the
-    // tool handles registered, but the bridge client is `exited=true`
-    // and every subsequent request would reject with
-    // "MCP server has exited" — leaving Pi's ctx_* tools permanently
-    // broken until the user restarts Pi.
-    //
-    // The structural fix is here, not in lifecycle.ts: the bridge owns
-    // the child lifecycle, so it transparently respawns + re-initialises
-    // the server on the next call. Restores parity with adapters whose
-    // host MCP client respawns on EOF (Claude Code, Codex, etc.).
-    if (this.exited) await this.respawn();
+    // Respawn-on-idle-exit is centralized in request(), so initialize,
+    // tools/list, tools/call, and future methods share the same recovery path.
     return this.request<MCPCallResult>(
       "tools/call",
       { name, arguments: args ?? {} },
@@ -340,12 +440,10 @@ export class MCPStdioClient {
    * Resets state so a fresh `start()` + `initialize()` cycle runs, then
    * the caller's pending request flows through the new child.
    *
-   * Internal — exposed only via the public `callTool()` happy path.
+   * Single-flight: concurrent callers share one in-flight respawn via
+   * respawnPromise, avoiding duplicate child processes.
    */
   private async respawn(): Promise<void> {
-    // Drop the dead child handle and clear stream buffer so leftover
-    // bytes from the previous incarnation don't get parsed as JSON-RPC
-    // for the new one. Pending map is already cleared by onExit().
     this.child = null;
     this.buffer = "";
     this.exited = false;
@@ -394,6 +492,17 @@ export interface PiToolRegistration {
   label: string;
   description: string;
   parameters: unknown;
+  renderCall?: (
+    args: unknown,
+    theme: PiRenderTheme,
+    context: PiRenderContext,
+  ) => unknown;
+  renderResult?: (
+    result: MCPCallResult,
+    options: { expanded: boolean; isPartial: boolean },
+    theme: PiRenderTheme,
+    context: PiRenderContext,
+  ) => unknown;
   execute: (
     toolCallId: string,
     params: Record<string, unknown>,
@@ -497,6 +606,8 @@ export async function bootstrapMCPTools(
       // for type inference). Empty-object fallback keeps tools that
       // declare no parameters callable.
       parameters: tool.inputSchema ?? { type: "object", properties: {} },
+      renderCall: createContextModeCallRenderer(tool.name),
+      renderResult: createContextModeResultRenderer(tool.name),
       async execute(_toolCallId, params) {
         const result = await client.callTool(tool.name, params ?? {});
         const text = (result.content ?? [])

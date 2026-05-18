@@ -44,7 +44,7 @@ import type { SessionEvent } from "../../types.js";
 
 import { WorkspaceRouter } from "./workspace-router.js";
 import { buildNodeCommand } from "../types.js";
-import { OPENCLAW_TOOL_DEFS } from "./mcp-tools.js";
+import { getOpenClawToolDefs } from "./mcp-tools.js";
 import type { OpenClawToolDef } from "./mcp-tools.js";
 
 // ── System-reminder filter (CCv2 — SLICE OClaw-3) ─────────
@@ -741,14 +741,15 @@ export default {
     // OpenClaw session. This loop fixes that — mirrors swarmvault MCP pattern
     // (refs/plugin-examples/openclaw/swarmvault/packages/engine/src/mcp.ts:46-51).
     if (api.registerTool) {
-      for (const def of OPENCLAW_TOOL_DEFS) {
+      const toolDefs = getOpenClawToolDefs();
+      for (const def of toolDefs) {
         try {
           api.registerTool(def);
         } catch (err) {
           log.warn?.("registerTool failed", { name: def.name }, err);
         }
       }
-      log.debug("registerTool[ctx_*]", { count: OPENCLAW_TOOL_DEFS.length });
+      log.debug("registerTool[ctx_*]", { count: toolDefs.length });
     } else {
       log.warn?.("api.registerTool unavailable — ctx_* tools not exposed in this OpenClaw build");
     }

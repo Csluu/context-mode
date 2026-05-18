@@ -884,6 +884,121 @@ describe("AskUserQuestion Events", () => {
     assert.equal(decisionEvents[0].category, "decision");
     assert.equal(decisionEvents[0].priority, 2);
     assert.ok(decisionEvents[0].data.includes("database"), "should include question text");
+    assert.ok(decisionEvents[0].data.includes("PostgreSQL"), "should include selected answer");
+    assert.ok(!decisionEvents[0].data.includes('"answers"'), "must not embed raw answers map");
+  });
+
+  test("extracts only selected label when AskUserQuestion response echoes request payload", () => {
+    const question = "Which database should we use?";
+    const input = {
+      tool_name: "AskUserQuestion",
+      tool_input: {
+        questions: [
+          {
+            question,
+            header: "Database",
+            options: [
+              { label: "PostgreSQL", description: "Relational DB" },
+              { label: "MongoDB", description: "Document DB" },
+            ],
+            multiSelect: false,
+          },
+        ],
+      },
+      tool_response: JSON.stringify({
+        questions: [
+          {
+            question,
+            header: "Database",
+            options: [
+              { label: "PostgreSQL", description: "Relational DB" },
+              { label: "MongoDB", description: "Document DB" },
+            ],
+            multiSelect: false,
+          },
+        ],
+        answers: { [question]: "PostgreSQL" },
+      }),
+    };
+
+    const events = extractEvents(input);
+    const decisionEvents = events.filter(e => e.type === "decision_question");
+    assert.equal(decisionEvents.length, 1);
+    assert.equal(decisionEvents[0].data, `Q: ${question} → A: PostgreSQL`);
+    assert.ok(!decisionEvents[0].data.includes('"questions"'), "must not embed echoed questions");
+    assert.ok(!decisionEvents[0].data.includes("[object Object]"), "must not stringify objects");
+  });
+
+  test("does not leak malformed AskUserQuestion response text", () => {
+    const input = {
+      tool_name: "AskUserQuestion",
+      tool_input: {
+        questions: [
+          {
+            question: "Pick one",
+            header: "Choice",
+            options: [{ label: "A", description: "" }],
+            multiSelect: false,
+          },
+        ],
+      },
+      tool_response: "not-json at all { broken",
+    };
+
+    const events = extractEvents(input);
+    const decisionEvents = events.filter(e => e.type === "decision_question");
+    assert.equal(decisionEvents.length, 1);
+    assert.equal(decisionEvents[0].data, "Q: Pick one → A: ");
+    assert.ok(!decisionEvents[0].data.includes("not-json"), "must not leak raw response");
+  });
+
+  test("joins AskUserQuestion multi-select answers", () => {
+    const question = "Pick features";
+    const input = {
+      tool_name: "AskUserQuestion",
+      tool_input: {
+        questions: [
+          {
+            question,
+            header: "Features",
+            options: [
+              { label: "Auth", description: "" },
+              { label: "Billing", description: "" },
+              { label: "Reporting", description: "" },
+            ],
+            multiSelect: true,
+          },
+        ],
+      },
+      tool_response: JSON.stringify({ answers: { [question]: ["Auth", "Reporting"] } }),
+    };
+
+    const events = extractEvents(input);
+    const decisionEvents = events.filter(e => e.type === "decision_question");
+    assert.equal(decisionEvents.length, 1);
+    assert.equal(decisionEvents[0].data, `Q: ${question} → A: Auth | Reporting`);
+  });
+
+  test("falls back to answer values when AskUserQuestion key differs from question text", () => {
+    const input = {
+      tool_name: "AskUserQuestion",
+      tool_input: {
+        questions: [
+          {
+            question: "Original question",
+            header: "Q",
+            options: [{ label: "Yes", description: "" }],
+            multiSelect: false,
+          },
+        ],
+      },
+      tool_response: JSON.stringify({ answers: { "Renamed key": "Yes" } }),
+    };
+
+    const events = extractEvents(input);
+    const decisionEvents = events.filter(e => e.type === "decision_question");
+    assert.equal(decisionEvents.length, 1);
+    assert.equal(decisionEvents[0].data, "Q: Original question → A: Yes");
   });
 
   test("non-AskUserQuestion tool does not produce decision_question", () => {

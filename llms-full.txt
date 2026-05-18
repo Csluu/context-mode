@@ -10,7 +10,7 @@ context-mode operates as a Claude Code plugin that intercepts data-heavy tool ca
 
 | File | Lines | Responsibility |
 |------|-------|----------------|
-| `src/server.ts` | ~2500 | MCP server, 11 tool definitions, session stats, intent search |
+| `src/server.ts` | ~2500+ | MCP server, stable and experimental tool definitions, session stats, intent search |
 | `src/store.ts` | ~1075 | FTS5 knowledge base, chunking strategies, search with fallback |
 | `src/executor.ts` | ~437 | Polyglot subprocess execution, output truncation, sandbox |
 | `src/security.ts` | ~557 | Deny/allow policies, shell-escape detection, pattern matching |
@@ -23,7 +23,7 @@ context-mode operates as a Claude Code plugin that intercepts data-heavy tool ca
 
 ## MCP Tools
 
-context-mode exposes 11 MCP tools. All tool names are prefixed with `mcp__plugin_context-mode_context-mode__` when called from Claude Code.
+context-mode exposes a stable MCP surface plus experimental-gated tools. Stable additions include `ctx_read`, `ctx_route`, `ctx_fetch_run`, `ctx_gain`, and `ctx_discover`; `ctx_guard`, `ctx_eval`, `ctx_trace`, `ctx_diff`, and `ctx_cache` are hidden unless `CTX_MODE_EXPERIMENTAL=1` or `CONTEXT_MODE_EXPERIMENTAL=1`. All tool names are prefixed with `mcp__plugin_context-mode_context-mode__` when called from Claude Code.
 
 ### ctx_execute
 
@@ -640,14 +640,18 @@ Emits XML routing rules as `additionalContext` at session start. Registered with
   </priority_instructions>
 
   <tool_selection_hierarchy>
-    1. GATHER: ctx_batch_execute(commands, queries)
-    2. FOLLOW-UP: ctx_search(queries: ["q1", "q2", ...])
-    3. PROCESSING: ctx_execute(language, code) | ctx_execute_file(path, language, code)
+    1. FILE MAPS: ctx_read(path, mode)
+    2. ROUTING: ctx_route(command, explain: true)
+    3. GATHER: ctx_batch_execute(commands, queries)
+    4. FOLLOW-UP: ctx_search(queries: ["q1", "q2", ...])
+    5. PROCESSING: ctx_execute(language, code) | ctx_execute_file(path, language, code)
+    6. SIDECARS: ctx_fetch_run(list: true | latest: true | runId, raw: true)
+    7. MEASURE: ctx_gain() | ctx_discover()
   </tool_selection_hierarchy>
 
   <forbidden_actions>
     - DO NOT use Bash for commands producing >20 lines of output.
-    - DO NOT use Read for analysis (use ctx_execute_file).
+    - DO NOT use Read for analysis (use ctx_read map/outline/symbols/slice first).
     - DO NOT use WebFetch (use ctx_fetch_and_index instead).
     - Bash is ONLY for git/mkdir/rm/mv/navigation.
   </forbidden_actions>
