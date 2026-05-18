@@ -12,11 +12,13 @@ export interface GainStatsSnapshot {
   readonly bytesIndexed: number;
   readonly bytesSandboxed: number;
   readonly cacheBytesSaved: number;
+  readonly sessionStart?: number;
 }
 
 interface GainDeps {
   readonly getSessionStats: () => GainStatsSnapshot;
   readonly getProjectDir: () => string;
+  readonly getCurrentSessionId?: () => string | undefined;
 }
 
 interface GainInput {
@@ -68,6 +70,25 @@ function renderPersistentTelemetry(summary: TelemetrySummary): string[] {
   ];
 }
 
+function currentSessionSidecars(
+  projectDir: string,
+  stats: GainStatsSnapshot,
+  currentSessionId?: string,
+) {
+  const sessionStart = Number.isFinite(stats.sessionStart)
+    ? stats.sessionStart
+    : undefined;
+  return listRunArtifacts(projectDir, Number.MAX_SAFE_INTEGER)
+    .filter((record) => {
+      if (currentSessionId && record.metadata.sessionId) {
+        return record.metadata.sessionId === currentSessionId;
+      }
+      if (!sessionStart) return true;
+      const createdMs = Date.parse(record.metadata.createdAt);
+      return Number.isFinite(createdMs) && createdMs >= sessionStart;
+    });
+}
+
 export function makeCtxGain(deps: GainDeps): ToolDefinition<GainInput, ToolTextResult> {
   return {
     name: "ctx_gain",
@@ -84,7 +105,7 @@ export function makeCtxGain(deps: GainDeps): ToolDefinition<GainInput, ToolTextR
     handler(input: GainInput, ctx: ToolContext): ToolTextResult {
       const stats = deps.getSessionStats();
       const returned = Object.values(stats.bytesReturned).reduce((sum, value) => sum + value, 0);
-      const sidecars = listRunArtifacts(deps.getProjectDir(), 100);
+      const sidecars = currentSessionSidecars(deps.getProjectDir(), stats, deps.getCurrentSessionId?.());
       const sidecarBytes = sidecars.reduce((sum, record) => sum + record.metadata.rawBytes, 0);
       const keptOut = stats.bytesIndexed + stats.bytesSandboxed + stats.cacheBytesSaved + sidecarBytes;
       const totalObserved = returned + keptOut;

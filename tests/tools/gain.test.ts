@@ -63,6 +63,125 @@ describe("ctx_gain tool", () => {
     }
   });
 
+  it("counts only sidecars created during the current runtime session when sessionStart is available", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "context-mode-gain-sidecars-"));
+    const sessionStart = Date.parse("2026-05-18T12:00:00.000Z");
+    try {
+      writeRunArtifact({
+        projectDir,
+        command: "old command",
+        stdout: "old output",
+        status: "unknown",
+        runId: "11111111-1111-4111-8111-111111111111",
+        now: new Date("2026-05-18T11:59:00.000Z"),
+      });
+      writeRunArtifact({
+        projectDir,
+        command: "new command",
+        stdout: "new output",
+        status: "unknown",
+        runId: "22222222-2222-4222-8222-222222222222",
+        now: new Date("2026-05-18T12:01:00.000Z"),
+      });
+      const tool = makeCtxGain({
+        getProjectDir: () => projectDir,
+        getSessionStats: () => ({
+          calls: {},
+          bytesReturned: {},
+          bytesIndexed: 0,
+          bytesSandboxed: 0,
+          cacheBytesSaved: 0,
+          sessionStart,
+        }),
+      });
+
+      const json = await tool.handler({ json: true }, testContext());
+      const payload = JSON.parse(json.content[0].text);
+
+      expect(payload.sidecarCount).toBe(1);
+      expect(payload.sidecarBytes).toBe(Buffer.byteLength("new output"));
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers sidecar session ids over timestamp filtering when available", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "context-mode-gain-session-id-"));
+    const sessionStart = Date.parse("2026-05-18T12:00:00.000Z");
+    try {
+      writeRunArtifact({
+        projectDir,
+        command: "mine",
+        sessionId: "session-a",
+        stdout: "mine",
+        status: "unknown",
+        now: new Date("2026-05-18T12:01:00.000Z"),
+      });
+      writeRunArtifact({
+        projectDir,
+        command: "other",
+        sessionId: "session-b",
+        stdout: "other",
+        status: "unknown",
+        now: new Date("2026-05-18T12:02:00.000Z"),
+      });
+      const tool = makeCtxGain({
+        getProjectDir: () => projectDir,
+        getCurrentSessionId: () => "session-a",
+        getSessionStats: () => ({
+          calls: {},
+          bytesReturned: {},
+          bytesIndexed: 0,
+          bytesSandboxed: 0,
+          cacheBytesSaved: 0,
+          sessionStart,
+        }),
+      });
+
+      const json = await tool.handler({ json: true }, testContext());
+      const payload = JSON.parse(json.content[0].text);
+
+      expect(payload.sidecarCount).toBe(1);
+      expect(payload.sidecarBytes).toBe(Buffer.byteLength("mine"));
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not cap current-session sidecar accounting at 100 artifacts", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "context-mode-gain-sidecar-cap-"));
+    try {
+      for (let i = 0; i < 101; i++) {
+        writeRunArtifact({
+          projectDir,
+          command: `cmd-${i}`,
+          stdout: "x",
+          status: "unknown",
+          now: new Date(2_000_000 + i),
+        });
+      }
+      const tool = makeCtxGain({
+        getProjectDir: () => projectDir,
+        getSessionStats: () => ({
+          calls: {},
+          bytesReturned: {},
+          bytesIndexed: 0,
+          bytesSandboxed: 0,
+          cacheBytesSaved: 0,
+          sessionStart: 1_000_000,
+        }),
+      });
+
+      const json = await tool.handler({ json: true }, testContext());
+      const payload = JSON.parse(json.content[0].text);
+
+      expect(payload.sidecarCount).toBe(101);
+      expect(payload.sidecarBytes).toBe(101);
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
   it("can include persisted route, parser, and latency telemetry for the latest session", async () => {
     const projectDir = mkdtempSync(join(tmpdir(), "context-mode-gain-project-"));
     const sessionsDir = mkdtempSync(join(tmpdir(), "context-mode-gain-sessions-"));

@@ -11,6 +11,7 @@ interface FetchRunDeps {
 
 interface FetchRunInput {
   readonly runId?: string;
+  readonly projectDir?: string;
   readonly latest?: boolean;
   readonly list?: boolean;
   readonly raw?: boolean;
@@ -51,6 +52,7 @@ export function makeCtxFetchRun(deps: FetchRunDeps): ToolDefinition<FetchRunInpu
         "List or fetch redacted raw-output sidecars created by context-mode runs. Raw secrets are not persisted by default.",
       inputSchema: z.object({
         runId: z.string().optional().describe("Run id to fetch. Prefix ids are accepted."),
+        projectDir: z.string().optional().describe("Optional project root override for run artifacts."),
         latest: z.boolean().optional().describe("Fetch the latest run artifact."),
         list: z.boolean().optional().describe("List recent run artifacts instead of fetching one."),
         raw: z.boolean().optional().describe("Include redacted raw output preview."),
@@ -60,7 +62,7 @@ export function makeCtxFetchRun(deps: FetchRunDeps): ToolDefinition<FetchRunInpu
       }),
     },
     handler(input: FetchRunInput, ctx: ToolContext): ToolTextResult {
-      const projectDir = deps.getProjectDir();
+      const projectDir = input.projectDir?.trim() || deps.getProjectDir();
       const budget = getAdapterOutputBudget(ctx.getAdapterId?.() ?? "unknown");
       if (input.list || (!input.runId && !input.latest)) {
         return { content: [{ type: "text", text: renderList(projectDir, input.limit ?? 20) }] };

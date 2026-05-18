@@ -38,8 +38,14 @@ function resolveClaudeConfigDir() {
 const isPluginInstallPath = (p) =>
   /[/\\]\.claude[/\\]plugins[/\\](cache|marketplaces)[/\\]/.test(p);
 const safeOriginalCwd = isPluginInstallPath(originalCwd) ? null : originalCwd;
+const likelyClaudeHost = Boolean(
+  process.env.CLAUDE_CODE_ENTRYPOINT
+  || process.env.CLAUDE_PLUGIN_ROOT
+  || process.env.CLAUDE_SESSION_ID
+  || /[/\\]\.claude[/\\]plugins[/\\]/.test(__dirname),
+);
 
-if (!process.env.CLAUDE_PROJECT_DIR && safeOriginalCwd) {
+if (likelyClaudeHost && !process.env.CLAUDE_PROJECT_DIR && safeOriginalCwd) {
   process.env.CLAUDE_PROJECT_DIR = safeOriginalCwd;
 }
 

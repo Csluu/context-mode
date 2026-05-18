@@ -24,9 +24,18 @@
  */
 
 /** Minimal JSON-schema-like parameter spec accepted by OpenClaw registerTool. */
+export interface OpenClawJsonSchema {
+  type: string;
+  description?: string;
+  items?: OpenClawJsonSchema;
+  properties?: Record<string, OpenClawJsonSchema>;
+  required?: string[];
+  additionalProperties?: boolean;
+}
+
 export interface OpenClawToolParameters {
   type: "object";
-  properties: Record<string, { type: string; description?: string }>;
+  properties: Record<string, OpenClawJsonSchema>;
   required?: string[];
   additionalProperties?: boolean;
 }
@@ -136,6 +145,7 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
       type: "object",
       properties: {
         path: { type: "string", description: "File path" },
+        projectDir: { type: "string", description: "Optional project root override" },
         mode: { type: "string", description: "auto | map | outline | slice | symbols | full" },
         start: { type: "number", description: "Start line for slice mode" },
         end: { type: "number", description: "End line for slice mode" },
@@ -166,7 +176,7 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
     parameters: {
       type: "object",
       properties: {
-        queries: { type: "array", description: "Search queries" },
+        queries: { type: "array", items: { type: "string" }, description: "Search queries" },
         source: { type: "string", description: "Optional source filter" },
         sort: { type: "string", description: "relevance | timeline" },
       },
@@ -182,8 +192,22 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
       properties: {
         url: { type: "string", description: "URL to fetch" },
         source: { type: "string", description: "Source label for indexed chunks" },
+        requests: {
+          type: "array",
+          items: {
+            type: "object",
+            required: ["url"],
+            properties: {
+              url: { type: "string" },
+              source: { type: "string" },
+            },
+            additionalProperties: true,
+          },
+          description: "Batch of {url, source} requests",
+        },
+        concurrency: { type: "number", description: "Max URLs to fetch in parallel" },
+        force: { type: "boolean", description: "Skip cache and fetch again" },
       },
-      required: ["url"],
       additionalProperties: true,
     },
     execute: cliRedirect("ctx_fetch_and_index"),
@@ -195,6 +219,7 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
       type: "object",
       properties: {
         runId: { type: "string", description: "Run id or prefix to fetch" },
+        projectDir: { type: "string", description: "Optional project root override" },
         latest: { type: "boolean", description: "Fetch latest artifact" },
         list: { type: "boolean", description: "List recent artifacts" },
         raw: { type: "boolean", description: "Include redacted raw preview" },
@@ -210,8 +235,20 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
     parameters: {
       type: "object",
       properties: {
-        commands: { type: "array", description: "Array of {label, command} objects" },
-        queries: { type: "array", description: "Search queries to run after indexing" },
+        commands: {
+          type: "array",
+          items: {
+            type: "object",
+            required: ["label", "command"],
+            properties: {
+              label: { type: "string" },
+              command: { type: "string" },
+            },
+            additionalProperties: true,
+          },
+          description: "Array of {label, command} objects",
+        },
+        queries: { type: "array", items: { type: "string" }, description: "Search queries to run after indexing" },
       },
       additionalProperties: true,
     },
@@ -237,7 +274,12 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
     description: "Show context-mode session statistics — token consumption and per-tool breakdown.",
     parameters: {
       type: "object",
-      properties: {},
+      properties: {
+        scope: { type: "string", description: "session | lifetime | all" },
+        session: { type: "string", description: "Session id to report, or latest" },
+        listSessions: { type: "boolean", description: "Return recent sessions instead of the full report" },
+        limit: { type: "number", description: "Maximum sessions to list when listSessions is true" },
+      },
       additionalProperties: true,
     },
     execute: cliRedirect("ctx_stats"),
@@ -249,6 +291,8 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
       type: "object",
       properties: {
         json: { type: "boolean", description: "Return machine-readable JSON" },
+        session: { type: "string", description: "Include persisted telemetry for a session id, or latest" },
+        lastDays: { type: "number", description: "Include persisted telemetry across the last N days" },
       },
       additionalProperties: true,
     },
@@ -262,6 +306,8 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
       properties: {
         json: { type: "boolean", description: "Return machine-readable JSON" },
         minBytes: { type: "number", description: "Minimum returned bytes for noisy-tool findings" },
+        session: { type: "string", description: "Include persisted telemetry for a session id, or latest" },
+        lastDays: { type: "number", description: "Include persisted telemetry across the last N days" },
       },
       additionalProperties: true,
     },

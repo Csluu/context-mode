@@ -92,6 +92,14 @@ describe("detectPlatform — config directory branches", () => {
     expect(detectPlatform().platform).toBe("claude-code");
   });
 
+  it("prefers ~/.codex over stale ~/.claude when both dirs exist", () => {
+    existsSyncMock.mockImplementation((
+      ((p: unknown) =>
+        p === resolve(home, ".codex") || p === resolve(home, ".claude")) as typeof fs.existsSync
+    ));
+    expect(detectPlatform().platform).toBe("codex");
+  });
+
   it("env var wins over a matching config dir", () => {
     forceDir(resolve(home, ".claude"));
     process.env.CODEX_CI = "1";

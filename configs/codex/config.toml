@@ -6,3 +6,4 @@ hooks = true
 
 [mcp_servers.context-mode]
 command = "context-mode"
+env = { CONTEXT_MODE_HOST = "codex" }

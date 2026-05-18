@@ -141,6 +141,35 @@ describe("run artifact store", () => {
     }
   });
 
+  it("uses deterministic ordering for same-timestamp artifacts", () => {
+    const projectDir = tempProject();
+    try {
+      writeRunArtifact({
+        projectDir,
+        command: "a",
+        stdout: "a",
+        status: "unknown",
+        now: new Date("2026-05-17T11:00:00.000Z"),
+        runId: "11111111-1111-4111-8111-111111111111",
+      });
+      writeRunArtifact({
+        projectDir,
+        command: "b",
+        stdout: "b",
+        status: "unknown",
+        now: new Date("2026-05-17T11:00:00.000Z"),
+        runId: "22222222-2222-4222-8222-222222222222",
+      });
+
+      expect(listRunArtifacts(projectDir, 10).map((record) => record.metadata.runId)).toEqual([
+        "22222222-2222-4222-8222-222222222222",
+        "11111111-1111-4111-8111-111111111111",
+      ]);
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
   it("handles concurrent writes without run id collisions", async () => {
     const projectDir = tempProject();
     try {
@@ -287,6 +316,30 @@ describe("run artifact store", () => {
 
       expect(listRunArtifacts(projectDir, 10)).toHaveLength(0);
       expect(fetchRunArtifact({ projectDir, latest: true, maxBytes: 100 })).toBeNull();
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores metadata with invalid createdAt values", () => {
+    const projectDir = tempProject();
+    try {
+      const record = writeRunArtifact({
+        projectDir,
+        command: "npm test",
+        stdout: "safe output",
+        status: "succeeded",
+      });
+      writeFileSync(
+        record.metadata.metadataPath,
+        `${JSON.stringify({
+          ...record.metadata,
+          createdAt: null,
+        }, null, 2)}\n`,
+        "utf8",
+      );
+
+      expect(listRunArtifacts(projectDir, 10)).toHaveLength(0);
     } finally {
       rmSync(projectDir, { recursive: true, force: true });
     }

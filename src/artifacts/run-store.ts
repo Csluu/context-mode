@@ -10,6 +10,7 @@ export type RunArtifactStatus = "succeeded" | "failed" | "unknown";
 export interface WriteRunArtifactInput {
   readonly projectDir: string;
   readonly command: string;
+  readonly sessionId?: string;
   readonly stdout?: string;
   readonly stderr?: string;
   readonly status?: RunArtifactStatus;
@@ -29,6 +30,7 @@ export interface WriteRunArtifactInput {
 export interface RunArtifactMetadata {
   readonly schemaVersion: 1;
   readonly runId: string;
+  readonly sessionId?: string;
   readonly createdAt: string;
   readonly status: RunArtifactStatus;
   readonly exitCode?: number;
@@ -111,6 +113,7 @@ function readMetadata(metadataPath: string): RunArtifactRecord | null {
   try {
     const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as RunArtifactMetadata;
     if (metadata.schemaVersion !== 1 || !metadata.runId || !metadata.rawPath) return null;
+    if (typeof metadata.createdAt !== "string" || !Number.isFinite(Date.parse(metadata.createdAt))) return null;
     const artifactDir = dirname(metadataPath);
     const rawPath = resolve(metadata.rawPath);
     const safeMetadataPath = resolve(metadataPath);
@@ -144,7 +147,11 @@ function sliceUtf8Bytes(text: string, maxBytes: number): string {
 function deletionCandidates(records: readonly RunArtifactRecord[]): RunArtifactRecord[] {
   return [...records]
     .filter((record) => !record.metadata.pinned)
-    .sort((a, b) => a.metadata.createdAt.localeCompare(b.metadata.createdAt));
+    .sort((a, b) =>
+      a.metadata.createdAt.localeCompare(b.metadata.createdAt)
+      || a.metadata.runId.localeCompare(b.metadata.runId)
+      || a.artifactDir.localeCompare(b.artifactDir)
+    );
 }
 
 export function cleanupRunArtifacts(
@@ -209,6 +216,7 @@ export function writeRunArtifact(input: WriteRunArtifactInput): RunArtifactRecor
   const metadata: RunArtifactMetadata = {
     schemaVersion: 1,
     runId,
+    ...(input.sessionId ? { sessionId: input.sessionId } : {}),
     createdAt: now.toISOString(),
     status: input.status ?? "unknown",
     ...(input.exitCode === undefined ? {} : { exitCode: input.exitCode }),
@@ -255,7 +263,11 @@ export function listRunArtifacts(projectDir: string, limit = 20): RunArtifactRec
     }
   }
   return records
-    .sort((a, b) => b.metadata.createdAt.localeCompare(a.metadata.createdAt))
+    .sort((a, b) =>
+      b.metadata.createdAt.localeCompare(a.metadata.createdAt)
+      || b.metadata.runId.localeCompare(a.metadata.runId)
+      || b.artifactDir.localeCompare(a.artifactDir)
+    )
     .slice(0, Math.max(1, limit));
 }
 

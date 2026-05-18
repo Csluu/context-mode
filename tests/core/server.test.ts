@@ -1773,7 +1773,8 @@ describe("Platform-aware session paths via adapter", () => {
     expect(serverSrc).toContain("function prependStatsScopeHeader");
     expect(serverSrc).toContain("ctx_stats scope:");
     expect(serverSrc).toContain("function resolveStatsSessionId");
-    expect(serverSrc).toContain("latest project session_meta row");
+    expect(serverSrc).toContain("latest observed project session_meta row");
+    expect(serverSrc).toContain("explicit ctx_stats session input");
   });
 
   // ── Adapter methods used for session paths ──
@@ -1998,21 +1999,29 @@ describe("Version outdated warning in trackResponse", () => {
     "utf-8",
   );
 
-  test("fetchLatestVersion function exists and uses npm registry", () => {
+  test("upstream version check is gated with unpinned upgrades", () => {
+    expect(serverSrc).toContain("function isUpstreamVersionCheckEnabled");
+    expect(serverSrc).toContain("CONTEXT_MODE_ALLOW_UNPINNED_UPGRADE");
     expect(serverSrc).toContain("function fetchLatestVersion");
     expect(serverSrc).toContain("registry.npmjs.org/context-mode");
   });
 
-  test("version check fires in main() after server.connect", () => {
+  test("version check is opt-in in main() after server.connect", () => {
     const mainFn = serverSrc.slice(serverSrc.indexOf("async function main"));
+    expect(mainFn).toContain("if (isUpstreamVersionCheckEnabled())");
     expect(mainFn).toContain("fetchLatestVersion");
   });
 
-  test("trackResponse prepends warning when outdated", () => {
+  test("trackResponse prepends warning only when opt-in check reports outdated", () => {
     const trackFn = serverSrc.slice(
       serverSrc.indexOf("function trackResponse"),
       serverSrc.indexOf("function trackIndexed"),
     );
+    const warningFn = serverSrc.slice(
+      serverSrc.indexOf("function shouldShowVersionWarning"),
+      serverSrc.indexOf("// ── Self-heal Layer 2"),
+    );
+    expect(warningFn).toContain("isUpstreamVersionCheckEnabled()");
     expect(trackFn).toContain("_latestVersion");
     expect(trackFn).toContain("outdated");
   });

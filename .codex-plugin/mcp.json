@@ -3,7 +3,10 @@
     "context-mode": {
       "command": "node",
       "args": ["./start.mjs"],
-      "cwd": "."
+      "cwd": ".",
+      "env": {
+        "CONTEXT_MODE_HOST": "codex"
+      }
     }
   }
 }

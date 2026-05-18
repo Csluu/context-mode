@@ -122,6 +122,46 @@ describe("ctxRead", () => {
     }
   });
 
+  it("returns a bounded directory map instead of failing on directories", () => {
+    const projectDir = tempProject();
+    try {
+      mkdirSync(join(projectDir, "src"), { recursive: true });
+      writeFileSync(join(projectDir, "package.json"), "{}", "utf8");
+      writeFileSync(join(projectDir, "src", "index.ts"), "export const ok = true;\n", "utf8");
+
+      const result = ctxRead({ projectDir, path: ".", mode: "map" });
+
+      expect(result.provider).toBe("directory");
+      expect(result.text).toContain("Directory map:");
+      expect(result.text).toContain("[dir]  src/");
+      expect(result.text).toContain("[file] package.json");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("includes Markdown headings in outline mode", () => {
+    const projectDir = tempProject();
+    try {
+      const file = join(projectDir, "GRAPH_REPORT.md");
+      writeFileSync(file, [
+        "# Graph Report",
+        "",
+        "## Corpus Check",
+        "body",
+        "### Community 1",
+      ].join("\n"), "utf8");
+
+      const result = ctxRead({ projectDir, path: file, mode: "outline" });
+
+      expect(result.text).toContain("heading");
+      expect(result.text).toContain("# Graph Report");
+      expect(result.text).toContain("## Corpus Check");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
   it("blocks binary files and path traversal", () => {
     const projectDir = tempProject();
     try {

@@ -8,6 +8,7 @@ import type { ToolContext, ToolDefinition } from "./types.js";
 interface DiscoverDeps {
   readonly getSessionStats: () => GainStatsSnapshot;
   readonly getProjectDir: () => string;
+  readonly getCurrentSessionId?: () => string | undefined;
 }
 
 interface DiscoverInput {
@@ -63,6 +64,25 @@ function renderPersistentTelemetry(summary: TelemetrySummary): string[] {
   ];
 }
 
+function currentSessionSidecars(
+  projectDir: string,
+  stats: GainStatsSnapshot,
+  currentSessionId?: string,
+) {
+  const sessionStart = Number.isFinite(stats.sessionStart)
+    ? stats.sessionStart
+    : undefined;
+  return listRunArtifacts(projectDir, Number.MAX_SAFE_INTEGER)
+    .filter((record) => {
+      if (currentSessionId && record.metadata.sessionId) {
+        return record.metadata.sessionId === currentSessionId;
+      }
+      if (!sessionStart) return true;
+      const createdMs = Date.parse(record.metadata.createdAt);
+      return Number.isFinite(createdMs) && createdMs >= sessionStart;
+    });
+}
+
 export function makeCtxDiscover(deps: DiscoverDeps): ToolDefinition<DiscoverInput, ToolTextResult> {
   return {
     name: "ctx_discover",
@@ -86,7 +106,7 @@ export function makeCtxDiscover(deps: DiscoverDeps): ToolDefinition<DiscoverInpu
           returnedBytes,
           calls: stats.calls[tool] ?? 0,
           category: isCtxTool(tool)
-            ? "mcp-tool-output"
+            ? "managed-context-output"
             : "observable-bypass",
           bypassKind: isNativeFileTool(tool)
             ? "native-file-tool"
@@ -94,7 +114,7 @@ export function makeCtxDiscover(deps: DiscoverDeps): ToolDefinition<DiscoverInpu
               ? "none"
               : "shell-or-host-tool",
           recommendation: isCtxTool(tool)
-            ? "Use intent/search/raw-sidecar options when output is large."
+            ? "Already routed through context-mode; add intent/parser/raw-sidecar options if this returned output is still too large."
             : isNativeFileTool(tool)
               ? "Route broad file reads/searches through ctx_read or ctx_search when the adapter cannot enforce this automatically."
               : "Route through ctx_* tools when possible.",
@@ -102,7 +122,7 @@ export function makeCtxDiscover(deps: DiscoverDeps): ToolDefinition<DiscoverInpu
         .filter((row) => row.returnedBytes >= minBytes)
         .sort((a, b) => b.returnedBytes - a.returnedBytes)
         .slice(0, 20);
-      const sidecars = listRunArtifacts(deps.getProjectDir(), 100);
+      const sidecars = currentSessionSidecars(deps.getProjectDir(), stats, deps.getCurrentSessionId?.());
       const sidecarBytes = sidecars.reduce((sum, record) => sum + record.metadata.rawBytes, 0);
       const observedNativeFileTools = noisyTools.filter((row) => row.bypassKind === "native-file-tool");
       const observedNonCtxTools = noisyTools.filter((row) => !isCtxTool(row.tool));
@@ -162,7 +182,7 @@ export function makeCtxDiscover(deps: DiscoverDeps): ToolDefinition<DiscoverInpu
       const lines = [
         "ctx_discover current session",
         "",
-        "Top noisy tools:",
+        "Top returned tools and bypass candidates:",
         ...(noisyTools.length > 0
           ? noisyTools.map((row, index) =>
             `${index + 1}. ${row.tool} ${fmtBytes(row.returnedBytes)} calls=${row.calls} category=${row.category} — ${row.recommendation}`)

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, realpathSync, readFileSync, statSync } from "node:fs";
+import { existsSync, realpathSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -88,6 +88,7 @@ function numbered(lines: readonly string[], startLine: number): string {
 }
 
 function symbolKind(line: string): string | null {
+  if (/^\s{0,3}#{1,6}\s+\S/.test(line)) return "heading";
   if (/^\s*import\b/.test(line)) return "import";
   if (/^\s*(export\s+)?(async\s+)?function\s+\w+/.test(line)) return "function";
   if (/^\s*(export\s+)?class\s+\w+/.test(line)) return "class";
@@ -97,6 +98,34 @@ function symbolKind(line: string): string | null {
   if (/^\s*export\s+/.test(line)) return "export";
   if (/^\s*(public|private|protected)?\s*(async\s+)?\w+\([^)]*\)\s*[:{]/.test(line)) return "method";
   return null;
+}
+
+function renderDirectoryMap(dirPath: string): string {
+  const entries = readdirSync(dirPath, { withFileTypes: true })
+    .sort((a, b) => {
+      if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+  const maxEntries = 120;
+  const rows = entries.slice(0, maxEntries).map((entry) => {
+    const marker = entry.isDirectory() ? "[dir] " : "[file]";
+    let detail = "";
+    if (!entry.isDirectory()) {
+      try {
+        detail = ` ${statSync(resolve(dirPath, entry.name)).size}B`;
+      } catch { /* best effort */ }
+    }
+    return `- ${marker} ${entry.name}${entry.isDirectory() ? "/" : detail}`;
+  });
+  if (entries.length > maxEntries) {
+    rows.push(`... ${entries.length - maxEntries} more entries omitted`);
+  }
+  return [
+    `Directory map: ${dirPath}`,
+    `entries: ${entries.length}`,
+    "",
+    ...rows,
+  ].join("\n");
 }
 
 function collectSymbols(lines: readonly string[]): CodeMapSymbol[] {
@@ -241,6 +270,16 @@ export function ctxRead(input: CtxReadInput): CtxReadResult {
   assertNotSensitivePath(filePath);
   if (!existsSync(filePath)) throw new Error(`file not found: ${filePath}`);
   const stats = statSync(filePath);
+  if (stats.isDirectory()) {
+    return {
+      path: filePath,
+      mode: input.mode && input.mode !== "auto" ? input.mode : "map",
+      provider: "directory",
+      lineCount: 0,
+      bytes: 0,
+      text: renderDirectoryMap(filePath),
+    };
+  }
   if (!stats.isFile()) throw new Error(`not a file: ${filePath}`);
   const buffer = readFileSync(filePath);
   if (looksBinary(buffer)) throw new Error(`binary file blocked: ${filePath}`);

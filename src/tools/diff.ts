@@ -52,6 +52,7 @@ export function makeCtxDiff(deps: DiffDeps): ToolDefinition<DiffInput, ToolTextR
         const artifact = writeRunArtifact({
           projectDir,
           command: input.staged ? "git diff --cached" : "git diff",
+          sessionId: _ctx.getCurrentSessionId?.(),
           stdout: result.rawDiff,
           status: result.provider.status === "ok" ? "succeeded" : "failed",
           parser: "ctx-diff",

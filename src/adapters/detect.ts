@@ -440,6 +440,18 @@ export function detectPlatform(clientInfo?: { name: string; version?: string }):
 
   const home = homedir();
 
+  // Codex users commonly also have ~/.claude from prior Claude Code usage.
+  // In MCP starts where clientInfo/env is missing, prefer the active Codex
+  // config home over stale Claude state so session DBs do not spill into
+  // ~/.claude/context-mode during Codex runs.
+  if (existsSync(resolve(home, ".codex"))) {
+    return {
+      platform: "codex",
+      confidence: "medium",
+      reason: "~/.codex/ directory exists",
+    };
+  }
+
   if (existsSync(resolve(home, ".claude"))) {
     return {
       platform: "claude-code",
@@ -453,14 +465,6 @@ export function detectPlatform(clientInfo?: { name: string; version?: string }):
       platform: "gemini-cli",
       confidence: "medium",
       reason: "~/.gemini/ directory exists",
-    };
-  }
-
-  if (existsSync(resolve(home, ".codex"))) {
-    return {
-      platform: "codex",
-      confidence: "medium",
-      reason: "~/.codex/ directory exists",
     };
   }
 

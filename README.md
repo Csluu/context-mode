@@ -586,6 +586,7 @@ Manual fallback for Codex builds without `plugin_hooks`:
 
    [mcp_servers.context-mode]
    command = "context-mode"
+   env = { CONTEXT_MODE_HOST = "codex" }
    ```
 
    > **Feature flag note:** Current Codex builds expose hooks under `[features].hooks`

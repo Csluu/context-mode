@@ -17,6 +17,7 @@ import { describe, it, expect, test, beforeAll, beforeEach, afterAll, afterEach,
 import { SessionDB } from "../../src/session/db.js";
 import { OpenClawSessionDB } from "../../src/adapters/openclaw/session-db.js";
 import { extractWorkspace, WorkspaceRouter } from "../../src/adapters/openclaw/workspace-router.js";
+import { OPENCLAW_TOOL_NAMES } from "../../src/adapters/openclaw/mcp-tools.js";
 
 // MCP readiness sentinel — routing.mjs checks process.ppid in-process
 const _sentinelDir = process.platform === "win32" ? tmpdir() : "/tmp";
@@ -214,6 +215,7 @@ describe("OpenClawPlugin", () => {
       expect(plugin.name).toBe("Context Mode");
       expect(plugin.configSchema).toBeDefined();
       expect(plugin.configSchema.type).toBe("object");
+      expect([...plugin.contracts.tools].sort()).toEqual([...OPENCLAW_TOOL_NAMES].sort());
       expect(typeof plugin.register).toBe("function");
     });
 

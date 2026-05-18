@@ -423,12 +423,15 @@ export class AnalyticsEngine {
    *
    * This is the ONE call that ctx_stats should use.
    */
-  queryAll(runtimeStats: RuntimeStats): FullReport {
+  queryAll(runtimeStats: RuntimeStats, opts?: { sessionId?: string | null }): FullReport {
     // ── Resolve latest session ID ──
-    const latestSession = this.db.prepare(
-      "SELECT session_id FROM session_meta ORDER BY started_at DESC, rowid DESC LIMIT 1",
-    ).get() as { session_id: string } | undefined;
-    const sid = latestSession?.session_id ?? "";
+    const hasSessionOverride = opts && Object.prototype.hasOwnProperty.call(opts, "sessionId");
+    const latestSession = hasSessionOverride
+      ? undefined
+      : this.db.prepare(
+        "SELECT session_id FROM session_meta ORDER BY started_at DESC, rowid DESC LIMIT 1",
+      ).get() as { session_id: string } | undefined;
+    const sid = hasSessionOverride ? opts?.sessionId ?? "" : latestSession?.session_id ?? "";
 
     // ── Runtime savings ──
     const totalBytesReturned = Object.values(runtimeStats.bytesReturned).reduce(
@@ -1020,9 +1023,10 @@ export function getConversationStats(opts: {
  *
  * - `eventDataBytes`  = SUM(LENGTH(data))      FROM session_events
  * - `bytesAvoided`    = SUM(bytes_avoided)     FROM session_events
- * - `bytesReturned`   = SUM(bytes_returned)    FROM session_events
+ * - `bytesReturned`   = max event/tool returned bytes for the session
+ * - `sandboxedMcpResponseBytes` = returned bytes from ctx_execute-style tools
  * - `snapshotBytes`   = SUM(LENGTH(snapshot))  FROM session_resume
- * - `totalSavedTokens` = (eventDataBytes + bytesAvoided + snapshotBytes) / 4
+ * - `totalSavedTokens` = (bytesAvoided + snapshotBytes) / 4
  *
  * `bytesReturned` is reported but NOT folded into `totalSavedTokens`
  * because it represents bytes the model already paid for — adding it
@@ -1032,6 +1036,7 @@ export interface RealBytesStats {
   eventDataBytes: number;
   bytesAvoided: number;
   bytesReturned: number;
+  sandboxedMcpResponseBytes: number;
   snapshotBytes: number;
   /**
    * v1.0.133 Slice 3: bytes attributed to this session in the FTS5 content
@@ -1173,6 +1178,7 @@ export function getRealBytesStats(opts: {
     eventDataBytes: 0,
     bytesAvoided: 0,
     bytesReturned: 0,
+    sandboxedMcpResponseBytes: 0,
     snapshotBytes: 0,
     contentBytes: 0,
     totalSavedTokens: 0,
@@ -1203,6 +1209,7 @@ export function getRealBytesStats(opts: {
   let eventDataBytes = 0;
   let bytesAvoided = 0;
   let bytesReturned = 0;
+  let sandboxedMcpResponseBytes = 0;
   let snapshotBytes = 0;
 
   // Each branch returns the tuple in the SAME column order so callers
@@ -1222,11 +1229,29 @@ export function getRealBytesStats(opts: {
           ).get(opts.sessionId) as
             | { data_bytes: number; bytes_avoided: number; bytes_returned: number }
             | undefined;
+          let eventReturnedForDb = 0;
           if (row) {
             eventDataBytes += Number(row.data_bytes ?? 0);
             bytesAvoided   += Number(row.bytes_avoided ?? 0);
-            bytesReturned  += Number(row.bytes_returned ?? 0);
+            eventReturnedForDb = Number(row.bytes_returned ?? 0);
           }
+          try {
+            const tool = sdb.prepare(
+              "SELECT COALESCE(SUM(bytes_returned), 0) AS bytes FROM tool_calls WHERE session_id = ?",
+            ).get(opts.sessionId) as { bytes: number } | undefined;
+            bytesReturned += Math.max(eventReturnedForDb, Number(tool?.bytes ?? 0));
+          } catch {
+            bytesReturned += eventReturnedForDb;
+          }
+          try {
+            const sandboxed = sdb.prepare(
+              `SELECT COALESCE(SUM(bytes_returned), 0) AS bytes
+               FROM tool_calls
+               WHERE session_id = ?
+                 AND tool IN ('ctx_execute', 'ctx_execute_file', 'ctx_batch_execute')`,
+            ).get(opts.sessionId) as { bytes: number } | undefined;
+            sandboxedMcpResponseBytes += Number(sandboxed?.bytes ?? 0);
+          } catch { /* old schema */ }
           try {
             const snap = sdb.prepare(
               "SELECT COALESCE(SUM(LENGTH(snapshot)), 0) AS bytes FROM session_resume WHERE session_id = ?",
@@ -1243,11 +1268,28 @@ export function getRealBytesStats(opts: {
           ).get() as
             | { data_bytes: number; bytes_avoided: number; bytes_returned: number }
             | undefined;
+          let eventReturnedForDb = 0;
           if (row) {
             eventDataBytes += Number(row.data_bytes ?? 0);
             bytesAvoided   += Number(row.bytes_avoided ?? 0);
-            bytesReturned  += Number(row.bytes_returned ?? 0);
+            eventReturnedForDb = Number(row.bytes_returned ?? 0);
           }
+          try {
+            const tool = sdb.prepare(
+              "SELECT COALESCE(SUM(bytes_returned), 0) AS bytes FROM tool_calls",
+            ).get() as { bytes: number } | undefined;
+            bytesReturned += Math.max(eventReturnedForDb, Number(tool?.bytes ?? 0));
+          } catch {
+            bytesReturned += eventReturnedForDb;
+          }
+          try {
+            const sandboxed = sdb.prepare(
+              `SELECT COALESCE(SUM(bytes_returned), 0) AS bytes
+               FROM tool_calls
+               WHERE tool IN ('ctx_execute', 'ctx_execute_file', 'ctx_batch_execute')`,
+            ).get() as { bytes: number } | undefined;
+            sandboxedMcpResponseBytes += Number(sandboxed?.bytes ?? 0);
+          } catch { /* old schema */ }
           try {
             const snap = sdb.prepare(
               "SELECT COALESCE(SUM(LENGTH(snapshot)), 0) AS bytes FROM session_resume",
@@ -1277,11 +1319,9 @@ export function getRealBytesStats(opts: {
     bytesAvoided += contentBytes;
   }
 
-  const totalSavedTokens = Math.floor(
-    (eventDataBytes + bytesAvoided + snapshotBytes) / 4,
-  );
+  const totalSavedTokens = Math.floor((bytesAvoided + snapshotBytes) / 4);
 
-  return { eventDataBytes, bytesAvoided, bytesReturned, snapshotBytes, contentBytes, totalSavedTokens };
+  return { eventDataBytes, bytesAvoided, bytesReturned, sandboxedMcpResponseBytes, snapshotBytes, contentBytes, totalSavedTokens };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1529,6 +1569,7 @@ export function getMultiAdapterRealBytesStats(opts?: {
     eventDataBytes: 0,
     bytesAvoided: 0,
     bytesReturned: 0,
+    sandboxedMcpResponseBytes: 0,
     snapshotBytes: 0,
     contentBytes: 0,
     totalSavedTokens: 0,
@@ -1562,10 +1603,11 @@ export function getMultiAdapterRealBytesStats(opts?: {
     sum.eventDataBytes += one.eventDataBytes;
     sum.bytesAvoided   += one.bytesAvoided;
     sum.bytesReturned  += one.bytesReturned;
+    sum.sandboxedMcpResponseBytes += one.sandboxedMcpResponseBytes;
     sum.snapshotBytes  += one.snapshotBytes;
   }
   sum.totalSavedTokens = Math.floor(
-    (sum.eventDataBytes + sum.bytesAvoided + sum.snapshotBytes) / 4,
+    (sum.bytesAvoided + sum.snapshotBytes) / 4,
   );
 
   return { ...sum, perAdapter };
@@ -1854,21 +1896,36 @@ function renderNarrative5Section(args: {
   const convEventsTokens = conversation.events * TOKENS_PER_EVENT;
   const convRescueTokens = Math.round((conversation.snapshotBytes ?? 0) / 4);
   const convLegacyTokens = convEventsTokens + convRescueTokens;
-  const convRealTokens   = realBytes?.conversation?.totalSavedTokens ?? 0;
+  const convReal = realBytes?.conversation;
+  const convMeasuredSavedBytes = convReal
+    ? convReal.bytesAvoided + convReal.snapshotBytes
+    : 0;
+  const convRealTokens = Math.floor(convMeasuredSavedBytes / 4);
   const conversationTokens = Math.max(convLegacyTokens, convRealTokens);
+  const hasLifetimeScope = Boolean(lifetime || multiAdapter || realBytes?.lifetime);
+  const convBytes = convMeasuredSavedBytes > 0
+    ? convMeasuredSavedBytes
+    : conversationTokens * 4;
 
-  const lifetimeEventsTokens = (lifetime?.totalEvents ?? 0) * TOKENS_PER_EVENT;
-  const lifetimeRescueTokens = Math.round((lifetime?.rescueBytes ?? 0) / 4);
+  const lifetimeEventsTokens = hasLifetimeScope ? (lifetime?.totalEvents ?? 0) * TOKENS_PER_EVENT : 0;
+  const lifetimeRescueTokens = hasLifetimeScope ? Math.round((lifetime?.rescueBytes ?? 0) / 4) : 0;
   const lifetimeLegacyTokens = lifetimeEventsTokens + lifetimeRescueTokens;
-  const lifetimeRealTokens   = realBytes?.lifetime?.totalSavedTokens ?? 0;
-  const lifetimeTokensWithout = Math.max(lifetimeLegacyTokens, lifetimeRealTokens);
+  const lifeRealStats = hasLifetimeScope ? realBytes?.lifetime : undefined;
+  const lifeRet = lifeRealStats?.bytesReturned ?? 0;
+  const lifeAv  = lifeRealStats?.bytesAvoided  ?? 0;
+  const lifetimeMeasuredSavedBytes = lifeRealStats
+    ? lifeAv + lifeRealStats.snapshotBytes
+    : 0;
+  const lifetimeRealSavedTokens = Math.floor(lifetimeMeasuredSavedBytes / 4);
+  const lifetimeSavedTokens = Math.max(lifetimeLegacyTokens, lifetimeRealSavedTokens);
   // Lifetime "with" — measured when available, else legacy 0.02 fallback.
   // Honest definition (matches conversation bar below):
   //   "with"    = bytes_returned (what the model actually re-saw)
   //   "without" = bytes_returned + bytes_avoided
   // When the schema has measurement, derive `with` from `bytes_returned/4`.
-  const lifeRet = realBytes?.lifetime?.bytesReturned ?? 0;
-  const lifeAv  = realBytes?.lifetime?.bytesAvoided  ?? 0;
+  const lifetimeTokensWithout = (lifeRet + lifeAv) > 0
+    ? Math.max(1, Math.floor((lifeRet + lifeAv) / 4))
+    : Math.max(1, lifetimeSavedTokens);
   const lifetimeTokensWith = (lifeRet + lifeAv) > 0
     ? Math.max(1, Math.floor(lifeRet / 4))
     : Math.max(1, Math.round(lifetimeTokensWithout * 0.02));
@@ -1876,12 +1933,12 @@ function renderNarrative5Section(args: {
   // Bytes from realBytes when present, else derive from tokens (×4 — same
   // ratio Phase 8 uses everywhere). All-work bytes drives the opener tally
   // + the section-3 receipt + section-4 cost example.
-  const lifetimeBytes = (multiAdapter?.totalBytes && multiAdapter.totalBytes > 0)
+  const lifetimeFallbackBytes = (multiAdapter?.totalBytes && multiAdapter.totalBytes > 0)
     ? multiAdapter.totalBytes
-    : lifetimeTokensWithout * 4;
-  const convBytes = realBytes?.conversation
-    ? (realBytes.conversation.eventDataBytes + realBytes.conversation.bytesAvoided + realBytes.conversation.snapshotBytes)
-    : conversationTokens * 4;
+    : lifetimeSavedTokens * 4;
+  const lifetimeBytes = hasLifetimeScope
+    ? (lifetimeMeasuredSavedBytes > 0 ? lifetimeMeasuredSavedBytes : lifetimeFallbackBytes)
+    : convBytes;
 
   // ── Days alive of THE CONVERSATION (section 1).
   const convDays = conversation.daysAlive >= 1
@@ -1889,14 +1946,20 @@ function renderNarrative5Section(args: {
     : `${Math.max(1, Math.round(conversation.daysAlive * 24))} hr alive · still going`;
 
   // ── Lifetime span (opener + receipt) — across every adapter / DB on disk.
-  const sinceMs = lifetime?.firstEventMs ?? multiAdapter?.perAdapter?.[0]?.firstMs ?? 0;
+  const sinceMs = hasLifetimeScope
+    ? lifetime?.firstEventMs ?? multiAdapter?.perAdapter?.[0]?.firstMs ?? 0
+    : conversation.firstEventMs ?? 0;
   const lifetimeDays = sinceMs > 0
     ? Math.max(1, Math.round((now - sinceMs) / 86_400_000))
     : 0;
-  const totalConversations = multiAdapter?.totalSessions ?? lifetime?.totalSessions ?? 1;
+  const totalConversations = hasLifetimeScope
+    ? multiAdapter?.totalSessions ?? lifetime?.totalSessions ?? 1
+    : 1;
   const realAdapterCount = multiAdapter?.perAdapter.filter((a) => a.isReal).length ?? 0;
   let where: string;
-  if (multiAdapter && realAdapterCount >= 2) {
+  if (!hasLifetimeScope) {
+    where = "in this session";
+  } else if (multiAdapter && realAdapterCount >= 2) {
     where = `across ${realAdapterCount} AI tools`;
   } else if (multiAdapter && realAdapterCount === 1) {
     const onlyReal = multiAdapter.perAdapter.find((a) => a.isReal);
@@ -1906,15 +1969,20 @@ function renderNarrative5Section(args: {
   }
 
   // ── Opener.
-  if (lifetimeDays > 0) {
+  if (!hasLifetimeScope) {
+    out.push(`  This conversation has ${fmtNum(conversation.events)} captures ${where}.`);
+    out.push(`  context-mode kept ${kb(convBytes)} out of this conversation.`);
+  } else if (lifetimeDays > 0) {
     out.push(`  Across ${lifetimeDays} days you ran ${fmtNum(totalConversations)} conversations ${where}.`);
   } else {
     out.push(`  You ran ${fmtNum(totalConversations)} conversations ${where}.`);
   }
   // Daily-average sub-line — never tease users with a tiny number when the
   // average is sub-MB (still informative); fall back to KB display.
-  const dailyBytes = lifetimeDays > 0 ? lifetimeBytes / lifetimeDays : 0;
-  out.push(`  context-mode kept ${kb(lifetimeBytes)} out of your context window — about ${kb(dailyBytes)} every single day.`);
+  if (hasLifetimeScope) {
+    const dailyBytes = lifetimeDays > 0 ? lifetimeBytes / lifetimeDays : 0;
+    out.push(`  context-mode kept ${kb(lifetimeBytes)} out of your context window — about ${kb(dailyBytes)} every single day.`);
+  }
   out.push("");
   out.push("");
 
@@ -1944,35 +2012,15 @@ function renderNarrative5Section(args: {
   }
   out.push("");
 
-  // Without/With bars — measured from real per-event bytes_returned / bytes_avoided.
-  //
-  // Honest definitions (v1.0.134 SLICE B — eventDataBytes floor):
-  //   Without = bytes the model WOULD have re-seen with no filtering
-  //           = bytes_avoided + bytes_returned + eventDataBytes
-  //   With    = bytes the model ACTUALLY re-saw after context-mode
-  //           = bytes_returned + eventDataBytes
-  //
-  // Why eventDataBytes belongs on BOTH sides:
-  //   `eventDataBytes` is the raw payload captured by the hook (tool args,
-  //   prompt body, etc). Those bytes were "kept out" — never inflated back
-  //   into context — but they still represent real measured signal. Pre-fix
-  //   the formula was `with = max(1, bytesReturned)`, which collapsed to 1
-  //   whenever the conversation hadn't accumulated any re-served bytes yet
-  //   (early in a session, or for tool-heavy work that never re-hits index).
-  //   That produced a degenerate ~100% kept-out bar even when the only
-  //   honest signal we had was a few KB of event payloads.
-  //
-  // No fallback to heuristic. If the schema has zero signal for this
-  // conversation (no hook ever populated any of the three columns),
-  // the section is skipped entirely. Honesty over decoration.
-  const realConv = realBytes?.conversation;
-  const measuredAvoided  = realConv?.bytesAvoided   ?? 0;
-  const measuredReturned = realConv?.bytesReturned  ?? 0;
-  const measuredEvent    = realConv?.eventDataBytes ?? 0;
+  // Without/With bars — measured from real bytes_returned / bytes_avoided.
+  // `eventDataBytes` is telemetry payload stored in SQLite, not model context,
+  // so it must not be counted as either returned context or avoided context.
+  const measuredAvoided  = convReal?.bytesAvoided   ?? 0;
+  const measuredReturned = convReal?.bytesReturned  ?? 0;
 
-  if (measuredAvoided + measuredReturned + measuredEvent > 0) {
-    const convBytesWithout  = measuredAvoided + measuredReturned + measuredEvent;
-    const convBytesWith     = Math.max(1, measuredReturned + measuredEvent);
+  if (measuredAvoided + measuredReturned > 0) {
+    const convBytesWithout  = measuredAvoided + measuredReturned;
+    const convBytesWith     = Math.max(1, measuredReturned);
     const convTokensWithout = Math.max(1, Math.floor(convBytesWithout / 4));
     const convTokensWith    = Math.max(1, Math.floor(convBytesWith    / 4));
     const withoutBar = dataBar(convTokensWithout, convTokensWithout, 32);
@@ -1982,6 +2030,10 @@ function renderNarrative5Section(args: {
     out.push(`  Without context-mode  ${kb(convBytesWithout).padStart(8)}  ${withoutBar}   ${fmtNum(convTokensWithout).padStart(7)} tokens`);
     out.push(`  With context-mode     ${kb(convBytesWith).padStart(8)}  ${withBar}   ${fmtNum(convTokensWith).padStart(7)} tokens`);
     out.push(`                          ${convPct.toFixed(0)}% kept out of context · your AI ran ${convMult}× longer before /compact fired`);
+    const sandboxedConvBytes = convReal?.sandboxedMcpResponseBytes ?? 0;
+    if (sandboxedConvBytes > 0) {
+      out.push(`  Sandboxed MCP responses ${kb(sandboxedConvBytes).padStart(8)}  from ctx_execute, ctx_execute_file, ctx_batch_execute`);
+    }
     out.push("");
   }
 
@@ -2023,7 +2075,7 @@ function renderNarrative5Section(args: {
     ? new Intl.DateTimeFormat(locale, { timeZone: tz, year: "numeric", month: "short", day: "numeric" })
         .format(new Date(conversation.firstEventMs))
     : "";
-  const lifeStartedYMD = sinceMs > 0
+  const lifeStartedYMD = hasLifetimeScope && sinceMs > 0
     ? new Intl.DateTimeFormat(locale, { timeZone: tz, year: "numeric", month: "short", day: "numeric" })
         .format(new Date(sinceMs))
     : "";
@@ -2032,9 +2084,13 @@ function renderNarrative5Section(args: {
   out.push(
     `  This chat: ${kb(convBytes)} kept out · ${conversation.events.toLocaleString(locale)} captures${convStartedYMD ? ` · started ${convStartedYMD}` : ""}.`,
   );
-  out.push(
-    `  All your work: ${kb(lifetimeBytes)} kept out · ${allCaps.toLocaleString(locale)} captures across ${distinctProj} project${distinctProj === 1 ? "" : "s"}${lifeStartedYMD ? ` · since ${lifeStartedYMD}` : ""}.`,
-  );
+  if (hasLifetimeScope) {
+    out.push(
+      `  All your work: ${kb(lifetimeBytes)} kept out · ${allCaps.toLocaleString(locale)} captures across ${distinctProj} project${distinctProj === 1 ? "" : "s"}${lifeStartedYMD ? ` · since ${lifeStartedYMD}` : ""}.`,
+    );
+  } else {
+    out.push("  Session scope only: lifetime totals were not requested.");
+  }
   out.push("");
   out.push("");
 
@@ -2043,7 +2099,12 @@ function renderNarrative5Section(args: {
   // optional team-scale callout, no scaling table, no math footnotes.
   out.push("  ─── 4. The bottom line ───");
   out.push("");
-  out.push(...renderCostExample(lifetimeBytes, lifetimeTokensWithout, lifetimeDays));
+  if (hasLifetimeScope) {
+    out.push(...renderCostExample(lifetimeBytes, lifetimeSavedTokens, lifetimeDays));
+  } else {
+    out.push(`  Session: ${tokensToUsd(conversationTokens)} of Opus 4 tokens kept out of this conversation.`);
+    out.push(`  context-mode kept ${kb(convBytes)} out of context for this chat.`);
+  }
   out.push("");
   out.push("");
 

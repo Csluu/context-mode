@@ -37,6 +37,36 @@ const WATCH_MODE_PATTERNS = [
   /\bvitest\b(?!.*\brun\b)/i,
   /\bjest\b.*\b--watch\b/i,
 ];
+const GIT_GLOBAL_OPTIONS_WITH_VALUE = new Set([
+  "-C",
+  "-c",
+  "--attr-source",
+  "--config-env",
+  "--exec-path",
+  "--git-dir",
+  "--namespace",
+  "--super-prefix",
+  "--work-tree",
+]);
+const GIT_GLOBAL_OPTIONS = new Set([
+  "--bare",
+  "--build-options",
+  "--glob-pathspecs",
+  "--help",
+  "--html-path",
+  "--icase-pathspecs",
+  "--info-path",
+  "--literal-pathspecs",
+  "--man-path",
+  "--no-lazy-fetch",
+  "--no-optional-locks",
+  "--no-pager",
+  "--no-replace-objects",
+  "--noglob-pathspecs",
+  "--paginate",
+  "--version",
+]);
+const GIT_READONLY_SUBCOMMANDS = new Set(["status", "diff", "show", "log"]);
 
 export interface ClassifyCommandOptions {
   dialect?: ShellDialect;
@@ -47,6 +77,179 @@ export interface ClassifyCommandOptions {
 
 export function stableCommandHash(command: string): string {
   return createHash("sha256").update(command).digest("hex");
+}
+
+function isLeadingEnvAssignment(raw: string | undefined): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*=/.test(raw ?? "");
+}
+
+function executableToken(token: string | undefined): string {
+  const base = (token ?? "")
+    .replace(/\\/g, "/")
+    .split("/")
+    .pop()
+    ?.toLowerCase() ?? "";
+  return base.replace(/\.(?:cmd|exe|bat|ps1)$/i, "");
+}
+
+export function gitSubcommandIndex(argv: readonly string[]): number {
+  let i = 0;
+  while (i < argv.length && isLeadingEnvAssignment(argv[i])) i++;
+  if (executableToken(argv[i]) !== "git") return -1;
+  i++;
+
+  while (i < argv.length) {
+    const raw = argv[i] ?? "";
+    if (raw === "--") return i + 1 < argv.length ? i + 1 : -1;
+    if (!raw.startsWith("-")) return i;
+
+    if (GIT_GLOBAL_OPTIONS_WITH_VALUE.has(raw)) {
+      i += 2;
+      continue;
+    }
+    const eq = raw.indexOf("=");
+    if (eq > 0 && GIT_GLOBAL_OPTIONS_WITH_VALUE.has(raw.slice(0, eq))) {
+      i++;
+      continue;
+    }
+    if ((raw.startsWith("-C") || raw.startsWith("-c")) && raw.length > 2) {
+      i++;
+      continue;
+    }
+    if (GIT_GLOBAL_OPTIONS.has(raw)) {
+      i++;
+      continue;
+    }
+    i++;
+  }
+
+  return -1;
+}
+
+export function gitSubcommand(argv: readonly string[]): string {
+  const index = gitSubcommandIndex(argv);
+  return index >= 0 ? (argv[index] ?? "").toLowerCase() : "";
+}
+
+interface ShellMeta {
+  readonly hasControlOperator: boolean;
+  readonly hasPipeline: boolean;
+  readonly hasInputRedirection: boolean;
+  readonly hasOutputRedirection: boolean;
+  readonly hasHeredoc: boolean;
+  readonly hasSubshell: boolean;
+  readonly hasBacktick: boolean;
+}
+
+function isShellEscape(ch: string, quote: "'" | "\"" | null, dialect: ShellDialect): boolean {
+  if (dialect === "powershell") return ch === "`" && quote !== "'";
+  if (dialect === "cmd") return ch === "^";
+  return ch === "\\" && quote !== "'";
+}
+
+function isWindowsDrivePathToken(value: string): boolean {
+  return /^[A-Za-z]:(?:\\|$)/.test(value);
+}
+
+function scanShellMeta(command: string, dialect: ShellDialect = "unknown"): ShellMeta {
+  let quote: "'" | "\"" | null = null;
+  let escaped = false;
+  let hasControlOperator = false;
+  let hasPipeline = false;
+  let hasInputRedirection = false;
+  let hasOutputRedirection = false;
+  let hasHeredoc = false;
+  let hasSubshell = false;
+  let hasBacktick = false;
+
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    const next = command[i + 1] ?? "";
+    const prev = command[i - 1] ?? "";
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (isShellEscape(ch, quote, dialect)) {
+      escaped = true;
+      continue;
+    }
+    if ((ch === "'" || ch === "\"") && quote === null) {
+      quote = ch;
+      continue;
+    }
+    if (quote === ch) {
+      quote = null;
+      continue;
+    }
+    if (quote !== "'") {
+      if (ch === "$" && next === "(") {
+        hasSubshell = true;
+        continue;
+      }
+      if (ch === "`") {
+        hasBacktick = true;
+        continue;
+      }
+    }
+    if (quote !== null) continue;
+
+    if (ch === "\r" || ch === "\n") {
+      hasControlOperator = true;
+      if (ch === "\r" && next === "\n") i++;
+      continue;
+    }
+    if (ch === "&" && next === ">") {
+      hasOutputRedirection = true;
+      i++;
+      continue;
+    }
+    if (ch === "&" && next === "&") {
+      hasControlOperator = true;
+      i++;
+      continue;
+    }
+    if (ch === "|" && next === "|") {
+      hasControlOperator = true;
+      i++;
+      continue;
+    }
+    if (ch === "|") {
+      hasControlOperator = true;
+      if (prev !== "|") hasPipeline = true;
+      continue;
+    }
+    if (ch === ";") {
+      hasControlOperator = true;
+      continue;
+    }
+    if (ch === "&" && prev !== ">") {
+      hasControlOperator = true;
+      continue;
+    }
+    if (ch === "<") {
+      hasInputRedirection = true;
+      if (next === "<") {
+        hasHeredoc = true;
+        i++;
+      }
+      continue;
+    }
+    if (ch === ">") {
+      hasOutputRedirection = true;
+      continue;
+    }
+  }
+
+  return {
+    hasControlOperator,
+    hasPipeline,
+    hasInputRedirection,
+    hasOutputRedirection,
+    hasHeredoc,
+    hasSubshell,
+    hasBacktick,
+  };
 }
 
 export function redactCommandShape(command: string): string {
@@ -72,7 +275,15 @@ export function detectShellDialect(command: string): ShellDialect {
   if (/\b(cmd\.exe|dir\s+\/|findstr\b|type\s+)/i.test(command)) {
     return "cmd";
   }
-  if (/[;&|$`]|^\s*(export|cd|source)\b/.test(command)) return "posix";
+  const meta = scanShellMeta(command);
+  if (
+    meta.hasControlOperator
+    || meta.hasInputRedirection
+    || meta.hasOutputRedirection
+    || meta.hasSubshell
+    || meta.hasBacktick
+    || /^\s*(export|cd|source)\b/.test(command)
+  ) return "posix";
   return "unknown";
 }
 
@@ -87,7 +298,7 @@ export function shellSplit(command: string): string[] {
       escaped = false;
       continue;
     }
-    if (ch === "\\" && quote !== "'") {
+    if (ch === "\\" && quote !== "'" && !isWindowsDrivePathToken(cur)) {
       escaped = true;
       continue;
     }
@@ -131,7 +342,7 @@ function splitSegments(command: string, dialect: ShellDialect, runId: string): C
       escaped = false;
       continue;
     }
-    if (ch === "\\" && quote !== "'") {
+    if (isShellEscape(ch, quote, dialect)) {
       cur += ch;
       escaped = true;
       continue;
@@ -161,6 +372,19 @@ function splitSegments(command: string, dialect: ShellDialect, runId: string): C
         push(ch);
         continue;
       }
+      if (ch === "\r" || ch === "\n") {
+        push("\\n");
+        if (ch === "\r" && next === "\n") i++;
+        continue;
+      }
+      if (ch === "&" && next === ">") {
+        cur += ch;
+        continue;
+      }
+      if (ch === "&" && next !== "&" && command[i - 1] !== ">") {
+        push("&");
+        continue;
+      }
     }
     cur += ch;
   }
@@ -178,30 +402,38 @@ function splitSegments(command: string, dialect: ShellDialect, runId: string): C
     operatorsAfter: seg.after,
     hasSideEffects: hasLikelySideEffects(seg.text),
     classificationOnly: false,
-  })).map((seg) => ({
-    ...seg,
-    classificationOnly:
-      seg.hasSideEffects
-      || seg.operatorsBefore.includes("|")
-      || seg.operatorsAfter.includes("|")
-      || /[<>]|\$\(|`|<<\s*\w+/.test(seg.rawShape),
-  }));
+  })).map((seg) => {
+    const meta = scanShellMeta(seg.rawShape, dialect);
+    return {
+      ...seg,
+      classificationOnly:
+        seg.hasSideEffects
+        || seg.operatorsBefore.includes("|")
+        || seg.operatorsAfter.includes("|")
+        || meta.hasInputRedirection
+        || meta.hasOutputRedirection
+        || meta.hasSubshell
+        || meta.hasBacktick,
+    };
+  });
 }
 
 function hasLikelySideEffects(command: string): boolean {
-  const [first, second] = shellSplit(command);
+  const argv = shellSplit(command);
+  const [first] = argv;
   if (!first) return false;
-  const token = first.toLowerCase();
+  const token = executableToken(first);
   if (["rm", "mv", "cp", "mkdir", "rmdir", "touch", "chmod", "chown", "git"].includes(token)) {
     if (token !== "git") return true;
-    return !["status", "diff", "show", "log"].includes((second ?? "").toLowerCase());
+    return !GIT_READONLY_SUBCOMMANDS.has(gitSubcommand(argv));
   }
   return false;
 }
 
-function classifyInput(command: string, opts: ClassifyCommandOptions): CommandInput {
-  const heredocDetected = /<<[-~]?\s*['"]?[\w.-]+['"]?/.test(command);
-  const stdinPresent = heredocDetected || /(^|[^|])\|([^|]|$)|<\s*\S/.test(command) || (opts.stdinBytes ?? 0) > 0;
+function classifyInput(command: string, opts: ClassifyCommandOptions, dialect: ShellDialect): CommandInput {
+  const meta = scanShellMeta(command, dialect);
+  const heredocDetected = meta.hasHeredoc;
+  const stdinPresent = heredocDetected || meta.hasPipeline || meta.hasInputRedirection || (opts.stdinBytes ?? 0) > 0;
   return {
     stdinPresent,
     stdinBytes: opts.stdinBytes ?? 0,
@@ -238,12 +470,13 @@ export function classifyCommand(command: string, opts: ClassifyCommandOptions = 
   const dialect = opts.dialect ?? detectShellDialect(command);
   const runId = opts.runId ?? randomUUID();
   const argv = shellSplit(normalized);
-  const input = classifyInput(normalized, opts);
+  const input = classifyInput(normalized, opts, dialect);
   const interactivity = classifyInteractivity(normalized, argv, input);
   const segments = splitSegments(normalized, dialect, runId);
   const hasCompoundOperators = segments.length > 1;
-  const hasRedirection = /(^|[^<])>\s*\S|<\s*\S/.test(normalized);
-  const hasSubshell = /\$\(|`/.test(normalized);
+  const meta = scanShellMeta(normalized, dialect);
+  const hasRedirection = meta.hasInputRedirection || meta.hasOutputRedirection;
+  const hasSubshell = meta.hasSubshell || meta.hasBacktick;
   const hasEnvAssignment = argv.some((arg, idx) => idx < 3 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(arg));
 
   return {

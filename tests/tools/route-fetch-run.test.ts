@@ -48,6 +48,7 @@ describe("ctx_route tool", () => {
 describe("ctx_fetch_run tool", () => {
   it("lists and fetches redacted run artifacts", async () => {
     const projectDir = mkdtempSync(join(tmpdir(), "context-mode-fetch-run-"));
+    const defaultProjectDir = mkdtempSync(join(tmpdir(), "context-mode-fetch-run-default-"));
     try {
       const artifact = writeRunArtifact({
         projectDir,
@@ -58,10 +59,14 @@ describe("ctx_fetch_run tool", () => {
         now: new Date("2026-05-17T12:00:00.000Z"),
       });
       const tool = makeCtxFetchRun({ getProjectDir: () => projectDir });
+      const overrideTool = makeCtxFetchRun({ getProjectDir: () => defaultProjectDir });
 
       const list = await tool.handler({ list: true }, testContext());
       expect(list.content[0].text).toContain(artifact.metadata.runId);
       expect(list.content[0].text).toContain("npm test");
+
+      const overrideList = await overrideTool.handler({ list: true, projectDir }, testContext());
+      expect(overrideList.content[0].text).toContain(artifact.metadata.runId);
 
       const raw = await tool.handler({ runId: "44444444", raw: true }, testContext());
       expect(raw.content[0].text).toContain("Run artifact 44444444-4444-4444-8444-444444444444");
@@ -97,6 +102,7 @@ describe("ctx_fetch_run tool", () => {
       expect(missing.content[0].text).toContain("CTX_ARTIFACT_NOT_FOUND");
     } finally {
       rmSync(projectDir, { recursive: true, force: true });
+      rmSync(defaultProjectDir, { recursive: true, force: true });
     }
   });
 });

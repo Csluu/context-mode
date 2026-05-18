@@ -53,6 +53,10 @@ describe("ctx_discover tool", () => {
       const json = await tool.handler({ json: true, minBytes: 1000 }, testContext());
       const payload = JSON.parse(json.content[0].text);
       expect(payload.noisyTools).toHaveLength(3);
+      expect(payload.noisyTools.find((item: { tool: string }) => item.tool === "ctx_execute")).toMatchObject({
+        category: "managed-context-output",
+        bypassKind: "none",
+      });
       expect(payload.noisyTools.find((item: { tool: string }) => item.tool === "Read")).toMatchObject({
         bypassKind: "native-file-tool",
       });
@@ -60,6 +64,97 @@ describe("ctx_discover tool", () => {
       expect(payload.bypassCategories.some((item: { category: string }) => item.category === "mcp-available-not-used")).toBe(true);
       expect(payload.bypassCategories.some((item: { category: string }) => item.category === "instruction-only-bypass")).toBe(true);
       expect(payload.bypassCategories.some((item: { category: string }) => item.category === "hook-missing")).toBe(true);
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("counts only current runtime sidecars when sessionStart is available", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "context-mode-discover-sidecars-"));
+    const sessionStart = Date.parse("2026-05-18T12:00:00.000Z");
+    try {
+      writeRunArtifact({
+        projectDir,
+        command: "old command",
+        stdout: "old output",
+        status: "unknown",
+        runId: "11111111-1111-4111-8111-111111111111",
+        now: new Date("2026-05-18T11:59:00.000Z"),
+      });
+      writeRunArtifact({
+        projectDir,
+        command: "new command",
+        stdout: "new output",
+        status: "unknown",
+        runId: "22222222-2222-4222-8222-222222222222",
+        now: new Date("2026-05-18T12:01:00.000Z"),
+      });
+
+      const tool = makeCtxDiscover({
+        getProjectDir: () => projectDir,
+        getSessionStats: () => ({
+          calls: {},
+          bytesReturned: {},
+          bytesIndexed: 0,
+          bytesSandboxed: 0,
+          cacheBytesSaved: 0,
+          sessionStart,
+        }),
+      });
+
+      const json = await tool.handler({ json: true }, testContext());
+      const payload = JSON.parse(json.content[0].text);
+
+      expect(payload.sidecars.count).toBe(1);
+      expect(payload.sidecars.rawBytes).toBe(Buffer.byteLength("new output"));
+      expect(payload.sidecars.latestRunId).toBe("22222222-2222-4222-8222-222222222222");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers sidecar session ids over timestamp filtering when available", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "context-mode-discover-session-id-"));
+    const sessionStart = Date.parse("2026-05-18T12:00:00.000Z");
+    try {
+      writeRunArtifact({
+        projectDir,
+        command: "mine",
+        sessionId: "session-a",
+        stdout: "mine",
+        status: "unknown",
+        now: new Date("2026-05-18T12:01:00.000Z"),
+        runId: "33333333-3333-4333-8333-333333333333",
+      });
+      writeRunArtifact({
+        projectDir,
+        command: "other",
+        sessionId: "session-b",
+        stdout: "other",
+        status: "unknown",
+        now: new Date("2026-05-18T12:02:00.000Z"),
+        runId: "44444444-4444-4444-8444-444444444444",
+      });
+
+      const tool = makeCtxDiscover({
+        getProjectDir: () => projectDir,
+        getCurrentSessionId: () => "session-a",
+        getSessionStats: () => ({
+          calls: {},
+          bytesReturned: {},
+          bytesIndexed: 0,
+          bytesSandboxed: 0,
+          cacheBytesSaved: 0,
+          sessionStart,
+        }),
+      });
+
+      const json = await tool.handler({ json: true }, testContext());
+      const payload = JSON.parse(json.content[0].text);
+
+      expect(payload.sidecars.count).toBe(1);
+      expect(payload.sidecars.rawBytes).toBe(Buffer.byteLength("mine"));
+      expect(payload.sidecars.latestRunId).toBe("33333333-3333-4333-8333-333333333333");
     } finally {
       rmSync(projectDir, { recursive: true, force: true });
     }

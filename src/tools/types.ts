@@ -26,6 +26,8 @@ export interface ToolContext {
   readonly getSessionDir: () => string;
   /** Current adapter/platform id, used for adapter-specific output budgets. */
   readonly getAdapterId?: () => string;
+  /** Resolve the active conversation/session id when the host exposes one. */
+  readonly getCurrentSessionId?: () => string | undefined;
   /** Wrap a tool response with usage tracking. Returns the response unchanged. */
   readonly trackResponse: <T>(toolName: string, response: T) => T;
 }

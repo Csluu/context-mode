@@ -9,6 +9,30 @@
     "filesystem_access": "full",
     "system_access": "full"
   },
+  "activation": {
+    "onStartup": true,
+    "onCapabilities": ["tool", "hook"]
+  },
+  "contracts": {
+    "tools": [
+      "ctx_execute",
+      "ctx_execute_file",
+      "ctx_read",
+      "ctx_index",
+      "ctx_search",
+      "ctx_fetch_and_index",
+      "ctx_fetch_run",
+      "ctx_batch_execute",
+      "ctx_route",
+      "ctx_stats",
+      "ctx_gain",
+      "ctx_discover",
+      "ctx_doctor",
+      "ctx_upgrade",
+      "ctx_purge",
+      "ctx_insight"
+    ]
+  },
   "configSchema": {
     "type": "object",
     "properties": {

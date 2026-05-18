@@ -44,7 +44,7 @@ import type { SessionEvent } from "../../types.js";
 
 import { WorkspaceRouter } from "./workspace-router.js";
 import { buildNodeCommand } from "../types.js";
-import { getOpenClawToolDefs } from "./mcp-tools.js";
+import { getOpenClawToolDefs, OPENCLAW_TOOL_NAMES } from "./mcp-tools.js";
 import type { OpenClawToolDef } from "./mcp-tools.js";
 
 // ── System-reminder filter (CCv2 — SLICE OClaw-3) ─────────
@@ -308,6 +308,9 @@ export default {
   id: "context-mode",
   name: "Context Mode",
   configSchema,
+  contracts: {
+    tools: [...OPENCLAW_TOOL_NAMES],
+  },
 
   // OpenClaw calls register() synchronously — returning a Promise causes hooks
   // to be silently ignored. Async init runs eagerly; hooks await it on first use.

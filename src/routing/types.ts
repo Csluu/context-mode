@@ -164,6 +164,16 @@ export interface RouteDecision {
   priority?: number;
   confidence: number;
   route?: RoutePlan;
+  segmentRoutes?: Array<{
+    segmentIndex: number;
+    command: string;
+    decision: RouteDecisionKind;
+    selectedRule?: string;
+    confidence: number;
+    route?: RoutePlan;
+    safety: RouteSafety;
+    diagnostics: string[];
+  }>;
   rejectedRules: RejectedRouteRule[];
   safety: RouteSafety;
   adapterCapabilityReason?: string;

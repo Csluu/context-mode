@@ -71,8 +71,8 @@ import { getHookScriptPaths } from "./util/hook-config.js";
 import { resolveClaudeConfigDir } from "./util/claude-config.js";
 import { resolveProjectDir } from "./util/project-dir.js";
 import { loadDatabase } from "./db-base.js";
-import { AnalyticsEngine, formatReport, getConversationStats, getContentBytesAllSessions, getLifetimeStats, getMultiAdapterLifetimeStats, getRealBytesStats, OPUS_INPUT_PRICE_PER_TOKEN } from "./session/analytics.js";
-import { writeRunArtifact } from "./artifacts/run-store.js";
+import { AnalyticsEngine, formatReport, getConversationStats, getContentBytesAllSessions, getLifetimeStats, getMultiAdapterLifetimeStats, getRealBytesStats, OPUS_INPUT_PRICE_PER_TOKEN, type RealBytesStats } from "./session/analytics.js";
+import { listRunArtifacts, writeRunArtifact } from "./artifacts/run-store.js";
 import { redactText } from "./filters/pipeline.js";
 import { getOutputParser, parseCommandOutput, renderParsedOutput } from "./parsers/registry.js";
 import type { ParserConfidence, ParserInput } from "./parsers/types.js";
@@ -444,14 +444,70 @@ const sessionStats = {
   sessionStart: Date.now(),
 };
 
+function emptySessionStats(): typeof sessionStats {
+  return {
+    calls: {},
+    bytesReturned: {},
+    latencyMs: {},
+    latencyMaxMs: {},
+    bytesIndexed: 0,
+    bytesSandboxed: 0,
+    cacheHits: 0,
+    cacheBytesSaved: 0,
+    sessionStart: Date.now(),
+  };
+}
+
+function currentRuntimeSidecarBytes(projectDir: string, sessionId: string | null | undefined): number {
+  try {
+    const sessionStart = Number.isFinite(sessionStats.sessionStart)
+      ? sessionStats.sessionStart
+      : undefined;
+    return listRunArtifacts(projectDir, Number.MAX_SAFE_INTEGER)
+      .filter((record) => {
+        if (sessionId) {
+          return record.metadata.sessionId === sessionId;
+        }
+        if (!sessionStart) return true;
+        const createdMs = Date.parse(record.metadata.createdAt);
+        return Number.isFinite(createdMs) && createdMs >= sessionStart;
+      })
+      .reduce((sum, record) => sum + record.metadata.rawBytes, 0);
+  } catch {
+    return 0;
+  }
+}
+
+function sessionStatsForReport(projectDir: string, sessionId: string | null | undefined): typeof sessionStats {
+  const sidecarBytes = currentRuntimeSidecarBytes(projectDir, sessionId);
+  if (sidecarBytes <= 0) return sessionStats;
+  return {
+    ...sessionStats,
+    bytesSandboxed: sessionStats.bytesSandboxed + sidecarBytes,
+  };
+}
+
+function addRuntimeSidecarAvoidedBytes(stats: RealBytesStats, sidecarBytes: number): RealBytesStats {
+  if (sidecarBytes <= 0) return stats;
+  const bytesAvoided = stats.bytesAvoided + sidecarBytes;
+  return {
+    ...stats,
+    bytesAvoided,
+    sandboxedMcpResponseBytes: stats.sandboxedMcpResponseBytes + sidecarBytes,
+    totalSavedTokens: Math.floor((bytesAvoided + stats.snapshotBytes) / 4),
+  };
+}
+
 type ToolResult = {
   content: Array<{ type: "text"; text: string }>;
   isError?: boolean;
 };
 
 // ── Version outdated warning ──────────────────────────────────────────────
-// Non-blocking npm check at startup. trackResponse prepends warning
-// using a burst cadence: 3 warnings → 1h silent → 3 warnings → repeat.
+// Upstream npm checks are opt-in for this fork. The published npm package is
+// no longer authoritative once local changes diverge from upstream; when an
+// operator explicitly enables unpinned upstream upgrades, trackResponse can
+// prepend a burst-cadenced warning: 3 warnings → 1h silent → 3 warnings.
 
 let _latestVersion: string | null = null;
 let _warningBurstCount = 0;
@@ -459,7 +515,12 @@ let _lastBurstStart = 0;
 const VERSION_BURST_SIZE = 3;
 const VERSION_SILENT_MS = 60 * 60 * 1000; // 1 hour
 
+function isUpstreamVersionCheckEnabled(): boolean {
+  return process.env.CONTEXT_MODE_ALLOW_UNPINNED_UPGRADE === "1";
+}
+
 async function fetchLatestVersion(): Promise<string> {
+  if (!isUpstreamVersionCheckEnabled()) return "unknown";
   return new Promise((res) => {
     const req = httpsRequest(
       "https://registry.npmjs.org/context-mode/latest",
@@ -505,6 +566,7 @@ function isOutdated(): boolean {
 }
 
 function shouldShowVersionWarning(): boolean {
+  if (!isUpstreamVersionCheckEnabled()) return false;
   if (!isOutdated()) return false;
   const now = Date.now();
   // Start of a new burst?
@@ -1731,6 +1793,7 @@ function appendRunSidecarNote(
     const artifact = writeRunArtifact({
       projectDir: getProjectDir(),
       command: opts.command,
+      sessionId: currentAttribution()?.sessionId,
       stdout: opts.stdout,
       stderr: opts.stderr,
       status: opts.status,
@@ -3350,17 +3413,66 @@ function formatStatsSessionList(sessionDbPath: string, limit: number): string {
   const Database = loadDatabase();
   const db = new Database(sessionDbPath, { readonly: true });
   try {
-    const rows = db.prepare(`
+    const hasToolCalls = Boolean(db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tool_calls'",
+    ).get());
+    const rows = db.prepare(hasToolCalls ? `
+      WITH event_rollup AS (
+        SELECT
+          session_id,
+          COUNT(*) AS events,
+          COALESCE(SUM(bytes_returned), 0) AS event_bytes_returned,
+          COALESCE(SUM(bytes_avoided), 0) AS bytes_avoided,
+          MIN(created_at) AS started_at,
+          MAX(created_at) AS last_event_at
+        FROM session_events
+        GROUP BY session_id
+      ),
+      tool_rollup AS (
+        SELECT
+          session_id,
+          COALESCE(SUM(bytes_returned), 0) AS tool_bytes_returned,
+          MAX(updated_at) AS last_tool_at
+        FROM tool_calls
+        GROUP BY session_id
+      )
       SELECT
-        session_id,
-        COUNT(*) AS events,
-        COALESCE(SUM(bytes_returned), 0) AS bytes_returned,
-        COALESCE(SUM(bytes_avoided), 0) AS bytes_avoided,
-        MIN(created_at) AS started_at,
-        MAX(created_at) AS last_event_at
-      FROM session_events
-      GROUP BY session_id
-      ORDER BY last_event_at DESC
+        m.session_id,
+        COALESCE(e.events, 0) AS events,
+        CASE
+          WHEN COALESCE(t.tool_bytes_returned, 0) > COALESCE(e.event_bytes_returned, 0) THEN COALESCE(t.tool_bytes_returned, 0)
+          ELSE COALESCE(e.event_bytes_returned, 0)
+        END AS bytes_returned,
+        COALESCE(e.bytes_avoided, 0) AS bytes_avoided,
+        COALESCE(e.started_at, m.started_at) AS started_at,
+        COALESCE(m.last_event_at, e.last_event_at, t.last_tool_at, m.started_at) AS last_event_at
+      FROM session_meta m
+      LEFT JOIN event_rollup e ON e.session_id = m.session_id
+      LEFT JOIN tool_rollup t ON t.session_id = m.session_id
+      ORDER BY COALESCE(m.last_event_at, e.last_event_at, t.last_tool_at, m.started_at) DESC, m.started_at DESC, m.session_id DESC
+      LIMIT ?
+    ` : `
+      WITH event_rollup AS (
+        SELECT
+          session_id,
+          COUNT(*) AS events,
+          COALESCE(SUM(bytes_returned), 0) AS bytes_returned,
+          COALESCE(SUM(bytes_avoided), 0) AS bytes_avoided,
+          MIN(created_at) AS started_at,
+          MAX(created_at) AS last_event_at
+        FROM session_events
+        GROUP BY session_id
+      )
+      SELECT
+        m.session_id,
+        COALESCE(e.events, 0) AS events,
+        COALESCE(e.bytes_returned, 0) AS bytes_returned,
+        COALESCE(e.bytes_avoided, 0) AS bytes_avoided,
+        COALESCE(e.started_at, m.started_at) AS started_at,
+        COALESCE(m.last_event_at, e.last_event_at, m.started_at) AS last_event_at
+      FROM session_meta m
+      LEFT JOIN event_rollup e ON e.session_id = m.session_id
+      ORDER BY COALESCE(m.last_event_at, e.last_event_at, m.started_at) DESC, m.started_at DESC, m.session_id DESC
       LIMIT ?
     `).all(maxRows) as Array<{
       session_id: string;
@@ -3374,7 +3486,7 @@ function formatStatsSessionList(sessionDbPath: string, limit: number): string {
       "ctx_stats sessions",
       "",
       rows.length === 0
-        ? "No session events found for this project."
+        ? "No sessions found for this project."
         : `Showing ${rows.length} most recent ${rows.length === 1 ? "session" : "sessions"} for this project.`,
     ];
     for (const row of rows) {
@@ -3390,22 +3502,110 @@ function formatStatsSessionList(sessionDbPath: string, limit: number): string {
   }
 }
 
-function resolveStatsSessionId(sdb: import("./session/analytics.js").DatabaseAdapter): { sessionId?: string; source: string } {
-  const envSessionId = process.env.CLAUDE_SESSION_ID;
-  if (envSessionId) return { sessionId: envSessionId, source: "CLAUDE_SESSION_ID" };
+function statsSessionExists(sdb: import("./session/analytics.js").DatabaseAdapter, sessionId: string): boolean {
+  try {
+    const row = sdb.prepare("SELECT 1 FROM session_meta WHERE session_id = ? LIMIT 1").get(sessionId) as unknown;
+    if (row) return true;
+  } catch { /* tolerate old/incomplete DBs */ }
+  try {
+    const row = sdb.prepare("SELECT 1 FROM session_events WHERE session_id = ? LIMIT 1").get(sessionId) as unknown;
+    if (row) return true;
+  } catch { /* tolerate old/incomplete DBs */ }
+  try {
+    const row = sdb.prepare("SELECT 1 FROM tool_calls WHERE session_id = ? LIMIT 1").get(sessionId) as unknown;
+    if (row) return true;
+  } catch { /* tolerate DBs without tool_calls */ }
+  return false;
+}
+
+function firstNonBlankEnv(names: readonly string[]): string | undefined {
+  for (const name of names) {
+    const value = process.env[name]?.trim();
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function resolveLatestStatsSessionId(sdb: import("./session/analytics.js").DatabaseAdapter): string | undefined {
+  try {
+    const row = sdb.prepare(`
+      WITH event_rollup AS (
+        SELECT session_id, MAX(created_at) AS last_event_at
+        FROM session_events
+        GROUP BY session_id
+      ),
+      tool_rollup AS (
+        SELECT session_id, MAX(updated_at) AS last_tool_at
+        FROM tool_calls
+        GROUP BY session_id
+      )
+      SELECT m.session_id
+      FROM session_meta m
+      LEFT JOIN event_rollup e ON e.session_id = m.session_id
+      LEFT JOIN tool_rollup t ON t.session_id = m.session_id
+      ORDER BY COALESCE(m.last_event_at, e.last_event_at, t.last_tool_at, m.started_at) DESC, m.started_at DESC, m.session_id DESC
+      LIMIT 1
+    `).get() as { session_id: string } | undefined;
+    if (row?.session_id) return row.session_id;
+  } catch { /* fall through for DBs without tool_calls or session_meta */ }
   try {
     const row = sdb.prepare(
-      "SELECT session_id FROM session_meta WHERE session_id LIKE '________-____-____-____-____________' ORDER BY started_at DESC, rowid DESC LIMIT 1",
+      "SELECT session_id FROM session_meta ORDER BY COALESCE(last_event_at, started_at) DESC, started_at DESC, session_id DESC LIMIT 1",
     ).get() as { session_id: string } | undefined;
-    if (row?.session_id) return { sessionId: row.session_id, source: "latest project session_meta row" };
+    if (row?.session_id) return row.session_id;
   } catch { /* ctx_stats must never fail on session-id detection */ }
   try {
     const row = sdb.prepare(
-      "SELECT session_id FROM session_meta ORDER BY started_at DESC, rowid DESC LIMIT 1",
+      "SELECT session_id FROM session_events GROUP BY session_id ORDER BY MAX(created_at) DESC, session_id DESC LIMIT 1",
     ).get() as { session_id: string } | undefined;
-    if (row?.session_id) return { sessionId: row.session_id, source: "latest project session_meta row (non-uuid)" };
+    if (row?.session_id) return row.session_id;
   } catch { /* ctx_stats must never fail on session-id detection */ }
-  return { source: "unresolved" };
+  return undefined;
+}
+
+function resolveStatsSessionId(
+  sdb: import("./session/analytics.js").DatabaseAdapter,
+  requestedSession?: string,
+): { sessionId?: string; source: string; notFound?: boolean } {
+  const explicitSessionId = requestedSession?.trim();
+  if (explicitSessionId && explicitSessionId !== "latest") {
+    if (!statsSessionExists(sdb, explicitSessionId)) {
+      return { sessionId: explicitSessionId, source: "explicit ctx_stats session input (not found)", notFound: true };
+    }
+    return { sessionId: explicitSessionId, source: "explicit ctx_stats session input" };
+  }
+  if (explicitSessionId === "latest") {
+    const latest = resolveLatestStatsSessionId(sdb);
+    if (latest) return { sessionId: latest, source: "latest observed project session_meta row (requested)" };
+    return { source: "unresolved" };
+  }
+  const envSessionId = firstNonBlankEnv([
+    "CONTEXT_MODE_SESSION_ID",
+    "CLAUDE_SESSION_ID",
+    "CODEX_SESSION_ID",
+    "CURSOR_SESSION_ID",
+    "CURSOR_TRACE_ID",
+    "QWEN_SESSION_ID",
+    "ZED_SESSION_ID",
+  ]);
+  if (envSessionId) return { sessionId: envSessionId, source: "session environment variable" };
+  return { source: "runtime counters only; no live session id exposed" };
+}
+
+function statsScopeLine(scope: "session" | "lifetime" | "all", sessionIdSource?: string): string {
+  if (scope === "lifetime") return "lifetime only; current-session section omitted";
+  const sessionLabel = !sessionIdSource || sessionIdSource === "unresolved"
+    ? "resolved session"
+    : sessionIdSource.includes("explicit ctx_stats session input")
+      ? "explicit session"
+      : sessionIdSource.includes("latest observed project session_meta row")
+        ? "latest observed project session"
+      : sessionIdSource.includes("session environment variable")
+        ? "current session"
+        : sessionIdSource.includes("runtime counters only")
+          ? "runtime counters"
+          : "resolved session";
+  return scope === "session" ? `${sessionLabel} only` : `${sessionLabel} + lifetime`;
 }
 
 function prependStatsScopeHeader(text: string, opts: {
@@ -3416,11 +3616,7 @@ function prependStatsScopeHeader(text: string, opts: {
   sessionIdSource?: string;
   hasSessionDb: boolean;
 }): string {
-  const scopeLine = opts.scope === "session"
-    ? "current session only"
-    : opts.scope === "lifetime"
-      ? "lifetime only; current-session section omitted"
-      : "current session + lifetime";
+  const scopeLine = statsScopeLine(opts.scope, opts.sessionIdSource);
   const lines = [
     `ctx_stats scope: ${opts.scope} (${scopeLine})`,
     `session id: ${opts.sessionId ?? "unresolved"}${opts.sessionIdSource ? ` (${opts.sessionIdSource})` : ""}`,
@@ -3444,7 +3640,10 @@ server.registerTool(
       scope: z
         .enum(["session", "lifetime", "all"])
         .default("all")
-        .describe("Report scope: 'session' = current session only (skips lifetime/multi-adapter aggregation); 'lifetime' = cross-session + multi-adapter totals only; 'all' = full report including session, lifetime, and multi-adapter."),
+        .describe("Report scope: 'session' = resolved session/runtime counters only (skips lifetime/multi-adapter aggregation); 'lifetime' = cross-session + multi-adapter totals only; 'all' = full report including session, lifetime, and multi-adapter. Pass session:'latest' explicitly to inspect the latest observed project session."),
+      session: z.string().optional().describe(
+        "Session id to report, or 'latest'. Use listSessions:true to find a parent session when subagents created newer sessions.",
+      ),
       listSessions: z.boolean().optional().describe(
         "Return a compact list of recent sessions for this project instead of the full stats report.",
       ),
@@ -3454,7 +3653,7 @@ server.registerTool(
     }),
   },
   async (input) => {
-    const statsInput = input as { scope?: "session" | "lifetime" | "all"; listSessions?: boolean; limit?: number };
+    const statsInput = input as { scope?: "session" | "lifetime" | "all"; session?: string; listSessions?: boolean; limit?: number };
     const scope: "session" | "lifetime" | "all" = statsInput?.scope ?? "all";
     const includeSession = scope === "session" || scope === "all";
     const includeLifetime = scope === "lifetime" || scope === "all";
@@ -3482,10 +3681,34 @@ server.registerTool(
       if (existsSync(sessionDbPath)) {
         const Database = loadDatabase();
         const sdb = new Database(sessionDbPath, { readonly: true });
-        const statsSession = resolveStatsSessionId(sdb);
+        const statsSession = resolveStatsSessionId(sdb, statsInput.session);
         try {
+          if (statsSession.notFound) {
+            text = prependStatsScopeHeader(
+              [
+                "ctx_stats session not found",
+                "",
+                `No session rows found for: ${statsSession.sessionId}`,
+                "Run ctx_stats with listSessions:true to choose an existing session id.",
+              ].join("\n"),
+              {
+                scope,
+                projectDir,
+                sessionDbPath,
+                sessionId: statsSession.sessionId,
+                sessionIdSource: statsSession.source,
+                hasSessionDb: true,
+              },
+            );
+            return trackResponse("ctx_stats", {
+              content: [{ type: "text" as const, text }],
+            });
+          }
           const engine = new AnalyticsEngine(sdb);
-          const report = engine.queryAll(sessionStats);
+          const reportStats = includeSession
+            ? sessionStatsForReport(projectDir, statsSession.sessionId ?? null)
+            : emptySessionStats();
+          const report = engine.queryAll(reportStats, { sessionId: statsSession.sessionId ?? null });
           // MCP usage is read-only and cheap; only available when DB exists.
           const mcpUsage = engine.getMcpToolUsage();
           // Lifetime stats span every project's SessionDB + auto-memory dir
@@ -3515,7 +3738,6 @@ server.registerTool(
           try {
             const sid = statsSession.sessionId;
             if (sid) {
-              conversation = getConversationStats({ sessionId: sid, sessionsDir: getSessionDir(), worktreeHash: dbHash });
               // v1.0.133 Slice 3: pass contentDbPath so getRealBytesStats can
               // join chunks WHERE session_id = sid and fold the indexed
               // content bytes into the per-conversation bar. Without this,
@@ -3523,25 +3745,42 @@ server.registerTool(
               // 49 MB of indexed content sitting in the content DB.
               // Render-time read-only — no DB mutation, no backfill.
               const contentDbPath = getStorePath();
-              const convReal = getRealBytesStats({ sessionId: sid, sessionsDir: getSessionDir(), worktreeHash: dbHash, contentDbPath });
-              const lifeRealBase = getRealBytesStats({ sessionsDir: getSessionDir() });
-              // v1.0.134 SLICE C: lifetime tier sums ALL chunks (no
-              // session_id filter). Without this fold, lifetime "kept out"
-              // only counts session_events.bytes_avoided and ignores the
-              // bulk of indexed payload across every prior conversation.
-              const lifeContentBytes = getContentBytesAllSessions(contentDbPath);
-              const lifeReal = {
-                ...lifeRealBase,
-                contentBytes: lifeRealBase.contentBytes + lifeContentBytes,
-                bytesAvoided: lifeRealBase.bytesAvoided + lifeContentBytes,
-                totalSavedTokens: Math.floor(
-                  (lifeRealBase.eventDataBytes
-                    + lifeRealBase.bytesAvoided
-                    + lifeContentBytes
-                    + lifeRealBase.snapshotBytes) / 4,
-                ),
+              const sidecarBytes = includeSession
+                ? currentRuntimeSidecarBytes(projectDir, sid)
+                : 0;
+              const convRealBase = includeSession
+                ? getRealBytesStats({ sessionId: sid, sessionsDir: getSessionDir(), worktreeHash: dbHash, contentDbPath })
+                : undefined;
+              const convReal = convRealBase
+                ? addRuntimeSidecarAvoidedBytes(convRealBase, sidecarBytes)
+                : undefined;
+              if (includeSession) {
+                conversation = getConversationStats({ sessionId: sid, sessionsDir: getSessionDir(), worktreeHash: dbHash });
+              }
+              let lifeReal;
+              if (includeLifetime) {
+                const lifeRealBase = getRealBytesStats({ sessionsDir: getSessionDir() });
+                // v1.0.134 SLICE C: lifetime tier sums ALL chunks (no
+                // session_id filter). Without this fold, lifetime "kept out"
+                // only counts session_events.bytes_avoided and ignores the
+                // bulk of indexed payload across every prior conversation.
+                const lifeContentBytes = getContentBytesAllSessions(contentDbPath);
+                lifeReal = {
+                  ...lifeRealBase,
+                  contentBytes: lifeRealBase.contentBytes + lifeContentBytes,
+                  bytesAvoided: lifeRealBase.bytesAvoided + lifeContentBytes,
+                  totalSavedTokens: Math.floor(
+                    (lifeRealBase.eventDataBytes
+                      + lifeRealBase.bytesAvoided
+                      + lifeContentBytes
+                      + lifeRealBase.snapshotBytes) / 4,
+                  ),
+                };
+              }
+              realBytes = {
+                ...(convReal ? { conversation: convReal } : {}),
+                ...(lifeReal ? { lifetime: lifeReal } : {}),
               };
-              realBytes = { conversation: convReal, lifetime: lifeReal };
             }
           } catch { /* never block ctx_stats */ }
           // v1.0.117: pass projectDir as cwd so the narrative renderer's
@@ -3565,10 +3804,12 @@ server.registerTool(
         // No session DB — build a minimal report from runtime stats only.
         // Lifetime still meaningful (other projects, auto-memory) so include it.
         const engine = new AnalyticsEngine(createMinimalDb());
-        const report = engine.queryAll(sessionStats);
-        const lifetime = getLifetimeStats({ sessionsDir: getSessionDir() });
+        const report = engine.queryAll(includeSession ? sessionStatsForReport(projectDir, null) : emptySessionStats(), { sessionId: null });
+        const lifetime = includeLifetime ? getLifetimeStats({ sessionsDir: getSessionDir() }) : undefined;
         let multiAdapter;
-        try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
+        if (includeLifetime) {
+          try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
+        }
         text = formatReport(report, VERSION, _latestVersion, { lifetime, multiAdapter });
         text = prependStatsScopeHeader(text, {
           scope,
@@ -3581,11 +3822,18 @@ server.registerTool(
     } catch {
       // Session DB not available or incompatible — build minimal report from runtime stats
       const engine = new AnalyticsEngine(createMinimalDb());
-      const report = engine.queryAll(sessionStats);
+      const fallbackProjectDir = (() => {
+        try { return getProjectDir(); } catch { return process.cwd(); }
+      })();
+      const report = engine.queryAll(includeSession ? sessionStatsForReport(fallbackProjectDir, null) : emptySessionStats(), { sessionId: null });
       let lifetime;
-      try { lifetime = getLifetimeStats({ sessionsDir: getSessionDir() }); } catch { /* never block ctx_stats */ }
+      if (includeLifetime) {
+        try { lifetime = getLifetimeStats({ sessionsDir: getSessionDir() }); } catch { /* never block ctx_stats */ }
+      }
       let multiAdapter;
-      try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
+      if (includeLifetime) {
+        try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
+      }
       text = formatReport(report, VERSION, _latestVersion, (lifetime || multiAdapter) ? { lifetime, multiAdapter } : undefined);
       text = prependStatsScopeHeader(text, {
         scope,
@@ -3606,6 +3854,7 @@ const _toolCtx: ToolContext = {
   pluginRoot: existsSync(resolve(__pkg_dir, "package.json")) ? __pkg_dir : dirname(__pkg_dir),
   getSessionDir,
   getAdapterId: () => _detectedPlatform,
+  getCurrentSessionId: () => currentAttribution()?.sessionId,
   trackResponse: trackResponse as ToolContext["trackResponse"],
 };
 registerTool(_toolCtx, makeCtxDoctor({ VERSION, getDiagnosticAdapter }));
@@ -3635,8 +3884,16 @@ registerTool(_toolCtx, makeCtxRead({
   getProjectDir,
   checkFilePath: (path) => checkFilePathDenyPolicy(path, "ctx_read"),
 }));
-registerTool(_toolCtx, makeCtxGain({ getProjectDir, getSessionStats: () => sessionStats }));
-registerTool(_toolCtx, makeCtxDiscover({ getProjectDir, getSessionStats: () => sessionStats }));
+registerTool(_toolCtx, makeCtxGain({
+  getProjectDir,
+  getSessionStats: () => sessionStats,
+  getCurrentSessionId: () => currentAttribution()?.sessionId,
+}));
+registerTool(_toolCtx, makeCtxDiscover({
+  getProjectDir,
+  getSessionStats: () => sessionStats,
+  getCurrentSessionId: () => currentAttribution()?.sessionId,
+}));
 registerTool(_toolCtx, makeCtxGuard({ getProjectDir }));
 registerTool(_toolCtx, makeCtxEval());
 registerTool(_toolCtx, makeCtxTrace({ getProjectDir }));
@@ -4402,14 +4659,14 @@ async function main() {
   } catch { /* best effort — never block startup on a stats restore failure */ }
 
   // Non-blocking version check — result stored for trackResponse warnings.
-  // First fetch at startup, then refresh every hour so long-running sessions
-  // (some users keep the MCP server alive 24h+) catch new releases without a
-  // restart. `.unref()` lets the process exit normally on SIGTERM regardless
-  // of pending intervals.
-  fetchLatestVersion().then(v => { if (v !== "unknown") _latestVersion = v; });
-  setInterval(() => {
+  // Only enabled with upstream upgrades, because this fork should not compare
+  // itself against the original npm package during normal local development.
+  if (isUpstreamVersionCheckEnabled()) {
     fetchLatestVersion().then(v => { if (v !== "unknown") _latestVersion = v; });
-  }, 60 * 60 * 1000).unref();
+    setInterval(() => {
+      fetchLatestVersion().then(v => { if (v !== "unknown") _latestVersion = v; });
+    }, 60 * 60 * 1000).unref();
+  }
 
   // Stats heartbeat — keep the statusline truthful while the user works in
   // tools other than MCP (Bash/Read/Edit during long sessions or post-/compact
