@@ -21,6 +21,13 @@ export function createRoutingBlock(t, options = {}) {
     Raw tool output floods context window. MUST use context-mode MCP tools. Keep raw data in sandbox.
   </priority_instructions>
 
+  <tool_discovery>
+    In Codex/OpenClaw, context-mode MCP tools may be deferred until searched.
+    If ${t("ctx_read")} / ${t("ctx_execute")} / ${t("ctx_search")} are not visible, first use tool_search with query "context-mode ctx_read ctx_execute ctx_search".
+    If coding task requires Serena and Serena tools are not visible, first use tool_search with query "serena initial_instructions find_symbol".
+    Do not use OpenClaw ctx_* bridge stubs as the real context-mode tools; load and call the standalone context-mode MCP tools instead.
+  </tool_discovery>
+
   <tool_selection_hierarchy>
     0. MEMORY: ${t("ctx_search")}(sort: "timeline")
        - After resume, check prior context before asking user.

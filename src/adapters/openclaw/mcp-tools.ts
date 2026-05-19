@@ -91,8 +91,8 @@ function cliRedirect(toolName: string) {
       {
         type: "text" as const,
         text: fallback
-          ? `[context-mode] ${toolName} is registered in OpenClaw as a bridge stub. CLI fallback: '${fallback}'. Full execution requires the standalone MCP transport when no CLI equivalent exists.`
-          : `[context-mode] ${toolName} is registered in OpenClaw as a bridge stub. Invoke the standalone MCP transport directly; this tool has no complete CLI equivalent.`,
+          ? `[context-mode] ${toolName} is an OpenClaw bridge stub, not the real Context Mode MCP tool. Prefer the standalone MCP tool mcp__context_mode__.${toolName}; if it is not visible, use tool_search with query "context-mode ${toolName}". CLI fallback: '${fallback}'.`
+          : `[context-mode] ${toolName} is an OpenClaw bridge stub, not the real Context Mode MCP tool. Prefer the standalone MCP tool mcp__context_mode__.${toolName}; if it is not visible, use tool_search with query "context-mode ${toolName}".`,
       },
     ],
   }));

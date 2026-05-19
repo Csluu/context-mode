@@ -18,18 +18,43 @@ import { resolve } from "node:path";
 
 const PLACEHOLDER = "${CLAUDE_PLUGIN_ROOT}";
 
+// Matches a cache path segment `context-mode/context-mode/<version>`.
+const CACHE_VERSION_RE =
+  /context-mode\/context-mode\/([0-9]+\.[0-9]+\.[0-9]+)(?=\/)/g;
+
 /** Convert any path string to forward slashes (MSYS-safe). */
 function fwd(p) {
   return String(p).replace(/\\/g, "/");
 }
 
+function pluginRootVersion(pluginRoot) {
+  if (!pluginRoot) return null;
+  const m =
+    /context-mode\/context-mode\/([0-9]+\.[0-9]+\.[0-9]+)(?:\/|$)/.exec(
+      fwd(pluginRoot),
+    );
+  return m ? m[1] : null;
+}
+
+function hasStaleCacheVersionSegment(content, currentVersion) {
+  if (!currentVersion || !content || typeof content !== "string") return false;
+  const safe = fwd(content);
+  CACHE_VERSION_RE.lastIndex = 0;
+  let m;
+  while ((m = CACHE_VERSION_RE.exec(safe)) !== null) {
+    if (m[1] !== currentVersion) return true;
+  }
+  return false;
+}
+
 /**
- * Pure detection: does this content contain an unresolved CLAUDE_PLUGIN_ROOT
- * placeholder that should be normalized?
+ * Pure detection: does this content need placeholder normalization or stale
+ * cache-version re-pointing?
  */
-export function needsHookNormalization(content) {
+export function needsHookNormalization(content, pluginRoot) {
   if (!content || typeof content !== "string") return false;
-  return content.includes(PLACEHOLDER);
+  if (content.includes(PLACEHOLDER)) return true;
+  return hasStaleCacheVersionSegment(content, pluginRootVersion(pluginRoot));
 }
 
 /**
@@ -41,10 +66,11 @@ export function needsHookNormalization(content) {
  * Idempotent — leaves already-normalized content unchanged.
  */
 export function normalizeHooksJson(content, nodePath, pluginRoot) {
-  if (!needsHookNormalization(content)) return content;
+  if (!needsHookNormalization(content, pluginRoot)) return content;
 
   const safeNode = fwd(nodePath);
   const safeRoot = fwd(pluginRoot);
+  const currentVersion = pluginRootVersion(pluginRoot);
 
   let parsed;
   try {
@@ -65,12 +91,24 @@ export function normalizeHooksJson(content, nodePath, pluginRoot) {
       if (!Array.isArray(inner)) continue;
       for (const h of inner) {
         if (typeof h?.command !== "string") continue;
-        if (!h.command.includes(PLACEHOLDER)) continue;
-        // Replace placeholder with absolute root (forward-slash).
-        let next = h.command.replaceAll(PLACEHOLDER, safeRoot);
-        // Replace bare `node ` prefix with quoted execPath. Match both
-        // `node ` and `node\t` at start, with optional surrounding whitespace.
-        next = next.replace(/^\s*node\s+/, `"${safeNode}" `);
+        const hasPlaceholder = h.command.includes(PLACEHOLDER);
+        const hasStale = hasStaleCacheVersionSegment(h.command, currentVersion);
+        if (!hasPlaceholder && !hasStale) continue;
+
+        let next = h.command;
+        if (hasPlaceholder) {
+          // Replace placeholder with absolute root (forward-slash).
+          next = next.replaceAll(PLACEHOLDER, safeRoot);
+          // Replace bare `node ` prefix with quoted execPath. Match both
+          // `node ` and `node\t` at start, with optional surrounding whitespace.
+          next = next.replace(/^\s*node\s+/, `"${safeNode}" `);
+        }
+        if (hasStale) {
+          next = fwd(next).replace(
+            CACHE_VERSION_RE,
+            `context-mode/context-mode/${currentVersion}`,
+          );
+        }
         h.command = next;
         mutated = true;
       }
@@ -92,10 +130,11 @@ export function normalizeHooksJson(content, nodePath, pluginRoot) {
  * Idempotent.
  */
 export function normalizePluginJson(content, nodePath, pluginRoot) {
-  if (!needsHookNormalization(content)) return content;
+  if (!needsHookNormalization(content, pluginRoot)) return content;
 
   const safeNode = fwd(nodePath);
   const safeRoot = fwd(pluginRoot);
+  const currentVersion = pluginRootVersion(pluginRoot);
 
   let parsed;
   try {
@@ -114,11 +153,20 @@ export function normalizePluginJson(content, nodePath, pluginRoot) {
 
     if (Array.isArray(srv.args)) {
       const before = srv.args;
-      const after = before.map((a) =>
-        typeof a === "string" && a.includes(PLACEHOLDER)
-          ? a.replaceAll(PLACEHOLDER, safeRoot)
-          : a,
-      );
+      const after = before.map((a) => {
+        if (typeof a !== "string") return a;
+        let next = a;
+        if (next.includes(PLACEHOLDER)) {
+          next = next.replaceAll(PLACEHOLDER, safeRoot);
+        }
+        if (hasStaleCacheVersionSegment(next, currentVersion)) {
+          next = fwd(next).replace(
+            CACHE_VERSION_RE,
+            `context-mode/context-mode/${currentVersion}`,
+          );
+        }
+        return next;
+      });
       if (after.some((v, i) => v !== before[i])) {
         srv.args = after;
         mutated = true;
@@ -158,7 +206,7 @@ export function normalizeHooksOnStartup({ pluginRoot, nodePath, platform }) {
     const hooksPath = resolve(pluginRoot, "hooks", "hooks.json");
     if (existsSync(hooksPath)) {
       const original = readFileSync(hooksPath, "utf-8");
-      if (needsHookNormalization(original)) {
+      if (needsHookNormalization(original, pluginRoot)) {
         const next = normalizeHooksJson(original, nodePath, pluginRoot);
         if (next !== original) {
           writeFileSync(hooksPath, next, "utf-8");
@@ -174,7 +222,7 @@ export function normalizeHooksOnStartup({ pluginRoot, nodePath, platform }) {
     const pluginPath = resolve(pluginRoot, ".claude-plugin", "plugin.json");
     if (existsSync(pluginPath)) {
       const original = readFileSync(pluginPath, "utf-8");
-      if (needsHookNormalization(original)) {
+      if (needsHookNormalization(original, pluginRoot)) {
         const next = normalizePluginJson(original, nodePath, pluginRoot);
         if (next !== original) {
           writeFileSync(pluginPath, next, "utf-8");

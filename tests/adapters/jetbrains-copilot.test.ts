@@ -4,6 +4,11 @@ import { homedir } from "node:os";
 import { resolve, join } from "node:path";
 import { createHash } from "node:crypto";
 import { JetBrainsCopilotAdapter } from "../../src/adapters/jetbrains-copilot/index.js";
+import {
+  buildHookCommand,
+  HOOK_TYPES,
+  isContextModeHook,
+} from "../../src/adapters/jetbrains-copilot/hooks.js";
 
 describe("JetBrainsCopilotAdapter", () => {
   let adapter: JetBrainsCopilotAdapter;
@@ -208,6 +213,31 @@ describe("JetBrainsCopilotAdapter", () => {
       const result = adapter.checkPluginRegistration();
       expect(result.status).toBe("warn");
       expect(result.check).toContain("registration");
+    });
+  });
+
+  describe("hook command portability", () => {
+    it("emits CLI dispatcher commands and recognizes legacy script commands", () => {
+      const command = buildHookCommand(HOOK_TYPES.SESSION_START, "C:/local/plugin");
+
+      expect(command).toBe("context-mode hook jetbrains-copilot sessionstart");
+      expect(command).not.toContain("C:/local/plugin");
+      expect(
+        isContextModeHook({ hooks: [{ command }] }, HOOK_TYPES.SESSION_START),
+      ).toBe(true);
+      expect(
+        isContextModeHook(
+          {
+            hooks: [
+              {
+                command:
+                  '"C:/Program Files/nodejs/node.exe" "C:/local/plugin/hooks/sessionstart.mjs"',
+              },
+            ],
+          },
+          HOOK_TYPES.SESSION_START,
+        ),
+      ).toBe(true);
     });
   });
 

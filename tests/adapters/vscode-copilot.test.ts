@@ -3,7 +3,12 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { VSCodeCopilotAdapter } from "../../src/adapters/vscode-copilot/index.js";
-import { HOOK_TYPES, HOOK_SCRIPTS } from "../../src/adapters/vscode-copilot/hooks.js";
+import {
+  buildHookCommand,
+  HOOK_TYPES,
+  HOOK_SCRIPTS,
+  isContextModeHook,
+} from "../../src/adapters/vscode-copilot/hooks.js";
 
 describe("VSCodeCopilotAdapter", () => {
   let adapter: VSCodeCopilotAdapter;
@@ -195,6 +200,31 @@ describe("VSCodeCopilotAdapter", () => {
       expect(types).not.toContain("Stop");
       expect(types).not.toContain("SubagentStart");
       expect(types).not.toContain("SubagentStop");
+    });
+  });
+
+  describe("hook command portability", () => {
+    it("emits CLI dispatcher commands and recognizes legacy script commands", () => {
+      const command = buildHookCommand(HOOK_TYPES.SESSION_START, "C:/local/plugin");
+
+      expect(command).toBe("context-mode hook vscode-copilot sessionstart");
+      expect(command).not.toContain("C:/local/plugin");
+      expect(
+        isContextModeHook({ hooks: [{ command }] }, HOOK_TYPES.SESSION_START),
+      ).toBe(true);
+      expect(
+        isContextModeHook(
+          {
+            hooks: [
+              {
+                command:
+                  '"C:/Program Files/nodejs/node.exe" "C:/local/plugin/hooks/sessionstart.mjs"',
+              },
+            ],
+          },
+          HOOK_TYPES.SESSION_START,
+        ),
+      ).toBe(true);
     });
   });
 

@@ -17,6 +17,7 @@ import { homedir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { SessionDB } from "../../session/db.js";
+import type { ProjectAttribution } from "../../session/project-attribution.js";
 import { extractEvents, extractUserEvents } from "../../session/extract.js";
 import type { HookInput } from "../../session/extract.js";
 import { buildResumeSnapshot } from "../../session/snapshot.js";
@@ -331,6 +332,11 @@ export default function piExtension(pi: any): void {
     pwd: process.env.PWD,
     cwd: process.cwd(),
   });
+  const _attribution: Partial<ProjectAttribution> = {
+    projectDir,
+    source: "workspace_root",
+    confidence: 0.98,
+  };
 
   const db = getOrCreateDB();
 
@@ -407,7 +413,7 @@ export default function piExtension(pi: any): void {
 
       if (events.length > 0) {
         for (const ev of events) {
-          db.insertEvent(_sessionId, ev as SessionEvent, "PostToolUse");
+          db.insertEvent(_sessionId, ev as SessionEvent, "PostToolUse", _attribution);
         }
       } else if (rawToolName) {
         // Fallback: record unrecognized tool call as generic event
@@ -428,6 +434,7 @@ export default function piExtension(pi: any): void {
               .slice(0, 16),
           },
           "PostToolUse",
+          _attribution,
         );
       }
     } catch {
@@ -460,7 +467,7 @@ export default function piExtension(pi: any): void {
       if (prompt) {
         const userEvents = extractUserEvents(prompt);
         for (const ev of userEvents) {
-          db.insertEvent(_sessionId, ev as SessionEvent, "UserPromptSubmit");
+          db.insertEvent(_sessionId, ev as SessionEvent, "UserPromptSubmit", _attribution);
         }
       }
 
@@ -484,6 +491,7 @@ export default function piExtension(pi: any): void {
         minPriority: 3,
         limit: 50,
       });
+      let behavioralDirective = "";
       if (activeEvents.length > 0) {
         const buildAuto = await getAutoInjection(pluginRoot);
         let memoryContext = "";
@@ -494,6 +502,14 @@ export default function piExtension(pi: any): void {
               data: String(e.data ?? ""),
             })),
           );
+          const bdMatch = memoryContext.match(/(<behavioral_directive>\n[^<]*\n<\/behavioral_directive>)/);
+          if (bdMatch) {
+            behavioralDirective = bdMatch[1];
+            memoryContext = memoryContext.replace(bdMatch[1], "");
+            if (memoryContext.match(/^<session_state[^>]*>\s*<\/session_state>\s*$/)) {
+              memoryContext = "";
+            }
+          }
         }
         // Fallback (or if helper produced empty output): inline 500-token cap.
         if (!memoryContext) {
@@ -517,6 +533,8 @@ export default function piExtension(pi: any): void {
         parts.push(resume.snapshot);
         db.markResumeConsumed(_sessionId);
       }
+
+      if (behavioralDirective) parts.push(behavioralDirective);
 
       // Return modified systemPrompt only if we added something beyond existing.
       const baseLen = existingPrompt ? 1 : 0;
@@ -562,6 +580,7 @@ export default function piExtension(pi: any): void {
           data_hash: createHash("sha256").update(data).digest("hex").slice(0, 16),
         },
         "PostToolUse",
+        _attribution,
       );
     } catch {
       // best effort — never break provider response

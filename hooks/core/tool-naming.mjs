@@ -12,7 +12,8 @@
  * | VS Code Copilot    | context-mode_<tool>                                        |
  * | Kiro               | @context-mode/<tool>                                       |
  * | Zed                | mcp:context-mode:<tool>                                    |
- * | Cursor / Codex / OpenClaw / Pi | bare <tool>                                    |
+ * | Cursor / Pi       | bare <tool>                                                |
+ * | Codex / OpenClaw  | mcp__context_mode__.<tool> when exposed through Codex tools |
  */
 
 const TOOL_PREFIXES = {
@@ -26,8 +27,8 @@ const TOOL_PREFIXES = {
   "kiro":           (tool) => `@context-mode/${tool}`,
   "zed":            (tool) => `mcp:context-mode:${tool}`,
   "cursor":         (tool) => tool,
-  "codex":          (tool) => tool,
-  "openclaw":       (tool) => tool,
+  "codex":          (tool) => `mcp__context_mode__.${tool}`,
+  "openclaw":       (tool) => `mcp__context_mode__.${tool}`,
   "pi":             (tool) => tool,
   "qwen-code":      (tool) => `mcp__context-mode__${tool}`,
 };

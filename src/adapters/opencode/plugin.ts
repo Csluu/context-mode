@@ -83,6 +83,25 @@ type PluginContext = {
   directory: string;
 };
 
+type NativeToolContext = {
+  sessionID: string;
+  messageID: string;
+  agent: string;
+  directory: string;
+  worktree?: string;
+  abort?: AbortSignal;
+  metadata?: (input: { title?: string; metadata?: Record<string, unknown> }) => void;
+};
+
+type NativeToolDefinition = {
+  description: string;
+  args: Record<string, unknown>;
+  execute: (
+    args: Record<string, unknown>,
+    ctx: NativeToolContext,
+  ) => Promise<string | { title?: string; output: string; metadata?: Record<string, unknown> }>;
+};
+
 /** OpenCode tool.execute.before — first parameter */
 interface BeforeHookInput {
   tool: string;
@@ -237,6 +256,29 @@ function getPlatform(): AdapterPlatformType {
   return "opencode";
 }
 
+type EmbeddedServerModule = typeof import("../../server.js");
+let embeddedServerModulePromise: Promise<EmbeddedServerModule> | undefined;
+
+function importEmbeddedServerModule(): Promise<EmbeddedServerModule> {
+  if (embeddedServerModulePromise) return embeddedServerModulePromise;
+
+  embeddedServerModulePromise = (async () => {
+    const prevEmbedded = process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS;
+    process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS = "1";
+    try {
+      return await import("../../server.js");
+    } finally {
+      if (prevEmbedded === undefined) delete process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS;
+      else process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS = prevEmbedded;
+    }
+  })().catch((err) => {
+    embeddedServerModulePromise = undefined;
+    throw err;
+  });
+
+  return embeddedServerModulePromise;
+}
+
 // ── Plugin Factory ────────────────────────────────────────
 
 /**
@@ -370,7 +412,71 @@ async function createContextModePlugin(ctx: PluginContext) {
     }
   }
 
+  async function buildNativeTools(): Promise<Record<string, NativeToolDefinition>> {
+    const mod = await importEmbeddedServerModule();
+
+    const tools: Record<string, NativeToolDefinition> = {};
+    for (const registered of mod.REGISTERED_CTX_TOOLS) {
+      const config = registered.config as Record<string, unknown>;
+      const inputSchema = config.inputSchema as
+        | { shape?: unknown; _def?: { shape?: unknown }; parse?: (input: unknown) => unknown }
+        | undefined;
+      const shape =
+        typeof inputSchema?.shape === "object" && inputSchema.shape !== null
+          ? inputSchema.shape
+          : typeof inputSchema?._def?.shape === "function"
+            ? (inputSchema._def.shape as () => unknown)()
+            : {};
+
+      tools[registered.name] = {
+        description: String(config.description ?? ""),
+        args: shape as Record<string, unknown>,
+        async execute(args: Record<string, unknown>, toolCtx: NativeToolContext) {
+          toolCtx.metadata?.({ title: String(config.title ?? registered.name) });
+          const project = toolCtx.directory || projectDir;
+
+          let parsedArgs: Record<string, unknown> = args ?? {};
+          if (typeof inputSchema?.parse === "function") {
+            try {
+              parsedArgs = inputSchema.parse(args ?? {}) as Record<string, unknown>;
+            } catch (err) {
+              const message = err instanceof Error ? err.message : String(err);
+              throw new Error(`Invalid arguments for ${registered.name}: ${message}`);
+            }
+          }
+
+          const result = await mod.withProjectDirOverride(
+            { projectDir: project, sessionId: toolCtx.sessionID },
+            async () => registered.handler(parsedArgs),
+          );
+
+          const r = result as {
+            content?: Array<{ type?: string; text?: string }>;
+            isError?: boolean;
+          };
+          const text = Array.isArray(r?.content)
+            ? r.content
+                .filter((c) => c?.type === "text" && typeof c.text === "string")
+                .map((c) => c.text)
+                .join("\n")
+            : typeof result === "string"
+              ? result
+              : JSON.stringify(result ?? "");
+
+          if (r?.isError) throw new Error(text || `${registered.name} returned an error`);
+          return { title: String(config.title ?? registered.name), output: text };
+        },
+      };
+    }
+
+    return tools;
+  }
+
+  const nativeTools = await buildNativeTools();
+
   return {
+    tool: nativeTools,
+
     // ── PreToolUse: Routing enforcement ─────────────────
 
     "tool.execute.before": async (input: BeforeHookInput, output: BeforeHookOutput) => {

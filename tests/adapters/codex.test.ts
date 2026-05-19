@@ -1,6 +1,7 @@
 import "../setup-home";
 import { describe, it, expect, beforeEach } from "vitest";
 import { execFileSync } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { CodexAdapter } from "../../src/adapters/codex/index.js";
@@ -271,6 +272,30 @@ describe("CodexAdapter", () => {
       expect(config).toHaveProperty("SessionStart");
       expect(config).toHaveProperty("UserPromptSubmit");
       expect(config).toHaveProperty("Stop");
+    });
+  });
+
+  describe("validateHooks", () => {
+    it("warns when a hook has duplicate managed context-mode entries", () => {
+      mkdirSync(adapter.getConfigDir(), { recursive: true });
+      writeFileSync(adapter.getSettingsPath(), "[features]\nhooks = true\n", "utf-8");
+      const hooks = adapter.generateHookConfig("");
+      hooks.PreToolUse = [
+        hooks.PreToolUse[0],
+        JSON.parse(JSON.stringify(hooks.PreToolUse[0])),
+      ];
+      writeFileSync(
+        adapter.getHooksPath(),
+        JSON.stringify({ hooks }, null, 2),
+        "utf-8",
+      );
+
+      const results = adapter.validateHooks("");
+      const duplicate = results.find((r) => r.check === "PreToolUse duplicates");
+
+      expect(duplicate?.status).toBe("warn");
+      expect(duplicate?.message).toContain("Codex will fire all of them");
+      expect(duplicate?.fix).toContain("context-mode upgrade");
     });
   });
 });

@@ -1,5 +1,3 @@
-import { buildNodeCommand } from "../types.js";
-
 /**
  * adapters/jetbrains-copilot/hooks — JetBrains Copilot hook definitions and matchers.
  *
@@ -86,16 +84,14 @@ export function isContextModeHook(
 
 /**
  * Build the hook command string for a given hook type.
- * Uses absolute node path to avoid PATH issues (homebrew, nvm, volta, etc.).
- * Falls back to CLI dispatcher if pluginRoot is not provided.
+ * Always emits the CLI dispatcher form. `pluginRoot` is accepted for API
+ * compatibility but intentionally ignored because these hook files are
+ * workspace-committed and must not bake in local absolute paths.
  */
-export function buildHookCommand(hookType: HookType, pluginRoot?: string): string {
+export function buildHookCommand(hookType: HookType, _pluginRoot?: string): string {
   const scriptName = HOOK_SCRIPTS[hookType];
   if (!scriptName) {
     throw new Error(`No script defined for hook type: ${hookType}`);
-  }
-  if (pluginRoot) {
-    return buildNodeCommand(`${pluginRoot}/hooks/jetbrains-copilot/${scriptName}`);
   }
   return `context-mode hook jetbrains-copilot ${hookType.toLowerCase()}`;
 }

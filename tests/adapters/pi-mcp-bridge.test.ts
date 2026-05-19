@@ -137,4 +137,24 @@ describe("MCPStdioClient", () => {
 
     client.shutdown();
   }, 15_000);
+
+  it("rejects a request instead of throwing when child stdin is already closed", async () => {
+    const fakePath = join(scratch, "idle-server.mjs");
+    writeFileSync(
+      fakePath,
+      `setInterval(() => {}, 60000);\n`,
+      "utf-8",
+    );
+
+    const { MCPStdioClient } = await import("../../src/adapters/pi/mcp-bridge.js");
+    const client = new MCPStdioClient(fakePath);
+    client.start();
+
+    const child = (client as any).child;
+    await new Promise<void>((resolve) => child?.stdin?.end(resolve));
+
+    await expect(client.listTools()).rejects.toThrow(/MCP server (stdin unavailable|exited)/);
+
+    client.shutdown();
+  }, 15_000);
 });
