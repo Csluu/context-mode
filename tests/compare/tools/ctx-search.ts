@@ -21,10 +21,22 @@ async function seed(client: McpStdioClient): Promise<void> {
 const suite: Suite = {
   name: "ctx-search",
   scenarios: [
-    { tool: "ctx_search", name: "single-q-alpha", args: { queries: ["alpha"] }, setup: seed },
-    { tool: "ctx_search", name: "multi-q",        args: { queries: ["alpha", "bravo", "charlie"] }, setup: seed },
-    { tool: "ctx_search", name: "scoped-source",  args: { queries: ["delta"], source: "corpus-bravo" }, setup: seed },
-    { tool: "ctx_search", name: "high-limit",     args: { queries: ["echo"], limit: 10 }, setup: seed },
+    {
+      tool: "ctx_search", name: "single-q-alpha", args: { queries: ["alpha"] }, setup: seed,
+      assert: (t) => t.toLowerCase().includes("alpha") ? [] : [`no 'alpha' in search result`],
+    },
+    {
+      tool: "ctx_search", name: "multi-q", args: { queries: ["alpha", "bravo", "charlie"] }, setup: seed,
+      assert: (t) => ["alpha", "bravo", "charlie"].filter((w) => !t.toLowerCase().includes(w)).map((w) => `missing '${w}'`),
+    },
+    {
+      tool: "ctx_search", name: "scoped-source", args: { queries: ["delta"], source: "corpus-bravo" }, setup: seed,
+      assert: (t) => t.toLowerCase().includes("delta") ? [] : [`no 'delta' in scoped result`],
+    },
+    {
+      tool: "ctx_search", name: "high-limit", args: { queries: ["echo"], limit: 10 }, setup: seed,
+      assert: (t) => t.toLowerCase().includes("echo") ? [] : [`no 'echo' in high-limit result`],
+    },
   ],
 };
 

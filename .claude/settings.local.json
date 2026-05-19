@@ -13,7 +13,10 @@
       "Bash(mv route.ts ctx-route.ts)",
       "Bash(mv execute.ts ctx-execute.ts)",
       "Bash(mv search.ts ctx-search.ts)",
-      "Bash(mv batch.ts ctx-batch.ts)"
+      "Bash(mv batch.ts ctx-batch.ts)",
+      "Bash(mkdir -p tests/compare/fixtures)",
+      "Bash(cp src/executor.ts tests/compare/fixtures/pinned-executor.ts)",
+      "Read(//c/c/Users/chris/Documents/GitHub/context-mode/tests/compare/fixtures/**)"
     ]
   }
 }

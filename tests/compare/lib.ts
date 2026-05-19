@@ -65,12 +65,18 @@ export interface Row {
   scenario: string;
   tool: string;
   iterations: number;
+  /** UTF-8 bytes of the JSON-serialized args. Same on fork and upstream (matched input). */
+  argsBytes: number;
   fork: SideMetric;
   upstream: SideMetric;
   parity: "match" | "equivalent" | "divergent" | "error";
   assertIssues: string[];
   diffPreview: string;
   notes: string;
+}
+
+export function argsBytesOf(args: unknown): number {
+  return Buffer.byteLength(JSON.stringify(args ?? {}), "utf8");
 }
 
 export function requireToolOk(result: ToolCallResult, context: string): ToolCallResult {
@@ -213,6 +219,7 @@ export async function runScenario(
     scenario: s.name,
     tool: s.tool,
     iterations,
+    argsBytes: argsBytesOf(s.args),
     fork: emptySide(),
     upstream: emptySide(),
     parity: "error",

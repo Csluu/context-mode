@@ -43,6 +43,8 @@ export interface Workflow {
 export interface StepResult {
   label: string;
   tool: string;
+  /** UTF-8 bytes of JSON-serialized resolved args. Same on fork+upstream. */
+  argsBytes: number;
   ms: number;
   bytes: number;
   ok: boolean;
@@ -83,6 +85,7 @@ async function runSide(client: McpStdioClient, wf: Workflow): Promise<WorkflowSi
         steps.push({
           label: step.label,
           tool: step.tool,
+          argsBytes: 0,
           ms: 0,
           bytes: 0,
           ok: false,
@@ -92,7 +95,8 @@ async function runSide(client: McpStdioClient, wf: Workflow): Promise<WorkflowSi
       }
     }
     const args = resolveArgs(step.args, ctx);
-    const res: StepResult = { label: step.label, tool: step.tool, ms: 0, bytes: 0, ok: false };
+    const argsBytes = Buffer.byteLength(JSON.stringify(args ?? {}), "utf8");
+    const res: StepResult = { label: step.label, tool: step.tool, argsBytes, ms: 0, bytes: 0, ok: false };
     try {
       const r = await client.call(step.tool, args);
       res.ms = r.ms;

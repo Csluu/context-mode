@@ -21,16 +21,30 @@ on:
         description: "Run ctx_stats validation"
         required: false
         default: "true"
+      os_matrix:
+        description: "OS to run on (ubuntu, windows, both)"
+        required: false
+        default: "ubuntu"
 
 permissions:
   contents: read
   issues: write
   pull-requests: read
 
+concurrency:
+  group: compare-upstream-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   compare:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Nightly + manual dispatch run both OSes. PR runs Ubuntu only by default
+        # to keep PR feedback fast — switch via workflow_dispatch os_matrix input.
+        os: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.os_matrix == 'both')) && fromJSON('["ubuntu-latest","windows-latest"]') || fromJSON('["ubuntu-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
@@ -54,28 +68,31 @@ jobs:
 
       - name: Run per-tool parity suites
         run: npm run compare:all
-        continue-on-error: false
 
       - name: Run real-life workflows
         if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.include_workflows != 'false' }}
         run: npm run compare:workflows
-        continue-on-error: false
 
       - name: Run ctx_stats validation
         if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.include_stats_validate != 'false' }}
         run: npm run compare:stats-validate
-        continue-on-error: false
+
+      - name: Aggregate token breakdown
+        if: always()
+        run: npm run compare:tokens
+        continue-on-error: true
 
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: compare-reports-${{ github.run_id }}
+          name: compare-reports-${{ matrix.os }}-${{ github.run_id }}
           path: build/compare/
+          if-no-files-found: ignore
           retention-days: 30
 
       - name: Comment summary on PR
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && always()
+        if: github.event_name == 'pull_request' && matrix.os == 'ubuntu-latest' && github.event.pull_request.head.repo.full_name == github.repository && always()
         uses: actions/github-script@v7
         continue-on-error: true
         with:
@@ -90,7 +107,8 @@ jobs:
             const all = pick('all-');
             const wf  = pick('workflows-');
             const sv  = pick('stat-validate-');
-            for (const [label, f] of [['Per-tool', all], ['Workflows', wf], ['Stat validation', sv]]) {
+            const tk  = pick('tokens-');
+            for (const [label, f] of [['Per-tool', all], ['Workflows', wf], ['Stat validation', sv], ['Token breakdown', tk]]) {
               if (!f) continue;
               const body = fs.readFileSync(path.join(dir, f), 'utf8');
               const summary = body.split('\n').slice(0, 30).join('\n');
@@ -98,9 +116,10 @@ jobs:
             }
             if (parts.length === 0) return;
             const out = `## Fork vs upstream comparison\n\n${parts.join('\n\n')}\n\n_Full reports in run artifacts._`;
+            const MAX = 60000;
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: out.slice(0, 65000),
+              body: out.length > MAX ? out.slice(0, MAX) + '\n\n_(truncated)_' : out,
             });

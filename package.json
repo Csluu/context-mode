@@ -136,7 +136,8 @@
     "compare:value-parsers": "npx tsx tests/compare/run.ts value-parsers",
     "compare:value-diff": "npx tsx tests/compare/run.ts value-diff",
     "compare:value-trace": "npx tsx tests/compare/run.ts value-trace",
-    "compare:full": "npm run compare:all && npm run compare:workflows && npm run compare:stats-validate",
+    "compare:full": "npm run compare:all && npm run compare:workflows && npm run compare:stats-validate && npm run compare:tokens",
+    "compare:tokens": "npx tsx tests/compare/run-tokens.ts",
     "install:openclaw": "node -e \"if(process.platform==='win32'){console.error('OpenClaw install requires bash (Git Bash or WSL)');process.exit(1)}else{require('child_process').execSync('bash scripts/install-openclaw-plugin.sh',{stdio:'inherit'})}\"",
     "postinstall": "node scripts/postinstall.mjs"
   },

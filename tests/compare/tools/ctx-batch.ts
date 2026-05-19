@@ -19,7 +19,15 @@ const queries = [
 const suite: Suite = {
   name: "ctx-batch",
   scenarios: [
-    { tool: "ctx_batch_execute", name: "three-cmd-five-q", args: { commands, queries } },
+    {
+      tool: "ctx_batch_execute", name: "three-cmd-five-q", args: { commands, queries },
+      assert: (t) => {
+        const issues: string[] = [];
+        if (!t.toLowerCase().includes("alpha")) issues.push(`no 'alpha' (echo output)`);
+        if (!/comparison-fixture-line/i.test(t)) issues.push(`no echo content`);
+        return issues;
+      },
+    },
     {
       tool: "ctx_batch_execute",
       name: "single-cmd",
@@ -27,6 +35,7 @@ const suite: Suite = {
         commands: [{ label: "platform", command: "node -e \"console.log(process.platform, process.arch)\"" }],
         queries: ["platform"],
       },
+      assert: (t) => /win32|linux|darwin/i.test(t) ? [] : [`no platform string in result`],
     },
   ],
 };
