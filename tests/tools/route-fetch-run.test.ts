@@ -84,15 +84,33 @@ describe("ctx_fetch_run tool", () => {
         now: new Date("2026-05-17T12:01:00.000Z"),
       });
       const capped = await tool.handler({ runId: largeArtifact.metadata.runId, raw: true }, testContext());
-      expect(capped.content[0].text).toContain("...[truncated at 8000 bytes]");
+      expect(capped.content[0].text).toContain("...[head preview truncated at 8000 bytes]");
       expect(capped.content[0].text).not.toContain("x".repeat(8_500));
 
       const codexCapped = await tool.handler(
         { runId: largeArtifact.metadata.runId, raw: true },
         testContextForAdapter("codex"),
       );
-      expect(codexCapped.content[0].text).toContain("...[truncated at 6000 bytes]");
+      expect(codexCapped.content[0].text).toContain("...[head preview truncated at 6000 bytes]");
       expect(codexCapped.content[0].text).not.toContain("x".repeat(6_500));
+
+      const tailArtifact = writeRunArtifact({
+        projectDir,
+        command: "npm test --runInBand",
+        stdout: `START_OF_LOG\n${"body\n".repeat(300)}FINAL_SUMMARY_OK`,
+        status: "failed",
+        maxRunBytes: 500,
+        runId: "88888888-8888-4888-8888-888888888888",
+        now: new Date("2026-05-17T12:02:00.000Z"),
+      });
+      const tail = await tool.handler(
+        { runId: tailArtifact.metadata.runId, raw: true, maxBytes: 200, preview: "tail" },
+        testContext(),
+      );
+      expect(tail.content[0].text).toContain("--- redacted raw preview (tail) ---");
+      expect(tail.content[0].text).toContain("FINAL_SUMMARY_OK");
+      expect(tail.content[0].text).not.toContain("START_OF_LOG");
+      expect(tail.content[0].text).toContain("...[tail preview truncated at 200 bytes]");
 
       const pinned = await tool.handler({ latest: true, pin: true }, testContext());
       expect(pinned.content[0].text).toContain("pinned: true");

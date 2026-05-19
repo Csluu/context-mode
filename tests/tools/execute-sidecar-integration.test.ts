@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -129,6 +129,183 @@ describe("ctx_execute sidecar integration", () => {
       expect(searchText).not.toContain("TOKEN=abc123");
     } finally {
       rmSync(projectDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("honors projectDir override for shell cwd and sidecar lookup", async () => {
+    const activeProjectDir = mkdtempSync(join(tmpdir(), "context-mode-execute-active-"));
+    const targetProjectDir = mkdtempSync(join(tmpdir(), "context-mode-execute-target-"));
+    try {
+      const proc = spawn("node", [serverEntry], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          CLAUDE_PROJECT_DIR: activeProjectDir,
+          CONTEXT_MODE_PROJECT_DIR: activeProjectDir,
+          CONTEXT_MODE_DISABLE_VERSION_CHECK: "1",
+        },
+      });
+      processes.push(proc);
+
+      const init = waitForRpc(proc, 30);
+      sendRpc(proc, {
+        jsonrpc: "2.0",
+        id: 30,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "projectdir-test", version: "1.0" } },
+      });
+      expect((await init)?.error).toBeUndefined();
+      sendRpc(proc, { jsonrpc: "2.0", method: "notifications/initialized" });
+
+      const execute = await callTool(proc, 31, "ctx_execute", {
+        language: "shell",
+        projectDir: targetProjectDir,
+        intent: "project override line 349",
+        code: "node -e \"for (let i = 0; i < 350; i++) console.log(process.cwd() + ' project override line ' + i)\"",
+      });
+      const executeText = execute?.result?.content?.[0]?.text ?? "";
+      expect(execute?.error).toBeUndefined();
+      expect(executeText).toContain("Full redacted output saved:");
+      expect(executeText).toContain(`projectDir: ${JSON.stringify(targetProjectDir)}`);
+      const runId = executeText.match(/runId: "([^"]+)"/)?.[1];
+      expect(runId).toBeTruthy();
+
+      const targetFetch = await callTool(proc, 32, "ctx_fetch_run", {
+        projectDir: targetProjectDir,
+        runId,
+        raw: true,
+        maxBytes: 40_000,
+      });
+      const targetText = targetFetch?.result?.content?.[0]?.text ?? "";
+      expect(targetFetch?.error).toBeUndefined();
+      expect(targetText).toContain("project override line 349");
+      expect(targetText).toContain(targetProjectDir);
+
+      const activeFetch = await callTool(proc, 33, "ctx_fetch_run", {
+        projectDir: activeProjectDir,
+        runId,
+        raw: true,
+      });
+      expect(activeFetch?.error).toBeUndefined();
+      expect(activeFetch?.result?.isError).toBe(true);
+      expect(activeFetch?.result?.content?.[0]?.text ?? "").toContain("CTX_ARTIFACT_NOT_FOUND");
+    } finally {
+      rmSync(activeProjectDir, { recursive: true, force: true });
+      rmSync(targetProjectDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("uses cwd for subdirectory execution while keeping sidecars under projectDir", async () => {
+    const activeProjectDir = mkdtempSync(join(tmpdir(), "context-mode-execute-cwd-active-"));
+    const targetProjectDir = mkdtempSync(join(tmpdir(), "context-mode-execute-cwd-target-"));
+    const frontendDir = join(targetProjectDir, "frontend");
+    mkdirSync(frontendDir);
+    writeFileSync(join(frontendDir, "marker.txt"), "cwd-marker-123\n", "utf8");
+    try {
+      const proc = spawn("node", [serverEntry], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          CLAUDE_PROJECT_DIR: activeProjectDir,
+          CONTEXT_MODE_PROJECT_DIR: activeProjectDir,
+          CONTEXT_MODE_DISABLE_VERSION_CHECK: "1",
+        },
+      });
+      processes.push(proc);
+
+      const init = waitForRpc(proc, 50);
+      sendRpc(proc, {
+        jsonrpc: "2.0",
+        id: 50,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "cwd-test", version: "1.0" } },
+      });
+      expect((await init)?.error).toBeUndefined();
+      sendRpc(proc, { jsonrpc: "2.0", method: "notifications/initialized" });
+
+      const execute = await callTool(proc, 51, "ctx_execute", {
+        language: "javascript",
+        projectDir: targetProjectDir,
+        cwd: "frontend",
+        intent: "CWD_SIDE_CAR_499",
+        code: [
+          "const fs = require('node:fs');",
+          "console.log('JS_CWD=' + process.cwd());",
+          "console.log('MARKER=' + fs.readFileSync('marker.txt', 'utf8').trim());",
+          "for (let i = 0; i < 500; i++) console.log('CWD_SIDE_CAR_' + i + ' ' + process.cwd());",
+        ].join("\n"),
+      });
+      const executeText = execute?.result?.content?.[0]?.text ?? "";
+      expect(execute?.error).toBeUndefined();
+      expect(executeText).toContain("Full redacted output saved:");
+      const runId = executeText.match(/runId: "([^"]+)"/)?.[1];
+      expect(runId).toBeTruthy();
+
+      const fetchRun = await callTool(proc, 52, "ctx_fetch_run", {
+        projectDir: targetProjectDir,
+        runId,
+        raw: true,
+        maxBytes: 40_000,
+      });
+      const fetchText = fetchRun?.result?.content?.[0]?.text ?? "";
+      expect(fetchRun?.error).toBeUndefined();
+      expect(fetchText).toContain("MARKER=cwd-marker-123");
+      expect(fetchText).toContain(frontendDir);
+      expect(existsSync(join(targetProjectDir, ".context-mode"))).toBe(true);
+      expect(existsSync(join(frontendDir, ".context-mode"))).toBe(false);
+    } finally {
+      rmSync(activeProjectDir, { recursive: true, force: true });
+      rmSync(targetProjectDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("honors projectDir override for batch shell cwd and indexing", async () => {
+    const activeProjectDir = mkdtempSync(join(tmpdir(), "context-mode-batch-active-"));
+    const targetProjectDir = mkdtempSync(join(tmpdir(), "context-mode-batch-target-"));
+    const frontendDir = join(targetProjectDir, "frontend");
+    mkdirSync(frontendDir);
+    try {
+      const proc = spawn("node", [serverEntry], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          CLAUDE_PROJECT_DIR: activeProjectDir,
+          CONTEXT_MODE_PROJECT_DIR: activeProjectDir,
+          CONTEXT_MODE_DISABLE_VERSION_CHECK: "1",
+        },
+      });
+      processes.push(proc);
+
+      const init = waitForRpc(proc, 40);
+      sendRpc(proc, {
+        jsonrpc: "2.0",
+        id: 40,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "batch-projectdir-test", version: "1.0" } },
+      });
+      expect((await init)?.error).toBeUndefined();
+      sendRpc(proc, { jsonrpc: "2.0", method: "notifications/initialized" });
+
+      const batch = await callTool(proc, 41, "ctx_batch_execute", {
+        projectDir: targetProjectDir,
+        cwd: "frontend",
+        commands: [
+          {
+            label: "cwd_probe",
+            command: "node -e \"console.log('BATCH_CWD=' + process.cwd())\"",
+          },
+        ],
+        queries: ["BATCH_CWD"],
+      });
+      const batchText = batch?.result?.content?.[0]?.text ?? "";
+      expect(batch?.error).toBeUndefined();
+      expect(batchText).toContain("BATCH_CWD");
+      expect(batchText).toContain(frontendDir);
+      expect(batchText).not.toContain(activeProjectDir);
+      expect(existsSync(join(frontendDir, ".context-mode"))).toBe(false);
+    } finally {
+      rmSync(activeProjectDir, { recursive: true, force: true });
+      rmSync(targetProjectDir, { recursive: true, force: true });
     }
   }, 30_000);
 

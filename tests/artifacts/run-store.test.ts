@@ -211,6 +211,43 @@ describe("run artifact store", () => {
     }
   });
 
+  it("preserves the original log tail when per-run sidecar storage is truncated", () => {
+    const projectDir = tempProject();
+    try {
+      const record = writeRunArtifact({
+        projectDir,
+        command: "npm test",
+        stdout: `START_OF_LOG\n${"middle\n".repeat(200)}FINAL_SUMMARY_OK`,
+        status: "failed",
+        maxRunBytes: 200,
+      });
+
+      const raw = readFileSync(record.metadata.rawPath, "utf8");
+      expect(record.metadata.truncated).toBe(true);
+      expect(raw).toContain("stored head and tail");
+
+      const head = fetchRunArtifact({
+        projectDir,
+        runId: record.metadata.runId,
+        maxBytes: 80,
+        preview: "head",
+      })?.raw ?? "";
+      expect(head).toContain("START_OF_LOG");
+      expect(head).not.toContain("FINAL_SUMMARY_OK");
+
+      const tail = fetchRunArtifact({
+        projectDir,
+        runId: record.metadata.runId,
+        maxBytes: 80,
+        preview: "tail",
+      })?.raw ?? "";
+      expect(tail).toContain("FINAL_SUMMARY_OK");
+      expect(tail).not.toContain("START_OF_LOG");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
   it("does not delete the just-written artifact when project cap is smaller than one run", () => {
     const projectDir = tempProject();
     try {

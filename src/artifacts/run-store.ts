@@ -61,6 +61,7 @@ export interface FetchRunOptions {
   readonly runId?: string;
   readonly latest?: boolean;
   readonly maxBytes?: number;
+  readonly preview?: "head" | "tail";
 }
 
 export interface FetchedRunArtifact extends RunArtifactRecord {
@@ -144,6 +145,20 @@ function sliceUtf8Bytes(text: string, maxBytes: number): string {
   return text.slice(0, end);
 }
 
+function sliceUtf8TailBytes(text: string, maxBytes: number): string {
+  let bytes = 0;
+  const chars = Array.from(text);
+  let start = chars.length;
+  for (let i = chars.length - 1; i >= 0; i--) {
+    const char = chars[i];
+    const nextBytes = Buffer.byteLength(char);
+    if (bytes + nextBytes > maxBytes) break;
+    bytes += nextBytes;
+    start = i;
+  }
+  return chars.slice(start).join("");
+}
+
 function deletionCandidates(records: readonly RunArtifactRecord[]): RunArtifactRecord[] {
   return [...records]
     .filter((record) => !record.metadata.pinned)
@@ -209,7 +224,15 @@ export function writeRunArtifact(input: WriteRunArtifactInput): RunArtifactRecor
   const redactedBytes = Buffer.byteLength(redacted.text);
   const truncated = redactedBytes > maxRunBytes;
   const storedText = truncated
-    ? `${sliceUtf8Bytes(redacted.text, maxRunBytes)}\n[context-mode: sidecar truncated at ${maxRunBytes} bytes; original redacted bytes ${redactedBytes}]\n`
+    ? (() => {
+      const headBytes = Math.max(1, Math.ceil(maxRunBytes / 2));
+      const tailBytes = Math.max(1, maxRunBytes - headBytes);
+      return [
+        sliceUtf8Bytes(redacted.text, headBytes),
+        `[context-mode: sidecar truncated at ${maxRunBytes} bytes; original redacted bytes ${redactedBytes}; stored head and tail]`,
+        sliceUtf8TailBytes(redacted.text, tailBytes),
+      ].join("\n");
+    })()
     : redacted.text;
   const rawPath = join(artifactDir, "raw.log");
   const metadataPath = join(artifactDir, "metadata.json");
@@ -290,9 +313,14 @@ export function fetchRunArtifact(options: FetchRunOptions): FetchedRunArtifact |
   const raw = readFileSync(record.metadata.rawPath, "utf8");
   const rawBytes = Buffer.byteLength(raw);
   const truncated = rawBytes > maxBytes;
+  const preview = options.preview ?? "head";
   return {
     ...record,
-    raw: truncated ? sliceUtf8Bytes(raw, maxBytes) : raw,
+    raw: truncated
+      ? preview === "tail"
+        ? sliceUtf8TailBytes(raw, maxBytes)
+        : sliceUtf8Bytes(raw, maxBytes)
+      : raw,
     truncated,
   };
 }

@@ -322,6 +322,27 @@ describe("Heading-Aware Chunking", () => {
     store.close();
   });
 
+  test("keeps oversized fenced code blocks intact", () => {
+    const store = createStore();
+    const longCode = [
+      "function uniqueOversizedFenceProbe() {",
+      ...Array.from({ length: 700 }, (_, i) => `  console.log("line ${i}");`),
+      "}",
+    ].join("\n");
+    store.index({
+      content: `# Large Example\n\n\`\`\`javascript\n${longCode}\n\`\`\`\n\nAfter the code block.`,
+      source: "oversized-code-intact",
+    });
+
+    const results = store.search("uniqueOversizedFenceProbe", 1);
+    assert.ok(results.length > 0);
+    assert.ok(results[0].content.includes("```javascript"));
+    assert.ok(results[0].content.includes("uniqueOversizedFenceProbe"));
+    assert.ok(results[0].content.includes("\n```\n") || results[0].content.endsWith("\n```"));
+
+    store.close();
+  });
+
   test("tracks heading hierarchy in titles", () => {
     const store = createStore();
     store.index({
@@ -361,6 +382,24 @@ describe("Heading-Aware Chunking", () => {
     const codeResults = store.search("python print hello", 1);
     assert.ok(codeResults.length > 0);
     assert.equal(codeResults[0].contentType, "code");
+
+    store.close();
+  });
+
+  test("splits oversized unbroken markdown sections", () => {
+    const store = createStore();
+    const longLine = "graph_node_".repeat(1_000);
+    const result = store.index({
+      content: `# Graph Report\n\n${longLine}\n\n## Tail\n\nfindable tail`,
+      source: "graph-report",
+    });
+
+    assert.ok(
+      result.totalChunks > 1,
+      `Expected oversized unbroken section to split, got ${result.totalChunks} chunks`,
+    );
+    const results = store.search("graph_node", 10);
+    assert.ok(results.length > 1, "Search should reach multiple bounded graph chunks");
 
     store.close();
   });

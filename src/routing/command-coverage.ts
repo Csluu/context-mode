@@ -124,6 +124,18 @@ export const COMMAND_COVERAGE: readonly CommandCoverageEntry[] = [
     fixtures: ["success", "failure", "empty", "huge", "ansi", "malformed"],
   },
   {
+    command: "npm run lint",
+    ecosystem: "node",
+    status: "experimental",
+    router: "recommend",
+    parser: "generic-failure",
+    autoRewriteEligible: false,
+    supportsJsonFirst: false,
+    dangerLevel: "low",
+    knownFlagConflicts: ["--watch", "--fix"],
+    fixtures: ["success", "failure", "empty", "huge", "ansi", "malformed"],
+  },
+  {
     command: "npx tsc",
     ecosystem: "node",
     status: "experimental",

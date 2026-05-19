@@ -18,6 +18,7 @@ interface FetchRunInput {
   readonly pin?: boolean;
   readonly maxBytes?: number;
   readonly limit?: number;
+  readonly preview?: "head" | "tail";
 }
 
 type ToolTextResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
@@ -59,6 +60,7 @@ export function makeCtxFetchRun(deps: FetchRunDeps): ToolDefinition<FetchRunInpu
         pin: z.boolean().optional().describe("Pin the artifact so future cleanup can preserve it."),
         maxBytes: z.coerce.number().int().positive().max(200_000).optional().describe("Max raw preview bytes."),
         limit: z.coerce.number().int().positive().max(100).optional().describe("Max list entries."),
+        preview: z.enum(["head", "tail"]).optional().describe("Raw preview window. Use tail for final test/build summaries at the end of long logs."),
       }),
     },
     handler(input: FetchRunInput, ctx: ToolContext): ToolTextResult {
@@ -73,6 +75,7 @@ export function makeCtxFetchRun(deps: FetchRunDeps): ToolDefinition<FetchRunInpu
         runId: input.runId,
         latest: input.latest || !input.runId,
         maxBytes: input.maxBytes ?? budget.maxSidecarPreviewBytes,
+        preview: input.preview,
       });
       if (!artifact) {
         return {
@@ -87,6 +90,7 @@ export function makeCtxFetchRun(deps: FetchRunDeps): ToolDefinition<FetchRunInpu
             projectDir,
             runId: pinned.metadata.runId,
             maxBytes: input.maxBytes ?? budget.maxSidecarPreviewBytes,
+            preview: input.preview,
           }) ?? artifact;
         }
       }
@@ -103,9 +107,10 @@ export function makeCtxFetchRun(deps: FetchRunDeps): ToolDefinition<FetchRunInpu
       if (m.summary) lines.push(`summary: ${m.summary}`);
       if (m.pinned) lines.push("pinned: true");
       if (input.raw) {
-        lines.push("", "--- redacted raw preview ---", artifact.raw ?? "");
+        const preview = input.preview ?? "head";
+        lines.push("", `--- redacted raw preview (${preview}) ---`, artifact.raw ?? "");
         if (artifact.truncated) {
-          lines.push("", `...[truncated at ${input.maxBytes ?? budget.maxSidecarPreviewBytes} bytes]`);
+          lines.push("", `...[${preview} preview truncated at ${input.maxBytes ?? budget.maxSidecarPreviewBytes} bytes]`);
         }
       } else {
         lines.push("", "Use ctx_fetch_run({ runId, raw: true }) for redacted raw preview.");

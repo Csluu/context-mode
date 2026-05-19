@@ -371,7 +371,7 @@ Use this matrix instead of guessing.
 | Docs only | `git diff --check` |
 | Config/instruction docs | JSON parse relevant config files, `git diff --check`, relevant hook/plugin tests |
 | TypeScript compile-only change | `npm run typecheck` |
-| MCP tool schema or registry | `vitest run tests/tools/registry.test.ts tests/plugins/openclaw.test.ts && npm run release:reports` |
+| MCP tool schema or registry | `vitest run tests/tools/registry.test.ts tests/plugins/openclaw.test.ts tests/plugins/openclaw-tool-schema.test.ts && npm run release:reports` |
 | `ctx_read` behavior | `vitest run tests/read tests/tools/read.test.ts` |
 | Router/rewrite/classifier | `vitest run tests/routing tests/hooks/hook-rewrite.test.ts tests/cli/run-command.test.ts` |
 | Hook behavior | `vitest run tests/hooks tests/cli/hook-self-test.test.ts` |

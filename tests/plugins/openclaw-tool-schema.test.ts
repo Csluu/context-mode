@@ -53,6 +53,12 @@ describe("OpenClaw tool schemas", () => {
       required: ["label", "command"],
     });
     expect(batchTool?.parameters.properties.queries.items).toEqual({ type: "string" });
+    expect(batchTool?.parameters.properties).toMatchObject({
+      projectDir: { type: "string" },
+      cwd: { type: "string" },
+      timeout: { type: "number" },
+      concurrency: { type: "number" },
+    });
   });
 
   it("declares concrete ctx_fetch_and_index request item schemas", () => {
@@ -87,6 +93,76 @@ describe("OpenClaw tool schemas", () => {
       minBytes: { type: "number" },
       session: { type: "string" },
       lastDays: { type: "number" },
+    });
+  });
+
+  it("keeps OpenClaw ctx_execute/fetch_run schemas aligned with cwd and preview inputs", () => {
+    const executeTool = OPENCLAW_TOOL_DEFS.find((tool) => tool.name === "ctx_execute");
+    expect(executeTool?.parameters.properties).toMatchObject({
+      language: { type: "string" },
+      code: { type: "string" },
+      intent: { type: "string" },
+      parser: { type: "string" },
+      projectDir: { type: "string" },
+      cwd: { type: "string" },
+    });
+
+    const fetchRunTool = OPENCLAW_TOOL_DEFS.find((tool) => tool.name === "ctx_fetch_run");
+    expect(fetchRunTool?.parameters.properties).toMatchObject({
+      runId: { type: "string" },
+      projectDir: { type: "string" },
+      raw: { type: "boolean" },
+      maxBytes: { type: "number" },
+      preview: { type: "string" },
+    });
+
+    const indexTool = OPENCLAW_TOOL_DEFS.find((tool) => tool.name === "ctx_index");
+    expect(indexTool?.parameters.required).toBeUndefined();
+    expect(indexTool?.parameters.properties).toMatchObject({
+      content: { type: "string" },
+      path: { type: "string" },
+      source: { type: "string" },
+    });
+  });
+
+  it("keeps OpenClaw stable tool schemas aligned with MCP optional inputs", () => {
+    const executeFileTool = OPENCLAW_TOOL_DEFS.find((tool) => tool.name === "ctx_execute_file");
+    expect(executeFileTool?.parameters.properties).toMatchObject({
+      timeout: { type: "number" },
+      intent: { type: "string" },
+    });
+
+    const searchTool = OPENCLAW_TOOL_DEFS.find((tool) => tool.name === "ctx_search");
+    expect(searchTool?.parameters.properties).toMatchObject({
+      limit: { type: "number" },
+      contentType: { type: "string" },
+    });
+
+    const routeTool = OPENCLAW_TOOL_DEFS.find((tool) => tool.name === "ctx_route");
+    expect(routeTool?.parameters.properties).toMatchObject({
+      adapterCanRewrite: { type: "boolean" },
+    });
+
+    const doctorTool = OPENCLAW_TOOL_DEFS.find((tool) => tool.name === "ctx_doctor");
+    expect(doctorTool?.parameters.properties).toMatchObject({
+      json: { type: "boolean" },
+    });
+
+    const purgeTool = OPENCLAW_TOOL_DEFS.find((tool) => tool.name === "ctx_purge");
+    expect(purgeTool?.parameters.properties).toMatchObject({
+      confirm: { type: "boolean" },
+      dryRun: { type: "boolean" },
+      sessionId: { type: "string" },
+      scope: { type: "string" },
+    });
+
+    const insightTool = OPENCLAW_TOOL_DEFS.find((tool) => tool.name === "ctx_insight");
+    expect(insightTool?.parameters.properties).toMatchObject({
+      port: { type: "number" },
+      sessionDir: { type: "string" },
+      contentDir: { type: "string" },
+      insightSessionDir: { type: "string" },
+      insightContentDir: { type: "string" },
     });
   });
 });

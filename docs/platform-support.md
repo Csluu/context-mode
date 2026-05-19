@@ -524,15 +524,15 @@ context-mode hook cursor stop
 OpenClaw is an OpenAI-stack agent gateway. context-mode ships as a native gateway plugin that registers hooks through OpenClaw's plugin API rather than the JSON stdin/stdout wire protocol. The same plugin entry also registers context-mode as a context engine, owning compaction.
 
 **Hook Names:**
-- `tool_call:before` -- equivalent to PreToolUse
-- `tool_call:after` -- equivalent to PostToolUse
+- `before_tool_call` -- equivalent to PreToolUse
+- `after_tool_call` -- equivalent to PostToolUse
 - `command:new` -- equivalent to SessionStart (fires on each new gateway command)
 - `before_prompt_build` -- lifecycle hook for routing instruction injection
 - `registerContextEngine` (with `ownsCompaction`) -- equivalent to PreCompact
 
-**Blocking:** `return { block: true, blockReason: "..." }` from the `tool_call:before` handler
+**Blocking:** `return { block: true, blockReason: "..." }` from the `before_tool_call` handler
 
-**Arg Modification:** mutate `event.params` in the `tool_call:before` handler (or return `{ params: ... }`)
+**Arg Modification:** mutate `event.params` in the `before_tool_call` handler (or return `{ params: ... }`)
 
 **Output Modification:** not supported (the plugin paradigm exposes args/context, not the rendered tool output)
 
@@ -543,7 +543,7 @@ OpenClaw is an OpenAI-stack agent gateway. context-mode ships as a native gatewa
 - Plugin install: `~/.openclaw/extensions/context-mode/`
 - Project config: `openclaw.json` or `.openclaw/openclaw.json`
 - Global config fallback: `~/.openclaw/openclaw.json`
-- Project dir: `process.cwd()` (the gateway provides no dedicated env var)
+- Project dir: event `cwd`, then `OPENCLAW_PROJECT_DIR`, then `process.cwd()`
 - Memory dir: project-relative `./memory`
 - Session dir: `~/.openclaw/context-mode/sessions/`
 - Routing instructions: `AGENTS.md`
@@ -556,7 +556,7 @@ OpenClaw is an OpenAI-stack agent gateway. context-mode ships as a native gatewa
 **Notes / Caveats:**
 - TS plugin paradigm — hooks run in-process, so there is no shell command to chmod and no platform-specific stdin/stdout quirks
 - `ask` decisions are converted to `block` (with the original reason) since the gateway has no interactive confirmation path
-- `context` decisions inside `tool_call:before` are dropped — context injection must be routed through `before_prompt_build` or the registered context engine
+- `context` decisions inside `before_tool_call` are dropped — context injection must be routed through `before_prompt_build` or the registered context engine
 - Session ID falls back to `pid-${process.ppid}` when the gateway does not surface one
 
 ---

@@ -258,6 +258,20 @@ export async function withProjectDirOverride<T>(
   return projectDirOverride.run(ctx, fn);
 }
 
+function withOptionalProjectDir<T>(
+  projectDir: string | undefined,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const trimmed = projectDir?.trim();
+  return trimmed ? withProjectDirOverride(resolve(trimmed), fn) : fn();
+}
+
+function resolveExecutionCwd(cwd: string | undefined): string | undefined {
+  const trimmed = cwd?.trim();
+  if (!trimmed) return undefined;
+  return isAbsolute(trimmed) ? resolve(trimmed) : resolve(getProjectDir(), trimmed);
+}
+
 // Register empty prompts/resources handlers so MCP clients don't get -32601 (#168).
 // OpenCode calls listPrompts()/listResources() unconditionally — the error can poison
 // the SDK transport layer, causing subsequent listTools() calls to fail permanently.
@@ -1306,11 +1320,12 @@ export interface BatchRunOptions {
   timeout: number | undefined;
   concurrency: number;
   nodeOptsPrefix: string;
+  cwd?: string;
   onFsBytes?: (bytes: number) => void;
 }
 
 interface BatchExecutor {
-  execute(input: { language: "shell"; code: string; timeout: number | undefined }): Promise<{ stdout: string; timedOut?: boolean }>;
+  execute(input: { language: "shell"; code: string; timeout: number | undefined; cwd?: string }): Promise<{ stdout: string; timedOut?: boolean }>;
 }
 
 function quotePosixSingle(value: string): string {
@@ -1361,7 +1376,7 @@ export async function runBatchCommands(
   opts: BatchRunOptions,
   executor: BatchExecutor,
 ): Promise<BatchRunResult> {
-  const { timeout, concurrency, nodeOptsPrefix, onFsBytes } = opts;
+  const { timeout, concurrency, nodeOptsPrefix, cwd, onFsBytes } = opts;
 
   if (concurrency <= 1) {
     // Serial path — shared timeout budget, cascading skip on timeout.
@@ -1387,6 +1402,7 @@ export async function runBatchCommands(
         language: "shell",
         code: `${nodeOptsPrefix}${cmd.command} 2>&1`,
         timeout: perCmdTimeout,
+        cwd,
       });
       outputs.push(formatCommandOutput(cmd.label, result.stdout, onFsBytes));
       if (result.timedOut) {
@@ -1409,6 +1425,7 @@ export async function runBatchCommands(
         language: "shell",
         code: `${nodeOptsPrefix}${cmd.command} 2>&1`,
         timeout,
+        cwd,
       });
       // Always route partial stdout through formatCommandOutput so __CM_FS__
       // markers are stripped + counted, even when the command timed out.
@@ -1490,9 +1507,17 @@ server.registerTool(
         .string()
         .optional()
         .describe("Optional explicit output parser. Supported examples: generic-failure, failure-focus, git-status, git-diff, rg, grep, vitest, pytest. Unknown or failed parsers fail open and return normal output with a diagnostic."),
+      projectDir: z
+        .string()
+        .optional()
+        .describe("Optional project root override for indexing, sidecars, and default shell cwd. Use cwd for subdirectory commands."),
+      cwd: z
+        .string()
+        .optional()
+        .describe("Optional working directory for the executed process. Relative paths resolve under projectDir/the detected project root; artifacts still use projectDir."),
     }),
   },
-  async ({ language, code, timeout, background, intent, parser }) => {
+  async ({ language, code, timeout, background, intent, parser, projectDir, cwd }) => withOptionalProjectDir(projectDir, async () => {
     // Security: deny-only firewall
     if (language === "shell") {
       const denied = checkDenyPolicy(code, "execute");
@@ -1570,7 +1595,13 @@ ${code}
 __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nsetInterval(()=>{},2147483647);' : ''}
 })(typeof require!=='undefined'?require:null);`;
       }
-      const result = await executor.execute({ language, code: instrumentedCode, timeout, background });
+      const result = await executor.execute({
+        language,
+        code: instrumentedCode,
+        timeout,
+        background,
+        cwd: resolveExecutionCwd(cwd),
+      });
 
       // Parse sandbox network metrics from stderr
       const netMatch = result.stderr?.match(/__CM_NET__:(\d+)/);
@@ -1764,7 +1795,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
         isError: true,
       });
     }
-  },
+  }),
 );
 
 // ─────────────────────────────────────────────────────────
@@ -1949,11 +1980,13 @@ function appendRunSidecarNote(
     parserConfidence?: number;
     parserConfidenceLevel?: string;
     summary?: string;
+    projectDir?: string;
   },
 ): string {
   try {
+    const projectDir = opts.projectDir ?? getProjectDir();
     const artifact = writeRunArtifact({
-      projectDir: getProjectDir(),
+      projectDir,
       command: opts.command,
       sessionId: currentAttribution()?.sessionId,
       stdout: opts.stdout,
@@ -1969,8 +2002,8 @@ function appendRunSidecarNote(
       text,
       "",
       "Full redacted output saved:",
-      relative(getProjectDir(), artifact.metadata.rawPath).replace(/\\/g, "/"),
-      `Use ctx_fetch_run({ runId: "${artifact.metadata.runId}", raw: true })`,
+      relative(projectDir, artifact.metadata.rawPath).replace(/\\/g, "/"),
+      `Use ctx_fetch_run({ projectDir: ${JSON.stringify(projectDir)}, runId: "${artifact.metadata.runId}", raw: true })`,
     ].join("\n");
   } catch {
     return text;
@@ -3441,9 +3474,17 @@ server.registerTool(
           ">1 switches to per-command timeouts (no shared budget) and " +
           "individual `(timed out)` blocks instead of cascading skip.",
         ),
+      projectDir: z
+        .string()
+        .optional()
+        .describe("Optional project root override for indexing and default command cwd. Use cwd for subdirectory commands."),
+      cwd: z
+        .string()
+        .optional()
+        .describe("Optional working directory for batch commands. Relative paths resolve under projectDir/the detected project root; indexed output still uses projectDir."),
     }),
   },
-  async ({ commands, queries, timeout, concurrency }) => {
+  async ({ commands, queries, timeout, concurrency, projectDir, cwd }) => withOptionalProjectDir(projectDir, async () => {
     // Security: check each command against deny patterns
     for (const cmd of commands) {
       const denied = checkDenyPolicy(cmd.command, "batch_execute");
@@ -3464,6 +3505,7 @@ server.registerTool(
           timeout,
           concurrency,
           nodeOptsPrefix,
+          cwd: resolveExecutionCwd(cwd),
           onFsBytes: (bytes) => { sessionStats.bytesSandboxed += bytes; },
         },
         executor,
@@ -3542,7 +3584,7 @@ server.registerTool(
         isError: true,
       });
     }
-  },
+  }),
 );
 
 // ─────────────────────────────────────────────────────────

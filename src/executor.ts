@@ -203,6 +203,8 @@ interface ExecuteOptions {
   timeout?: number;
   /** Keep process running after timeout instead of killing it. */
   background?: boolean;
+  /** Optional working directory for the child process. */
+  cwd?: string;
   /**
    * Optional stream tee for sidecar writers. Called as stdout/stderr chunks
    * arrive, before the MCP server formats or buffers the final response.
@@ -277,8 +279,10 @@ export class PolyglotExecutor {
       const cmd = buildCommand(this.#runtimes, language, filePath);
 
       // Rust: compile then run
+      const requestedCwd = opts.cwd ? resolve(opts.cwd) : undefined;
+
       if (cmd[0] === "__rust_compile_run__") {
-        return await this.#compileAndRun(filePath, tmpDir, timeout, outputCapture);
+        return await this.#compileAndRun(filePath, requestedCwd ?? tmpDir, timeout, outputCapture);
       }
 
       // Sandbox memory cap (#tier3). When CONTEXT_MODE_SANDBOX_MEM_MB is set,
@@ -298,10 +302,10 @@ export class PolyglotExecutor {
         }
       }
 
-      // Shell commands run in the project directory so git, relative paths,
-      // and other project-aware tools work naturally. Non-shell languages
-      // run in the temp directory where their script file is written.
-      const cwd = language === "shell" ? this.#projectRoot : tmpDir;
+      // Shell commands default to the project directory so git, relative paths,
+      // and other project-aware tools work naturally. Non-shell languages keep
+      // their historical temp-dir cwd unless the caller passes opts.cwd.
+      const cwd = requestedCwd ?? (language === "shell" ? this.#projectRoot : tmpDir);
       const result = await this.#spawn(cmd, cwd, tmpDir, timeout, background, outputCapture);
 
       // Skip tmpDir cleanup if process was backgrounded — it may still need files
@@ -328,7 +332,7 @@ export class PolyglotExecutor {
       language,
       code,
     );
-    return this.execute({ language, code: wrappedCode, timeout, outputCapture });
+    return this.execute({ language, code: wrappedCode, timeout, outputCapture, cwd: opts.cwd });
   }
 
   #writeScript(tmpDir: string, code: string, language: Language): string {

@@ -534,13 +534,13 @@ Threats and required controls:
 - Command semantic changes.
   Auto-rewrite only allowlisted high-confidence commands. Compound commands are classify-only at first.
 - Sidecar exfiltration.
-  `ctx_fetch_run` must enforce path policy, project/session ownership, and slice/search defaults.
+  `ctx_fetch_run` must enforce path policy, project ownership, and slice/search defaults. Current stable lookup is scoped by `projectDir` plus `runId`/`latest`; it does not expose a session filter.
 - Network rewrite abuse.
   Do not auto-rewrite `curl` or `wget` until URL safety exists. Future network rewrites must block `file://`, localhost, RFC1918, link-local, metadata endpoints, credentialed URLs, unsafe methods, custom auth headers, proxy env surprises, and unsafe redirects. Redirect targets must be revalidated.
 - Path platform ambiguity.
   Use realpath-based boundary checks, case normalization, Windows drive/MSYS conversion rules, UNC/device path denial, alternate data stream denial, reserved-name handling, and opaque artifact ids instead of user-supplied artifact paths.
 - Sidecar local disclosure.
-  Store sidecars in per-user private directories with restrictive permissions. Use atomic create. Do not follow symlinks or hardlinks. Re-run redaction on retrieval. Include purge coverage.
+  Store sidecars under project-scoped `.context-mode/runs` directories with restrictive permissions where the platform supports them. Use atomic create. Do not follow symlinks or hardlinks. Re-run redaction on retrieval. Include purge coverage.
 
 Security test gates:
 

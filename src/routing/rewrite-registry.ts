@@ -201,6 +201,17 @@ function isNodeBuildCommand(command: ClassifiedCommand): boolean {
   return /^build(?::|$)/i.test(nodeScriptName(command));
 }
 
+function isNodeLintCommand(command: ClassifiedCommand): boolean {
+  const start = commandStartIndex(command);
+  const first = arg(command, start);
+  if (first === "eslint") return true;
+  if (first === "npx") {
+    const executable = arg(command, skipNpxOptions(command, start + 1));
+    if (executable === "eslint") return true;
+  }
+  return /^(lint|eslint)(?::|$)/i.test(nodeScriptName(command));
+}
+
 function isNodeTypecheckCommand(command: ClassifiedCommand): boolean {
   const start = commandStartIndex(command);
   const first = arg(command, start);
@@ -512,6 +523,24 @@ export const REWRITE_RULES: readonly RouteRule[] = [
     },
     buildRoute(command) {
       return route("ctx_execute", "generic-failure", command, "Return failure-focused build summary with raw log in a sidecar.");
+    },
+  },
+  {
+    id: "node-lint-generic",
+    priority: 72,
+    command: "npm run lint",
+    parser: "generic-failure",
+    category: "lint",
+    dangerLevel: "low",
+    autoRewriteEligible: false,
+    supportsJsonFirst: false,
+    knownFlagConflicts: ["--watch", "--fix"],
+    match(command) {
+      if (!isNodeLintCommand(command)) return null;
+      return { confidence: 0.75, reasons: ["lint output can be failure-focused and sidecar-backed"] };
+    },
+    buildRoute(command) {
+      return route("ctx_execute", "generic-failure", command, "Return failure-focused lint summary with raw log in a sidecar.");
     },
   },
   {

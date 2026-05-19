@@ -1591,6 +1591,95 @@ export class ContentStore {
 
   // ── Chunking ──
 
+  #pushBoundedMarkdownChunk(
+    chunks: Chunk[],
+    title: string,
+    content: string,
+    hasCode: boolean,
+    maxChunkBytes: number,
+  ): void {
+    const trimmed = content.trim();
+    if (trimmed.length === 0) return;
+    if (Buffer.byteLength(trimmed) <= maxChunkBytes) {
+      chunks.push({ title, content: trimmed, hasCode });
+      return;
+    }
+
+    const lines = trimmed.split("\n");
+    const units: Array<{ text: string; hasCode: boolean }> = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const codeMatch = line.match(/^(`{3,})(.*)?$/);
+      if (!codeMatch) {
+        units.push({ text: line, hasCode: false });
+        continue;
+      }
+
+      const fence = codeMatch[1];
+      const codeLines = [line];
+      i++;
+      while (i < lines.length) {
+        codeLines.push(lines[i]);
+        if (lines[i].startsWith(fence) && lines[i].trim() === fence) break;
+        i++;
+      }
+      units.push({ text: codeLines.join("\n"), hasCode: true });
+    }
+
+    let partIndex = 1;
+    let current: Array<{ text: string; hasCode: boolean }> = [];
+
+    const pushCurrent = () => {
+      const part = current.map((unit) => unit.text).join("\n").trim();
+      if (part.length === 0) return;
+      chunks.push({
+        title: `${title} (${partIndex})`,
+        content: part,
+        hasCode: current.some((unit) => unit.hasCode),
+      });
+      partIndex++;
+      current = [];
+    };
+
+    for (const unit of units) {
+      const candidate = [...current, unit].map((item) => item.text).join("\n");
+      if (Buffer.byteLength(candidate) <= maxChunkBytes) {
+        current.push(unit);
+        continue;
+      }
+      pushCurrent();
+      if (Buffer.byteLength(unit.text) <= maxChunkBytes) {
+        current.push(unit);
+        continue;
+      }
+      if (unit.hasCode) {
+        chunks.push({
+          title: `${title} (${partIndex})`,
+          content: unit.text.trim(),
+          hasCode: true,
+        });
+        partIndex++;
+        continue;
+      }
+
+      let segment = "";
+      for (const char of Array.from(unit.text)) {
+        if (Buffer.byteLength(segment + char) > maxChunkBytes && segment.length > 0) {
+          chunks.push({
+            title: `${title} (${partIndex})`,
+            content: segment,
+            hasCode: false,
+          });
+          partIndex++;
+          segment = "";
+        }
+        segment += char;
+      }
+      if (segment.length > 0) current.push({ text: segment, hasCode: false });
+    }
+    pushCurrent();
+  }
+
   #chunkMarkdown(text: string, maxChunkBytes: number = MAX_CHUNK_BYTES): Chunk[] {
     const chunks: Chunk[] = [];
     const lines = text.split("\n");
@@ -1623,11 +1712,7 @@ export class ContentStore {
         if (part.length === 0) return;
         const partTitle = paragraphs.length > 1 ? `${title} (${partIndex})` : title;
         partIndex++;
-        chunks.push({
-          title: partTitle,
-          content: part,
-          hasCode: part.includes("```"),
-        });
+        this.#pushBoundedMarkdownChunk(chunks, partTitle, part, part.includes("```"), maxChunkBytes);
         accumulator = [];
       };
 

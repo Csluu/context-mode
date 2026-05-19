@@ -113,10 +113,10 @@ After /clear or /compact: knowledge base and session stats preserved. Use `ctx p
 
 ## Windows notes
 
-**PowerShell cmdlets** — Sandbox uses bash. PowerShell cmdlets (`Format-List`, `Get-Culture`, etc.) fail with `command not found`. Wrap with `pwsh -NoProfile -Command "..."`.
+**PowerShell cmdlets** — The shell runtime is whatever context-mode detected/configured, often Git Bash on Windows. PowerShell cmdlets (`Format-List`, `Get-Culture`, etc.) fail under Git Bash with `command not found`. Wrap with `pwsh -NoProfile -Command "..."` when you need PowerShell.
 
-**Relative paths** — Sandbox CWD is temp dir, not project root. Convert to absolute paths. Ask user to confirm if unknown.
+**Relative paths** — Shell commands default to the resolved project root. Non-shell runtimes default to a temp script directory unless the tool supports and receives `cwd`. For subdirectory work, pass `projectDir` for the repo root and `cwd` for the subdirectory; convert ambiguous paths to absolute paths when needed.
 
-**Windows drive letters** — Sandbox runs Git Bash / MSYS2. `X:\path` → `/x/path` (lowercase, no `/mnt/`). Never emit `/mnt/<letter>/`.
+**Windows drive letters** — If the shell runtime is Git Bash / MSYS2, `X:\path` → `/x/path` (lowercase, no `/mnt/`). Never emit `/mnt/<letter>/` for this environment.
 
 **Quote paths** — Spaces in paths cause splits. Always double-quote: `rg "symbol" "$REPO_ROOT/some dir/Source"`.
