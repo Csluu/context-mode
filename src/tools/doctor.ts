@@ -7,7 +7,8 @@
  * renderer ReferenceError).
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { resolve } from "node:path";
 
 import { z } from "zod";
@@ -42,6 +43,9 @@ const IDLE_AFFECTED_HOSTS: ReadonlySet<string> = new Set([
   "vscode-copilot", "jetbrains-copilot", "antigravity", "zed",
 ]);
 
+const OPENCLAW_AGENTS = ["mono", "mochi", "miso", "mei"] as const;
+const PROMPT_MARKER = "context-mode: routing block injected";
+
 function integrationTier(adapter: HookAdapter): string {
   const caps = adapter.capabilities;
   if (caps.preToolUse && caps.postToolUse && caps.canModifyArgs) {
@@ -54,6 +58,127 @@ function integrationTier(adapter: HookAdapter): string {
     return "tier 2 MCP-only";
   }
   return "tier 3 instruction-only";
+}
+
+function readFileSafe(filePath: string): string {
+  try {
+    return readFileSync(filePath, "utf-8");
+  } catch {
+    return "";
+  }
+}
+
+function hasTomlSection(raw: string, section: string): boolean {
+  const escaped = section.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^\\s*\\[${escaped}\\]\\s*$`, "m").test(raw);
+}
+
+function hasHooksFeature(raw: string): boolean {
+  const lines = raw.split(/\r?\n/);
+  let inFeatures = false;
+  for (const line of lines) {
+    const section = line.match(/^\s*\[([^\]]+)\]\s*(?:#.*)?$/);
+    if (section) {
+      if (inFeatures) return false;
+      inFeatures = section[1] === "features";
+      continue;
+    }
+    if (inFeatures && /^\s*hooks\s*=\s*true\s*(?:#.*)?$/m.test(line)) return true;
+  }
+  return false;
+}
+
+function hasContextModeHost(raw: string): boolean {
+  const lines = raw.split(/\r?\n/);
+  let inContextEnv = false;
+  for (const line of lines) {
+    const section = line.match(/^\s*\[([^\]]+)\]\s*(?:#.*)?$/);
+    if (section) {
+      inContextEnv = section[1] === "mcp_servers.context-mode.env";
+      continue;
+    }
+    if (inContextEnv && /^\s*CONTEXT_MODE_HOST\s*=\s*["']codex["']\s*(?:#.*)?$/m.test(line)) return true;
+  }
+  return false;
+}
+
+function hasPromptMarkerEvidence(openclawHome: string, agent: string): boolean {
+  const roots = [
+    resolve(openclawHome, `workspace-${agent}`),
+    resolve(openclawHome, "agents", agent),
+  ];
+  const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
+  let inspected = 0;
+  let inspectedBytes = 0;
+
+  function visit(dir: string, depth: number): boolean {
+    if (depth > 4 || inspected > 150 || inspectedBytes > 8_000_000 || !existsSync(dir)) return false;
+    let entries: Array<{ name: string; isDirectory(): boolean }>;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+        .sort((a, b) => {
+          try {
+            return statSync(resolve(dir, b.name)).mtimeMs - statSync(resolve(dir, a.name)).mtimeMs;
+          } catch {
+            return 0;
+          }
+        });
+    } catch {
+      return false;
+    }
+    for (const entry of entries) {
+      if (entry.name === "node_modules" || entry.name === ".git") continue;
+      const full = resolve(dir, entry.name);
+      try {
+        const st = statSync(full);
+        if (st.mtimeMs < cutoff) continue;
+        if (entry.isDirectory()) {
+          if (visit(full, depth + 1)) return true;
+          continue;
+        }
+        if (!/\.(json|jsonl|log|txt|md)$/i.test(entry.name)) continue;
+        if (st.size > 256_000 || inspectedBytes + st.size > 8_000_000) continue;
+        inspected++;
+        inspectedBytes += st.size;
+        if (readFileSafe(full).includes(PROMPT_MARKER)) return true;
+      } catch {
+        // best effort
+      }
+    }
+    return false;
+  }
+
+  return roots.some((root) => visit(root, 0));
+}
+
+function auditOpenClawCodexHomes(): string[] {
+  const openclawHome = process.env.CONTEXT_MODE_OPENCLAW_HOME || process.env.OPENCLAW_HOME || resolve(homedir(), ".openclaw");
+  const agentsRoot = resolve(openclawHome, "agents");
+  if (!existsSync(agentsRoot)) {
+    return [`[OK] OpenClaw Codex homes: not detected at ${agentsRoot}`];
+  }
+
+  return OPENCLAW_AGENTS.map((agent) => {
+    const codexHome = resolve(agentsRoot, agent, "agent", "codex-home");
+    const configPath = resolve(codexHome, "config.toml");
+    const hooksPath = resolve(codexHome, "hooks.json");
+    const agentsPath = resolve(codexHome, "AGENTS.md");
+    const agentsOverridePath = resolve(codexHome, "AGENTS.override.md");
+    const config = readFileSafe(configPath);
+    const missing: string[] = [];
+    if (!existsSync(configPath)) missing.push("config.toml");
+    if (!existsSync(hooksPath)) missing.push("hooks.json");
+    if (config && !hasHooksFeature(config)) missing.push("hooks=true");
+    if (config && !hasTomlSection(config, "mcp_servers.context-mode")) missing.push("context-mode MCP");
+    if (config && !hasTomlSection(config, "mcp_servers.serena")) missing.push("serena MCP");
+    if (config && !hasContextModeHost(config)) missing.push("CONTEXT_MODE_HOST=codex");
+    if (!existsSync(agentsPath) && !existsSync(agentsOverridePath)) missing.push("AGENTS fallback");
+    if (!hasPromptMarkerEvidence(openclawHome, agent)) missing.push("recent prompt marker");
+
+    const prefix = missing.length === 0 ? "[OK]" : "[WARN]";
+    const detail = missing.length === 0 ? "complete" : `missing ${missing.join(", ")}`;
+    return `${prefix} OpenClaw Codex home ${agent}: ${detail} — ${codexHome}`;
+  });
 }
 
 /**
@@ -180,6 +305,12 @@ export function makeCtxDoctor(deps: DoctorDeps): ToolDefinition<DoctorInput, { c
       } else {
         lines.push("[WARN] Hooks: adapter detection unavailable");
       }
+
+      // OpenClaw projected Codex homes. This catches the most common failure
+      // mode after OpenClaw plugin/runtime updates: the global Codex config is
+      // healthy, but per-agent CODEX_HOME projections are stale or lack prompt
+      // fallback instructions.
+      lines.push(...auditOpenClawCodexHomes());
 
       // Router/config visibility. Keep this diagnostic local and non-fatal:
       // bad env config should be visible in doctor without crashing the tool.

@@ -1,10 +1,20 @@
 import "../setup-home";
 import { describe, it, expect, beforeEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { CodexAdapter } from "../../src/adapters/codex/index.js";
+
+function withMcpSentinel<T>(fn: (env: NodeJS.ProcessEnv) => T): T {
+  const dir = mkdtempSync(join(tmpdir(), "context-mode-codex-mcp-"));
+  writeFileSync(join(dir, `context-mode-mcp-ready-${process.pid}`), String(process.pid), "utf-8");
+  try {
+    return fn({ ...process.env, CONTEXT_MODE_MCP_SENTINEL_DIR: dir });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 describe("CodexAdapter", () => {
   let adapter: CodexAdapter;
@@ -273,6 +283,15 @@ describe("CodexAdapter", () => {
       expect(config).toHaveProperty("UserPromptSubmit");
       expect(config).toHaveProperty("Stop");
     });
+
+    it("matches OpenClaw Codex native tool names before routing runs", () => {
+      const config = adapter.generateHookConfig("/path/to/plugin");
+      const matcher = config.PreToolUse[0].matcher;
+
+      for (const tool of ["exec", "read", "Read", "grep", "Grep", "search", "Search"]) {
+        expect(matcher.split("|")).toContain(tool);
+      }
+    });
   });
 
   describe("validateHooks", () => {
@@ -326,6 +345,202 @@ describe("Codex pretooluse hook script", () => {
     const parsed = JSON.parse(stdout.trim());
     expect(parsed.hookSpecificOutput).toBeDefined();
     expect(parsed.hookSpecificOutput.hookEventName).toBe("PreToolUse");
+  });
+
+  it("denies OpenClaw Codex exec rg with a ctx_execute replacement", () => {
+    withMcpSentinel((env) => {
+      const hookScript = resolve(__dirname, "../../hooks/codex/pretooluse.mjs");
+      const input = JSON.stringify({
+        tool_name: "exec",
+        tool_input: { command: "rg TODO src" },
+        session_id: "test-exec-rg",
+        cwd: "/tmp",
+        hook_event_name: "PreToolUse",
+      });
+
+      const stdout = execFileSync(process.execPath, [hookScript], {
+        input,
+        encoding: "utf-8",
+        timeout: 10000,
+        env,
+      });
+
+      const parsed = JSON.parse(stdout.trim());
+      expect(parsed.hookSpecificOutput.permissionDecision).toBe("deny");
+      expect(parsed.hookSpecificOutput.permissionDecisionReason).toContain("mcp__context_mode__.ctx_execute");
+    });
+  });
+
+  it("denies OpenClaw Codex exec wrapping PowerShell search", () => {
+    withMcpSentinel((env) => {
+      const hookScript = resolve(__dirname, "../../hooks/codex/pretooluse.mjs");
+      const input = JSON.stringify({
+        tool_name: "exec",
+        tool_input: { command: 'pwsh -NoProfile -Command "rg TODO src"' },
+        session_id: "test-exec-pwsh",
+        cwd: "/tmp",
+        hook_event_name: "PreToolUse",
+      });
+
+      const stdout = execFileSync(process.execPath, [hookScript], {
+        input,
+        encoding: "utf-8",
+        timeout: 10000,
+        env,
+      });
+
+      const parsed = JSON.parse(stdout.trim());
+      expect(parsed.hookSpecificOutput.permissionDecision).toBe("deny");
+      expect(parsed.hookSpecificOutput.permissionDecisionReason).toContain("mcp__context_mode__.ctx_execute");
+    });
+  });
+
+  it("denies OpenClaw Codex exec containing tools.shell_command", () => {
+    withMcpSentinel((env) => {
+      const hookScript = resolve(__dirname, "../../hooks/codex/pretooluse.mjs");
+      const input = JSON.stringify({
+        tool_name: "exec",
+        tool_input: { command: 'tools.shell_command({"command":"rg TODO src"})' },
+        session_id: "test-exec-wrapper",
+        cwd: "/tmp",
+        hook_event_name: "PreToolUse",
+      });
+
+      const stdout = execFileSync(process.execPath, [hookScript], {
+        input,
+        encoding: "utf-8",
+        timeout: 10000,
+        env,
+      });
+
+      const parsed = JSON.parse(stdout.trim());
+      expect(parsed.hookSpecificOutput.permissionDecision).toBe("deny");
+      expect(parsed.hookSpecificOutput.permissionDecisionReason).toContain("mcp__context_mode__.ctx_execute");
+    });
+  });
+
+  it("denies uppercase OpenClaw Codex Search tool names", () => {
+    withMcpSentinel((env) => {
+      const hookScript = resolve(__dirname, "../../hooks/codex/pretooluse.mjs");
+      const input = JSON.stringify({
+        tool_name: "Search",
+        tool_input: { pattern: "TODO", path: "src" },
+        session_id: "test-search-uppercase",
+        cwd: "/tmp",
+        hook_event_name: "PreToolUse",
+      });
+
+      const stdout = execFileSync(process.execPath, [hookScript], {
+        input,
+        encoding: "utf-8",
+        timeout: 10000,
+        env,
+      });
+
+      const parsed = JSON.parse(stdout.trim());
+      expect(parsed.hookSpecificOutput.permissionDecision).toBe("deny");
+      expect(parsed.hookSpecificOutput.permissionDecisionReason).toContain("mcp__context_mode__.ctx_execute");
+    });
+  });
+
+  it("denies OpenClaw Codex exec containing nested PowerShell shell wrapper", () => {
+    withMcpSentinel((env) => {
+      const hookScript = resolve(__dirname, "../../hooks/codex/pretooluse.mjs");
+      const input = JSON.stringify({
+        tool_name: "exec",
+        tool_input: {
+          command: 'tools.shell_command({"command":"pwsh -NoProfile -Command \\"rg TODO src\\""})',
+        },
+        session_id: "test-exec-wrapper-nested-pwsh",
+        cwd: "/tmp",
+        hook_event_name: "PreToolUse",
+      });
+
+      const stdout = execFileSync(process.execPath, [hookScript], {
+        input,
+        encoding: "utf-8",
+        timeout: 10000,
+        env,
+      });
+
+      const parsed = JSON.parse(stdout.trim());
+      expect(parsed.hookSpecificOutput.permissionDecision).toBe("deny");
+      expect(parsed.hookSpecificOutput.permissionDecisionReason).toContain("mcp__context_mode__.ctx_execute");
+    });
+  });
+
+  it("allows OpenClaw Codex exec containing context-mode tool calls", () => {
+    withMcpSentinel((env) => {
+      const hookScript = resolve(__dirname, "../../hooks/codex/pretooluse.mjs");
+      const input = JSON.stringify({
+        tool_name: "exec",
+        tool_input: { command: 'tools.mcp__context_mode__ctx_read({"path":"src/server.ts","mode":"outline"})' },
+        session_id: "test-exec-context-mode",
+        cwd: "/tmp",
+        hook_event_name: "PreToolUse",
+      });
+
+      const stdout = execFileSync(process.execPath, [hookScript], {
+        input,
+        encoding: "utf-8",
+        timeout: 10000,
+        env,
+      });
+
+      const parsed = JSON.parse(stdout.trim());
+      expect(parsed.hookSpecificOutput.hookEventName).toBe("PreToolUse");
+      expect(parsed.hookSpecificOutput.permissionDecision).toBeUndefined();
+    });
+  });
+
+  it("denies context-mode wrapper text with a trailing noisy shell command", () => {
+    withMcpSentinel((env) => {
+      const hookScript = resolve(__dirname, "../../hooks/codex/pretooluse.mjs");
+      const input = JSON.stringify({
+        tool_name: "exec",
+        tool_input: {
+          command: 'tools.mcp__context_mode__ctx_read({"path":"src/server.ts","mode":"outline"}); rg TODO src',
+        },
+        session_id: "test-exec-context-mode-trailing-shell",
+        cwd: "/tmp",
+        hook_event_name: "PreToolUse",
+      });
+
+      const stdout = execFileSync(process.execPath, [hookScript], {
+        input,
+        encoding: "utf-8",
+        timeout: 10000,
+        env,
+      });
+
+      const parsed = JSON.parse(stdout.trim());
+      expect(parsed.hookSpecificOutput.permissionDecision).toBe("deny");
+      expect(parsed.hookSpecificOutput.permissionDecisionReason).toContain("mcp__context_mode__.ctx_execute");
+    });
+  });
+
+  it("denies shell wrapper text with a trailing noisy shell command", () => {
+    withMcpSentinel((env) => {
+      const hookScript = resolve(__dirname, "../../hooks/codex/pretooluse.mjs");
+      const input = JSON.stringify({
+        tool_name: "exec",
+        tool_input: { command: 'tools.shell_command({"command":"echo ok"}); rg TODO src' },
+        session_id: "test-exec-wrapper-trailing-shell",
+        cwd: "/tmp",
+        hook_event_name: "PreToolUse",
+      });
+
+      const stdout = execFileSync(process.execPath, [hookScript], {
+        input,
+        encoding: "utf-8",
+        timeout: 10000,
+        env,
+      });
+
+      const parsed = JSON.parse(stdout.trim());
+      expect(parsed.hookSpecificOutput.permissionDecision).toBe("deny");
+      expect(parsed.hookSpecificOutput.permissionDecisionReason).toContain("mcp__context_mode__.ctx_execute");
+    });
   });
 });
 

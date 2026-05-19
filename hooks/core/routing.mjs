@@ -153,6 +153,111 @@ function routeGuidance(decision, t) {
     "</context_guidance>",
   ].join("\n");
 }
+
+function codexEnforcementEnabled() {
+  return process.env.CONTEXT_MODE_CODEX_ENFORCE !== "0";
+}
+
+function toolCallHint(route, t) {
+  if (!route) return null;
+  if (route.tool === "ctx_read") {
+    return `${t("ctx_read")}(path: "...", mode: "outline" | "symbols" | "slice")`;
+  }
+  if (route.tool === "ctx_fetch_and_index") {
+    return `${t("ctx_fetch_and_index")}(url: "...", source: "...") then ${t("ctx_search")}(queries: [...])`;
+  }
+  if (route.tool === "ctx_batch_execute") {
+    return `${t("ctx_batch_execute")}(commands: [...], queries: [...])`;
+  }
+  const parser = route.parser ? `, parser: ${JSON.stringify(route.parser)}` : "";
+  const command = route.command ? `, code: ${JSON.stringify(route.command)}` : ', code: "..."';
+  return `${t(route.tool)}(language: "shell"${command}${parser})`;
+}
+
+function unwrapPowershellCommand(command) {
+  const trimmed = String(command ?? "").trim();
+  const powershell = trimmed.match(/^(?:pwsh|powershell)(?:\.exe)?\b[\s\S]*?(?:-Command|-c)\s+["']([^"']+)["']\s*$/i);
+  return powershell?.[1] ?? command;
+}
+
+function extractWrappedToolCommand(payload) {
+  const raw = String(payload ?? "").trim();
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const command = typeof parsed.command === "string"
+        ? parsed.command
+        : typeof parsed.cmd === "string"
+          ? parsed.cmd
+          : "";
+      if (command) return command;
+    }
+  } catch {
+    // Fall back to a bounded string-field extractor for non-JSON wrapper text.
+  }
+  const commandField = raw.match(/["'](?:command|cmd)["']\s*:\s*(["'])((?:\\.|(?!\1)[\s\S])*)\1/i);
+  if (commandField?.[2]) return commandField[2].replace(/\\(["'\\])/g, "$1");
+  return null;
+}
+
+function codexRouteDeny(decision, t) {
+  if (!codexEnforcementEnabled()) return null;
+  if (decision.decision === "pass-through") return null;
+  const route = decision.route ?? decision.segmentRoutes?.[0]?.route;
+  if (!route) return null;
+  const hint = toolCallHint(route, t);
+  if (!hint) return null;
+  const rule = decision.selectedRule ?? decision.segmentRoutes?.[0]?.selectedRule ?? "route";
+  const segmentNote = decision.segmentRoutes?.length
+    ? ` For compound commands, route the noisy segment(s) separately (${decision.segmentRoutes.length} recommendation(s)).`
+    : "";
+  return mcpRedirect({
+    action: "deny",
+    reason:
+      `context-mode: Codex cannot rewrite this noisy ${rule} command safely. ` +
+      `Retry with ${hint}.` +
+      segmentNote,
+    redirectMeta: {
+      tool: "Bash",
+      type: "bash-redirected",
+      bytesAvoided: 4096,
+      commandSummary: String(route.command ?? decision.segments?.[0]?.redactedShape ?? rule).slice(0, 200),
+    },
+  });
+}
+
+function codexReadDeny(filePath, bytes, t) {
+  if (!codexEnforcementEnabled()) return null;
+  return mcpRedirect({
+    action: "deny",
+    reason:
+      `context-mode: large file read blocked (${bytes} bytes). ` +
+      `Use ${t("ctx_read")}(path: ${JSON.stringify(filePath)}, mode: "outline") first, then bounded slice/symbol reads as needed.`,
+    redirectMeta: {
+      tool: "Read",
+      type: "read-redirected",
+      bytesAvoided: bytes,
+      commandSummary: String(filePath).slice(0, 200),
+    },
+  });
+}
+
+function codexGrepDeny(t) {
+  if (!codexEnforcementEnabled()) return null;
+  return mcpRedirect({
+    action: "deny",
+    reason:
+      `context-mode: broad search blocked. Use ${t("ctx_execute")}(language: "shell", code: "...", parser: "rg" | "grep") ` +
+      `or ${t("ctx_batch_execute")}(commands: [...], queries: [...]) so only compact matches enter context.`,
+    redirectMeta: {
+      tool: "Grep",
+      type: "grep-redirected",
+      bytesAvoided: 4096,
+      commandSummary: "native grep/search",
+    },
+  });
+}
 // Guidance throttle: show each advisory type at most once per session.
 // Hybrid approach:
 //   - In-memory Set for same-process (OpenCode ts-plugin, vitest)
@@ -600,6 +705,7 @@ const TOOL_ALIASES = {
   "read": "Read",
   "grep": "Grep",
   "search": "Grep",
+  "Search": "Grep",
   // Cursor
   "mcp_web_fetch": "WebFetch",
   "mcp_fetch_tool": "WebFetch",
@@ -673,9 +779,29 @@ function isExternalMcpTool(toolName) {
 
 function getShellCommand(toolInput) {
   if (!toolInput || typeof toolInput !== "object") return "";
-  if (typeof toolInput.command === "string") return toolInput.command;
-  if (typeof toolInput.cmd === "string") return toolInput.cmd;
-  return "";
+  const raw = typeof toolInput.command === "string"
+    ? toolInput.command
+    : typeof toolInput.cmd === "string"
+      ? toolInput.cmd
+      : "";
+  if (!raw) return "";
+
+  // OpenClaw Codex sometimes passes native tool-call wrappers through `exec`.
+  // If the wrapped call already targets context-mode, let it pass. If it wraps
+  // a shell command, classify the inner command so Codex can deny with the
+  // correct ctx_* replacement instead of missing the matcher entirely.
+  const trimmed = raw.trim();
+  if (/^tools\.mcp__context[-_]mode[^.\s]*[._]ctx_[a-z0-9_]*\s*\([\s\S]*\)\s*;?\s*$/i.test(trimmed)) {
+    return "";
+  }
+  const toolCall = trimmed.match(/^tools\.(?:shell_command|exec|local_shell)\s*\(([\s\S]*)\)\s*;?\s*$/i);
+  const payload = toolCall?.[1];
+  if (payload) {
+    const wrappedCommand = extractWrappedToolCommand(payload);
+    if (wrappedCommand) return getShellCommand({ command: wrappedCommand });
+  }
+
+  return unwrapPowershellCommand(trimmed);
 }
 
 function getCodexConfigDir(env = process.env) {
@@ -852,6 +978,21 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
     // Word-boundary guard prevents matching `gradle-wrapper-config`, `mvnDocker`, etc.
     if (/(^|\s|&&|\||\;)(\.\/gradlew|gradlew|gradle|\.\/mvnw|mvnw|mvn|\.\/sbt|sbt)(\s|$)/i.test(stripped)) {
       const safeCmd = command.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      if (platform === "codex") {
+        return mcpRedirect({
+          action: "deny",
+          reason:
+            `context-mode: build tool output blocked. Use ${t("ctx_execute")}` +
+            `(language: "shell", code: ${JSON.stringify(command)}, parser: "generic-failure") instead. ` +
+            "Codex hooks cannot safely rewrite this command.",
+          redirectMeta: {
+            tool: "Bash",
+            type: "bash-redirected",
+            bytesAvoided: 4096,
+            commandSummary: command.slice(0, 200),
+          },
+        });
+      }
       return mcpRedirect({
         action: "modify",
         updatedInput: {
@@ -876,6 +1017,11 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
             commandSummary: command.slice(0, 200),
           },
         };
+      }
+
+      if (platform === "codex") {
+        const codexDecision = codexRouteDeny(decision, t);
+        if (codexDecision) return codexDecision;
       }
 
       if (decision.decision === "recommend" || decision.decision === "classify-only") {
@@ -910,6 +1056,9 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
       try {
         const st = statSync(filePath);
         if (st.isFile() && st.size > 50_000) {
+          if (platform === "codex") {
+            return codexReadDeny(filePath, st.size, t);
+          }
           const decision = guidanceOnce("read", readGuidance, sessionId)
             ?? { action: "context", additionalContext: readGuidance };
           decision.redirectMeta = {
@@ -927,6 +1076,10 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
 
   // ─── Grep: nudge toward execute (once per session) ───
   if (canonical === "Grep") {
+    if (platform === "codex") {
+      const decision = codexGrepDeny(t);
+      if (decision) return decision;
+    }
     return guidanceOnce("grep", grepGuidance, sessionId);
   }
 

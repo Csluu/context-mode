@@ -203,8 +203,9 @@ describe("hook-side command routing", () => {
       "hook-rewrite-codex",
     );
 
-    expect(decision?.action).toBe("context");
-    expect(decision?.additionalContext).toContain("adapter cannot rewrite");
+    expect(decision?.action).toBe("deny");
+    expect(decision?.reason).toContain("Codex cannot rewrite");
+    expect(decision?.reason).toContain("mcp__context_mode__.ctx_execute");
   });
 
   it("fails closed when adapter identity is missing", () => {
@@ -280,8 +281,14 @@ describe("hook-side command routing", () => {
         sessionId,
       );
 
-      expect(decision?.action).toBe("context");
-      expect(decision?.additionalContext).toContain("adapter cannot rewrite");
+      if (adapter === "codex") {
+        expect(decision?.action).toBe("deny");
+        expect(decision?.reason).toContain("Codex cannot rewrite");
+        expect(decision?.reason).toContain("mcp__context_mode__.ctx_execute");
+      } else {
+        expect(decision?.action).toBe("context");
+        expect(decision?.additionalContext).toContain("adapter cannot rewrite");
+      }
     },
   );
 
@@ -326,8 +333,14 @@ describe("hook-side command routing", () => {
         sessionId,
       );
 
-      expect(decision?.action).toBe("context");
-      expect(decision?.additionalContext).toContain("adapter cannot rewrite");
+      if (adapter === "codex") {
+        expect(decision?.action).toBe("deny");
+        expect(decision?.reason).toContain("Codex cannot rewrite");
+        expect(decision?.reason).toContain("mcp__context_mode__.ctx_execute");
+      } else {
+        expect(decision?.action).toBe("context");
+        expect(decision?.additionalContext).toContain("adapter cannot rewrite");
+      }
     },
   );
 

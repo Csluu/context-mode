@@ -56,10 +56,11 @@ describe("context-mode hook test", () => {
     expect(result.status).toBe(0);
     expect(result.json).toMatchObject({
       adapter: "codex",
-      action: "context",
-      recommended: true,
+      action: "deny",
+      recommended: false,
       rewritten: false,
     });
-    expect(result.json.additionalContext).toContain("adapter cannot rewrite");
+    expect(result.json.reason).toContain("Codex cannot rewrite");
+    expect(result.json.reason).toContain("mcp__context_mode__.ctx_execute");
   });
 });

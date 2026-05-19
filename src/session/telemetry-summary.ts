@@ -23,6 +23,9 @@ export interface TelemetrySummary {
   readonly topParsers: ReadonlyArray<{ parser: string; count: number }>;
   readonly topLatencyTools: ReadonlyArray<{ tool: string; count: number; avgMs: number; maxMs: number }>;
   readonly topActors: ReadonlyArray<{ actor: string; count: number }>;
+  readonly topHooks: ReadonlyArray<{ hook: string; count: number }>;
+  readonly topHookActions: ReadonlyArray<{ action: string; count: number }>;
+  readonly topMatchedTools: ReadonlyArray<{ tool: string; count: number }>;
 }
 
 function sqlTimestamp(date: Date): string {
@@ -66,6 +69,27 @@ function topActorCounts(map: Map<string, number>): Array<{ actor: string; count:
     .slice(0, 10);
 }
 
+function topHookCounts(map: Map<string, number>): Array<{ hook: string; count: number }> {
+  return Array.from(map.entries())
+    .map(([hook, count]) => ({ hook, count }))
+    .sort((a, b) => b.count - a.count || a.hook.localeCompare(b.hook))
+    .slice(0, 10);
+}
+
+function topActionCounts(map: Map<string, number>): Array<{ action: string; count: number }> {
+  return Array.from(map.entries())
+    .map(([action, count]) => ({ action, count }))
+    .sort((a, b) => b.count - a.count || a.action.localeCompare(b.action))
+    .slice(0, 10);
+}
+
+function topMatchedToolCounts(map: Map<string, number>): Array<{ tool: string; count: number }> {
+  return Array.from(map.entries())
+    .map(([tool, count]) => ({ tool, count }))
+    .sort((a, b) => b.count - a.count || a.tool.localeCompare(b.tool))
+    .slice(0, 10);
+}
+
 function actorFromData(data: Record<string, unknown>): string | undefined {
   const adapter = typeof data.adapter === "string" && data.adapter.trim()
     ? data.adapter.trim()
@@ -82,6 +106,9 @@ function summarizeEvents(events: readonly StoredEvent[], scope: string): Telemet
   const rules = new Map<string, number>();
   const parsers = new Map<string, number>();
   const actors = new Map<string, number>();
+  const hooks = new Map<string, number>();
+  const hookActions = new Map<string, number>();
+  const matchedTools = new Map<string, number>();
   const latency = new Map<string, { count: number; totalMs: number; maxMs: number }>();
   let routeDecisions = 0;
   let parserRuns = 0;
@@ -95,6 +122,9 @@ function summarizeEvents(events: readonly StoredEvent[], scope: string): Telemet
     bytesReturned += Number(event.bytes_returned ?? 0);
     const data = parseJson(event.data);
     inc(actors, actorFromData(data));
+    inc(hooks, typeof data.hookEvent === "string" ? data.hookEvent : undefined);
+    inc(hookActions, typeof data.hookAction === "string" ? data.hookAction : undefined);
+    inc(matchedTools, typeof data.matchedToolName === "string" ? data.matchedToolName : undefined);
     if (event.type === "route-decision") {
       routeDecisions++;
       inc(rules, typeof data.selectedRule === "string" ? data.selectedRule : "no-rule");
@@ -138,6 +168,9 @@ function summarizeEvents(events: readonly StoredEvent[], scope: string): Telemet
     topParsers: topParserCounts(parsers),
     topLatencyTools,
     topActors: topActorCounts(actors),
+    topHooks: topHookCounts(hooks),
+    topHookActions: topActionCounts(hookActions),
+    topMatchedTools: topMatchedToolCounts(matchedTools),
   };
 }
 
@@ -155,6 +188,9 @@ function unavailable(scope: string): TelemetrySummary {
     topParsers: [],
     topLatencyTools: [],
     topActors: [],
+    topHooks: [],
+    topHookActions: [],
+    topMatchedTools: [],
   };
 }
 

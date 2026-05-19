@@ -61,6 +61,18 @@ function renderPersistentTelemetry(summary: TelemetrySummary): string[] {
     ...(summary.topActors.length > 0
       ? summary.topActors.map((row) => `- ${row.actor}: ${row.count}`)
       : ["- none"]),
+    "Top hook events:",
+    ...(summary.topHooks.length > 0
+      ? summary.topHooks.map((row) => `- ${row.hook}: ${row.count}`)
+      : ["- none"]),
+    "Top hook actions:",
+    ...(summary.topHookActions.length > 0
+      ? summary.topHookActions.map((row) => `- ${row.action}: ${row.count}`)
+      : ["- none"]),
+    "Top matched tools:",
+    ...(summary.topMatchedTools.length > 0
+      ? summary.topMatchedTools.map((row) => `- ${row.tool}: ${row.count}`)
+      : ["- none"]),
   ];
 }
 

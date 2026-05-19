@@ -19,10 +19,17 @@
  *   available.
  */
 
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 
 import { redactText } from "../filters/pipeline.js";
 import { SessionDB } from "./db.js";
+
+function codexHomeFingerprint(codexHome: string | undefined): string | undefined {
+  const trimmed = codexHome?.trim();
+  if (!trimmed) return undefined;
+  return `sha256:${createHash("sha256").update(trimmed).digest("hex").slice(0, 12)}`;
+}
 
 /**
  * Open the SessionDB at `dbPath`, find the latest session_id, and run
@@ -147,6 +154,10 @@ export function emitRouteDecisionEvent(opts: {
   confidence: number;
   adapter?: string;
   agent?: string;
+  codexHome?: string;
+  hookEvent?: string;
+  matchedToolName?: string;
+  hookAction?: string;
   safetyReason: string;
   adapterCapabilityReason?: string;
   diagnostics?: readonly string[];
@@ -167,6 +178,10 @@ export function emitRouteDecisionEvent(opts: {
           confidence: opts.confidence,
           ...(opts.adapter ? { adapter: opts.adapter } : {}),
           ...(opts.agent ? { agent: opts.agent } : {}),
+          ...(codexHomeFingerprint(opts.codexHome) ? { codexHome: codexHomeFingerprint(opts.codexHome) } : {}),
+          ...(opts.hookEvent ? { hookEvent: opts.hookEvent } : {}),
+          ...(opts.matchedToolName ? { matchedToolName: opts.matchedToolName } : {}),
+          ...(opts.hookAction ? { hookAction: opts.hookAction } : {}),
           safetyReason: opts.safetyReason,
           adapterCapabilityReason: opts.adapterCapabilityReason,
           diagnostics: opts.diagnostics ?? [],

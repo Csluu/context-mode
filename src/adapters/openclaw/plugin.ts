@@ -64,6 +64,12 @@ function isSystemReminderMessage(msg: string): boolean {
   return false;
 }
 
+function codexHomeFingerprint(codexHome: string | undefined): string | undefined {
+  const trimmed = codexHome?.trim();
+  if (!trimmed) return undefined;
+  return `sha256:${createHash("sha256").update(trimmed).digest("hex").slice(0, 12)}`;
+}
+
 // ── OpenClaw Plugin API Types ─────────────────────────────
 
 /** Context for auto-reply command handlers. */
@@ -275,6 +281,13 @@ function getToolError(event: AfterToolCallEvent): boolean {
   return Boolean(event.error || event.isError || event.is_error);
 }
 
+function agentFromSessionKey(sessionKey: string | undefined): string | undefined {
+  if (!sessionKey) return undefined;
+  const parts = sessionKey.split(":").filter(Boolean);
+  if (parts[0] === "agent" && parts[1]) return parts[1];
+  return parts[0];
+}
+
 // ── Module-level DB singleton ─────────────────────────────
 // Shared across all register() calls (one per agent session).
 // Lazy-initialized on first register() using the first projectDir seen.
@@ -343,8 +356,42 @@ export default {
     // promote to module scope.
     let resumeInjected = false;
     let sessionKey: string | undefined;
+    let openClawAgent: string | undefined;
     // Create temp session so after_tool_call events before session_start have a valid row
     db.ensureSession(sessionId, projectDir);
+
+    function emitRoutingTelemetry(
+      hookEvent: string,
+      toolName: string,
+      hookAction: string,
+      extra: Record<string, unknown> = {},
+      eventType = "route-decision",
+    ): void {
+      try {
+        const codexHome = codexHomeFingerprint(process.env.CODEX_HOME);
+        db.insertEvent(
+          sessionId,
+          {
+            type: eventType,
+            category: "routing",
+            data: JSON.stringify({
+              observedAt: new Date().toISOString(),
+              adapter: "openclaw",
+              ...(codexHome ? { codexHome } : {}),
+              ...(openClawAgent ? { agent: openClawAgent } : {}),
+              hookEvent,
+              matchedToolName: toolName || "unknown",
+              hookAction,
+              ...extra,
+            }),
+            priority: 1,
+          },
+          hookEvent,
+        );
+      } catch {
+        // Telemetry must never affect OpenClaw tool execution.
+      }
+    }
 
     const workspaceRouter = new WorkspaceRouter();
 
@@ -403,7 +450,6 @@ export default {
     api.on(
       "before_tool_call",
       async (event: unknown) => {
-        const { routing } = await initPromise;
         const e = event as BeforeToolCallEvent;
         const toolName = getToolName(e);
         const toolInputSlot = getToolInputSlot(e);
@@ -411,14 +457,22 @@ export default {
 
         let decision;
         try {
+          const { routing } = await initPromise;
           decision = routing.routePreToolUse(toolName, toolInput, projectDir, "openclaw");
         } catch {
+          emitRoutingTelemetry("before_tool_call", toolName, "route-error");
           return; // Routing failure → allow passthrough
         }
 
-        if (!decision) return; // No routing match → passthrough
+        if (!decision) {
+          return; // No routing match → passthrough
+        }
 
         log.debug("before_tool_call", { tool: toolName, action: decision.action });
+        emitRoutingTelemetry("before_tool_call", toolName, decision.action, {
+          hasUpdatedInput: Boolean(decision.updatedInput),
+          hasAdditionalContext: Boolean(decision.additionalContext),
+        });
 
         if (decision.action === "deny" || decision.action === "ask") {
           return {
@@ -593,6 +647,7 @@ export default {
 
           const key = e?.sessionKey;
           const resumedFrom = e?.resumedFrom;
+          openClawAgent = e?.agentId || agentFromSessionKey(key);
           log.debug("session_start", { sessionId: sid.slice(0, 8), sessionKey: key, resumedFrom });
 
           if (key) {
@@ -725,14 +780,21 @@ export default {
 
     api.on(
       "before_prompt_build",
-      () => {
-        if (!routingInstructions) return undefined;
+      async () => {
+        try {
+          await initPromise;
+          if (!routingInstructions) return undefined;
         log.debug("before_prompt_build[routing]", { hasInstructions: !!routingInstructions });
         // v1.0.107 — visible marker so OpenClaw users can verify the routing
         // block reached the model (Mickey-class verification path; mirrors
         // OpenCode + Pi adapters).
-        const marker = `<!-- context-mode: routing block injected (sessionID=${String(sessionId).slice(0, 8)}) -->`;
-        return { appendSystemContext: marker + "\n" + routingInstructions };
+        const marker = "<!-- context-mode: routing block injected -->";
+          emitRoutingTelemetry("before_prompt_build", "system-context", "append-routing", {}, "hook-routing");
+          return { appendSystemContext: marker + "\n" + routingInstructions };
+        } catch {
+          emitRoutingTelemetry("before_prompt_build", "system-context", "route-error", {}, "hook-routing");
+          return undefined;
+        }
       },
       { priority: 5 },
     );
@@ -787,8 +849,9 @@ export default {
     // back to flooding the context with raw tool output.
     api.on(
       "subagent_spawning",
-      (event: unknown) => {
+      async (event: unknown) => {
         try {
+          await initPromise;
           const e = (event ?? {}) as { input?: { prompt?: string } };
           const basePrompt = e?.input?.prompt ?? "";
           if (!routingInstructions) return undefined;
@@ -799,8 +862,10 @@ export default {
             basePromptLen: basePrompt.length,
             blockLen: routingInstructions.length,
           });
+          emitRoutingTelemetry("subagent_spawning", "subagent", "append-routing", {}, "hook-routing");
           return { inputOverride: { ...(e.input ?? {}), prompt: newPrompt } };
         } catch {
+          emitRoutingTelemetry("subagent_spawning", "subagent", "route-error", {}, "hook-routing");
           return undefined;
         }
       },

@@ -93,7 +93,7 @@ type HooksConfigReadResult =
 // Keep this as a single string literal — `codex.test.ts` drift-guard parses
 // the source with a `"([^"]+)"` regex.
 const PRE_TOOL_USE_MATCHER_PATTERN =
-  "local_shell|shell|shell_command|exec_command|Bash|Shell|apply_patch|Edit|Write|grep_files|ctx_execute|ctx_execute_file|ctx_batch_execute|ctx_fetch_and_index|ctx_search|ctx_index|mcp__";
+  "local_shell|shell|shell_command|exec_command|exec|Bash|Shell|read|Read|grep|Grep|search|Search|apply_patch|Edit|Write|grep_files|ctx_execute|ctx_execute_file|ctx_batch_execute|ctx_fetch_and_index|ctx_search|ctx_index|mcp__";
 
 const CODEX_HOOK_COMMANDS = {
   PreToolUse: "context-mode hook codex pretooluse",

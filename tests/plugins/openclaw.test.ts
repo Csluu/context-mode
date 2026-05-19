@@ -455,9 +455,21 @@ describe("OpenClawPlugin", () => {
       );
       expect(promptHook).toBeDefined();
 
-      const result = promptHook!.handler() as { appendSystemContext: string };
+      const result = await promptHook!.handler() as { appendSystemContext: string };
       expect(result).toHaveProperty("appendSystemContext");
       expect(result.appendSystemContext).toContain("context-mode");
+    });
+
+    it("awaits routing initialization on the first prompt build", async () => {
+      const mock = await createTestPlugin(join(tempDir, "prompt-build-first"));
+      const promptHook = mock.lifecycle.find(
+        (l) => l.event === "before_prompt_build" && l.opts?.priority === 5,
+      );
+      expect(promptHook).toBeDefined();
+
+      const result = await promptHook!.handler() as { appendSystemContext?: string } | undefined;
+      expect(result?.appendSystemContext).toContain("<!-- context-mode: routing block injected -->");
+      expect(result?.appendSystemContext).toContain("<context_window_protection>");
     });
 
     it("has priority 5", async () => {
@@ -475,13 +487,13 @@ describe("OpenClawPlugin", () => {
       const promptHook = mock.lifecycle.find(
         (l) => l.event === "before_prompt_build" && l.opts?.priority === 5,
       );
-      const result = promptHook!.handler() as { appendSystemContext?: string };
+      const result = await promptHook!.handler() as { appendSystemContext?: string };
       expect(result?.appendSystemContext).toBeDefined();
       // Hallmark of createRoutingBlock(toolNamer) — see hooks/routing-block.mjs:19.
       expect(result.appendSystemContext).toContain("<context_window_protection>");
       expect(result.appendSystemContext).toContain("<tool_selection_hierarchy>");
-      // OpenClaw tool-namer leaves bare ctx_* names unprefixed (no MCP wrap).
-      expect(result.appendSystemContext).toContain("ctx_batch_execute");
+      expect(result.appendSystemContext).toContain("mcp__context_mode__.ctx_batch_execute");
+      expect(result.appendSystemContext).not.toContain("context-mode__ctx_batch_execute");
     });
   });
 
@@ -571,7 +583,8 @@ describe("OpenClawPlugin", () => {
       const out = await tool!.execute("call-1", {});
 
       expect(out.content[0].text).toContain("context-mode guard");
-      expect(out.content[0].text).not.toContain("context-mode ctx_guard");
+      expect(out.content[0].text).not.toContain("CLI fallback: 'context-mode ctx_guard");
+      expect(out.content[0].text).toContain("mcp__context_mode__.ctx_guard");
     });
   });
 
@@ -644,7 +657,7 @@ describe("OpenClawPlugin", () => {
       const mock = await createTestPlugin(join(tempDir, "subagent-inject"));
       await flushInit(mock);
       const hook = mock.lifecycle.find((l) => l.event === "subagent_spawning");
-      const out = hook!.handler({
+      const out = await hook!.handler({
         input: { prompt: "Investigate the failing test." },
       }) as { inputOverride?: { prompt?: string } } | undefined;
       expect(out?.inputOverride?.prompt).toBeDefined();
@@ -656,7 +669,7 @@ describe("OpenClawPlugin", () => {
       const mock = await createTestPlugin(join(tempDir, "subagent-no-prompt"));
       await flushInit(mock);
       const hook = mock.lifecycle.find((l) => l.event === "subagent_spawning");
-      const out = hook!.handler({ input: {} }) as
+      const out = await hook!.handler({ input: {} }) as
         | { inputOverride?: { prompt?: string } }
         | undefined;
       expect(out?.inputOverride?.prompt).toContain("<context_window_protection>");
