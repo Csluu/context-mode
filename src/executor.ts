@@ -175,7 +175,7 @@ const OS_TMPDIR = (() => {
     const result = execFileSync(
       process.platform === "darwin" ? "getconf" : "mktemp",
       process.platform === "darwin" ? ["DARWIN_USER_TEMP_DIR"] : ["-u", "-d"],
-      { env: { ...process.env, TMPDIR: undefined as unknown as string }, encoding: "utf-8" },
+      { env: { ...process.env, TMPDIR: undefined as unknown as string }, encoding: "utf-8", timeout: 1_000 },
     ).trim();
     const dir = process.platform === "darwin" ? result : resolve(result, "..");
     if (dir && dir !== process.cwd()) return dir;

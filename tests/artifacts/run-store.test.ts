@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -170,6 +170,60 @@ describe("run artifact store", () => {
     }
   });
 
+  it("fetches explicit run ids older than the latest 200 artifacts", () => {
+    const projectDir = tempProject();
+    try {
+      const target = writeRunArtifact({
+        projectDir,
+        command: "target",
+        stdout: "target-output",
+        status: "succeeded",
+        now: new Date("2026-05-17T00:00:00.000Z"),
+        runId: "99999999-9999-4999-8999-999999999999",
+      });
+      for (let i = 0; i < 201; i++) {
+        writeRunArtifact({
+          projectDir,
+          command: `newer-${i}`,
+          stdout: `newer-${i}`,
+          status: "succeeded",
+          now: new Date(Date.parse("2026-05-18T00:00:00.000Z") + i * 1000),
+        });
+      }
+
+      expect(listRunArtifacts(projectDir, 200).some((record) => record.metadata.runId === target.metadata.runId)).toBe(false);
+      expect(fetchRunArtifact({ projectDir, runId: target.metadata.runId })?.raw).toBe("target-output");
+      expect(fetchRunArtifact({ projectDir, runId: "99999" })).toBeNull();
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("rejects ambiguous run id prefixes", () => {
+    const projectDir = tempProject();
+    try {
+      writeRunArtifact({
+        projectDir,
+        command: "first",
+        stdout: "first-output",
+        status: "succeeded",
+        runId: "123456aa-1111-4111-8111-111111111111",
+      });
+      writeRunArtifact({
+        projectDir,
+        command: "second",
+        stdout: "second-output",
+        status: "succeeded",
+        runId: "123456bb-2222-4222-8222-222222222222",
+      });
+
+      expect(fetchRunArtifact({ projectDir, runId: "123456" })).toBeNull();
+      expect(fetchRunArtifact({ projectDir, runId: "123456aa" })?.raw).toBe("first-output");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
   it("handles concurrent writes without run id collisions", async () => {
     const projectDir = tempProject();
     try {
@@ -197,15 +251,36 @@ describe("run artifact store", () => {
         command: "node noisy.js",
         stdout: "x".repeat(200),
         status: "succeeded",
-        maxRunBytes: 40,
+        maxRunBytes: 140,
       });
 
       const raw = readFileSync(record.metadata.rawPath, "utf8");
       expect(record.metadata.truncated).toBe(true);
       expect(record.metadata.redactedBytes).toBe(200);
       expect(record.metadata.storedBytes).toBe(Buffer.byteLength(raw));
+      expect(record.metadata.storedBytes).toBeLessThanOrEqual(140);
       expect(raw).toContain("sidecar truncated");
       expect(raw).toContain("original redacted bytes 200");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps storedBytes within tiny per-run caps", () => {
+    const projectDir = tempProject();
+    try {
+      const record = writeRunArtifact({
+        projectDir,
+        command: "node noisy.js",
+        stdout: "x".repeat(200),
+        status: "succeeded",
+        maxRunBytes: 40,
+      });
+
+      const raw = readFileSync(record.metadata.rawPath, "utf8");
+      expect(record.metadata.truncated).toBe(true);
+      expect(Buffer.byteLength(raw)).toBeLessThanOrEqual(40);
+      expect(record.metadata.storedBytes).toBe(Buffer.byteLength(raw));
     } finally {
       rmSync(projectDir, { recursive: true, force: true });
     }
@@ -248,6 +323,28 @@ describe("run artifact store", () => {
     }
   });
 
+  it("keeps UTF-8 tail previews on character boundaries", () => {
+    const projectDir = tempProject();
+    try {
+      const record = writeRunArtifact({
+        projectDir,
+        command: "npm test",
+        stdout: `prefix-${"middle-".repeat(50)}😀TAIL`,
+        status: "failed",
+      });
+
+      const tail = fetchRunArtifact({
+        projectDir,
+        runId: record.metadata.runId,
+        maxBytes: 8,
+        preview: "tail",
+      })?.raw ?? "";
+      expect(tail).toBe("😀TAIL");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
   it("does not delete the just-written artifact when project cap is smaller than one run", () => {
     const projectDir = tempProject();
     try {
@@ -262,6 +359,32 @@ describe("run artifact store", () => {
       expect(existsSync(record.metadata.rawPath)).toBe(true);
       expect(fetchRunArtifact({ projectDir, runId: record.metadata.runId, maxBytes: 20 })?.raw).toBe("x".repeat(20));
       expect(listRunArtifacts(projectDir, 10)).toHaveLength(1);
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("treats cleanup with no active policy as a no-op", () => {
+    const projectDir = tempProject();
+    try {
+      const first = writeRunArtifact({
+        projectDir,
+        command: "first",
+        stdout: "first-output",
+        status: "succeeded",
+        runId: "12121212-1212-4212-8212-121212121212",
+      });
+      const second = writeRunArtifact({
+        projectDir,
+        command: "second",
+        stdout: "second-output",
+        status: "succeeded",
+        runId: "34343434-3434-4434-8434-343434343434",
+      });
+
+      expect(cleanupRunArtifacts(projectDir)).toEqual({ deleted: 0, bytesDeleted: 0 });
+      expect(fetchRunArtifact({ projectDir, runId: first.metadata.runId })?.raw).toBe("first-output");
+      expect(fetchRunArtifact({ projectDir, runId: second.metadata.runId })?.raw).toBe("second-output");
     } finally {
       rmSync(projectDir, { recursive: true, force: true });
     }
@@ -355,6 +478,58 @@ describe("run artifact store", () => {
       expect(fetchRunArtifact({ projectDir, latest: true, maxBytes: 100 })).toBeNull();
     } finally {
       rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores symlinked artifact directories outside the run-store root", () => {
+    const projectDir = tempProject();
+    const outsideProjectDir = tempProject();
+    try {
+      const outside = writeRunArtifact({
+        projectDir: outsideProjectDir,
+        command: "outside",
+        stdout: "outside-output",
+        status: "succeeded",
+        now: new Date("2026-05-17T00:00:00.000Z"),
+        runId: "abababab-abab-4bab-8bab-abababababab",
+      });
+      const dayDir = join(getRunArtifactRoot(projectDir), "2026-05-17");
+      mkdirSync(dayDir, { recursive: true });
+      const linkPath = join(dayDir, "linked-artifact");
+      try {
+        symlinkSync(outside.artifactDir, linkPath, process.platform === "win32" ? "junction" : "dir");
+      } catch {
+        return;
+      }
+
+      expect(listRunArtifacts(projectDir, 10).map((record) => record.metadata.runId)).not.toContain(outside.metadata.runId);
+      expect(fetchRunArtifact({ projectDir, latest: true, maxBytes: 100 })).toBeNull();
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+      rmSync(outsideProjectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects symlinked .context-mode roots before writing artifacts", () => {
+    const projectDir = tempProject();
+    const outsideDir = tempProject();
+    try {
+      const contextDir = join(projectDir, ".context-mode");
+      try {
+        symlinkSync(outsideDir, contextDir, process.platform === "win32" ? "junction" : "dir");
+      } catch {
+        return;
+      }
+
+      expect(() => writeRunArtifact({
+        projectDir,
+        command: "npm test",
+        stdout: "should-not-write-outside",
+      })).toThrow(/artifact path must not be a symlink|artifact path escapes root/);
+      expect(existsSync(join(outsideDir, "runs"))).toBe(false);
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+      rmSync(outsideDir, { recursive: true, force: true });
     }
   });
 

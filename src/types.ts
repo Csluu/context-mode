@@ -78,6 +78,7 @@ export interface IndexResult {
   label: string;
   totalChunks: number;
   codeChunks: number;
+  indexedBytes: number;
 }
 
 /**

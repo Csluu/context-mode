@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
+import { writeRunArtifact } from "../../src/artifacts/run-store.js";
 import { createGuardScanReport, scanGuardBuffer, scanGuardText } from "../../src/guard/scanner.js";
 import { makeCtxGuard } from "../../src/tools/guard.js";
 import type { ToolContext } from "../../src/tools/types.js";
@@ -69,7 +70,7 @@ describe("ctx_guard tool", () => {
     try {
       const file = join(dir, "binaryish.log");
       writeFileSync(file, Buffer.from([0, 0, 0, 1, 2, 3]));
-      const tool = makeCtxGuard({ getProjectDir: () => process.cwd() });
+      const tool = makeCtxGuard({ getProjectDir: () => dir });
       const result = await tool.handler({ mode: "scan-file", path: file, json: true }, testContext());
       const payload = JSON.parse(result.content[0].text);
 
@@ -86,7 +87,7 @@ describe("ctx_guard tool", () => {
     try {
       const file = join(dir, "safe.log");
       writeFileSync(file, "SAFE_PAYLOAD_SHOULD_NOT_BE_RETURNED");
-      const tool = makeCtxGuard({ getProjectDir: () => process.cwd() });
+      const tool = makeCtxGuard({ getProjectDir: () => dir });
       const result = await tool.handler({ mode: "scan-file", path: file, json: true }, testContext());
       const payload = JSON.parse(result.content[0].text);
 
@@ -98,6 +99,97 @@ describe("ctx_guard tool", () => {
       expect(JSON.parse(preview.content[0].text).redactedPreview).toContain("SAFE_PAYLOAD_SHOULD_NOT_BE_RETURNED");
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("scan-file rejects paths outside the project root by default", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "ctx-guard-project-"));
+    const outsideDir = mkdtempSync(join(tmpdir(), "ctx-guard-outside-"));
+    try {
+      const file = join(outsideDir, "outside.log");
+      writeFileSync(file, "outside payload");
+      const tool = makeCtxGuard({ getProjectDir: () => projectDir });
+      const result = await tool.handler({ mode: "scan-file", path: file, json: true }, testContext());
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("CTX_GUARD_PATH_OUTSIDE_PROJECT");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it("scan-file applies the Read deny checker before scanning", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ctx-guard-deny-"));
+    try {
+      const file = join(dir, "blocked.log");
+      writeFileSync(file, "blocked payload");
+      const tool = makeCtxGuard({
+        getProjectDir: () => dir,
+        checkFilePath: () => ({ content: [{ type: "text", text: "DENIED_BY_TEST" }], isError: true }),
+      });
+      const result = await tool.handler({ mode: "scan-file", path: file, json: true }, testContext());
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("DENIED_BY_TEST");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("scan-file honors an explicit projectDir override", async () => {
+    const defaultProjectDir = mkdtempSync(join(tmpdir(), "ctx-guard-default-"));
+    const targetProjectDir = mkdtempSync(join(tmpdir(), "ctx-guard-target-"));
+    try {
+      const file = join(targetProjectDir, "target.log");
+      writeFileSync(file, "target project payload");
+      const tool = makeCtxGuard({
+        getProjectDir: () => defaultProjectDir,
+        resolveProjectDirOverride: (projectDir) => projectDir,
+      });
+
+      const result = await tool.handler({ mode: "scan-file", path: "target.log", projectDir: targetProjectDir, json: true }, testContext());
+
+      expect(result.isError).toBeFalsy();
+      expect(JSON.parse(result.content[0].text).status).toBe("allow");
+    } finally {
+      rmSync(defaultProjectDir, { recursive: true, force: true });
+      rmSync(targetProjectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("scan-sidecars honors an explicit projectDir override", async () => {
+    const defaultProjectDir = mkdtempSync(join(tmpdir(), "ctx-guard-sidecar-default-"));
+    const targetProjectDir = mkdtempSync(join(tmpdir(), "ctx-guard-sidecar-target-"));
+    try {
+      writeRunArtifact({
+        projectDir: defaultProjectDir,
+        command: "default",
+        stdout: "default output",
+        status: "succeeded",
+        runId: "11111111-1111-4111-8111-111111111111",
+      });
+      writeRunArtifact({
+        projectDir: targetProjectDir,
+        command: "target",
+        stdout: "target output",
+        status: "succeeded",
+        runId: "22222222-2222-4222-8222-222222222222",
+      });
+      const tool = makeCtxGuard({
+        getProjectDir: () => defaultProjectDir,
+        resolveProjectDirOverride: (projectDir) => projectDir,
+      });
+
+      const result = await tool.handler({ mode: "scan-sidecars", projectDir: targetProjectDir, latest: true, json: true }, testContext());
+      const payload = JSON.parse(result.content[0].text);
+
+      expect(result.isError).toBeFalsy();
+      expect(payload.subjects).toHaveLength(1);
+      expect(payload.subjects[0].pathOrId).toBe("22222222-2222-4222-8222-222222222222");
+    } finally {
+      rmSync(defaultProjectDir, { recursive: true, force: true });
+      rmSync(targetProjectDir, { recursive: true, force: true });
     }
   });
 });

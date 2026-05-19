@@ -32,3 +32,5 @@ context-mode-guidance-*/
 !/docs/rtk-spec-validation-plan.md
 !/docs/AGENT_PROJECT_OVERVIEW.md
 !/docs/FORK_HANDOFF.md
+!/docs/fork-vs-upstream-test-plan.md
+.compare/

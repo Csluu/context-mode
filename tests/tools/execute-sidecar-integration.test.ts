@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -142,6 +142,7 @@ describe("ctx_execute sidecar integration", () => {
           ...process.env,
           CLAUDE_PROJECT_DIR: activeProjectDir,
           CONTEXT_MODE_PROJECT_DIR: activeProjectDir,
+          CONTEXT_MODE_ALLOWED_PROJECT_DIRS: targetProjectDir,
           CONTEXT_MODE_DISABLE_VERSION_CHECK: "1",
         },
       });
@@ -195,6 +196,62 @@ describe("ctx_execute sidecar integration", () => {
     }
   }, 30_000);
 
+  it("rejects projectDir and cwd symlinks that escape the effective project root", async () => {
+    const activeProjectDir = mkdtempSync(join(tmpdir(), "context-mode-execute-active-"));
+    const outsideDir = mkdtempSync(join(tmpdir(), "context-mode-execute-outside-"));
+    const linkedProjectDir = join(activeProjectDir, "linked-project");
+    const linkedCwd = join(activeProjectDir, "linked-cwd");
+    try {
+      try {
+        symlinkSync(outsideDir, linkedProjectDir, process.platform === "win32" ? "junction" : "dir");
+        symlinkSync(outsideDir, linkedCwd, process.platform === "win32" ? "junction" : "dir");
+      } catch {
+        return;
+      }
+      const proc = spawn("node", [serverEntry], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          CLAUDE_PROJECT_DIR: activeProjectDir,
+          CONTEXT_MODE_PROJECT_DIR: activeProjectDir,
+          CONTEXT_MODE_DISABLE_VERSION_CHECK: "1",
+        },
+      });
+      processes.push(proc);
+
+      const init = waitForRpc(proc, 60);
+      sendRpc(proc, {
+        jsonrpc: "2.0",
+        id: 60,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "symlink-projectdir-test", version: "1.0" } },
+      });
+      expect((await init)?.error).toBeUndefined();
+      sendRpc(proc, { jsonrpc: "2.0", method: "notifications/initialized" });
+
+      const projectResult = await callTool(proc, 61, "ctx_execute", {
+        language: "shell",
+        projectDir: linkedProjectDir,
+        code: "pwd",
+      });
+      expect(projectResult?.error).toBeUndefined();
+      expect(projectResult?.result?.isError).toBe(true);
+      expect(projectResult?.result?.content?.[0]?.text ?? "").toContain("Invalid projectDir override");
+
+      const cwdResult = await callTool(proc, 62, "ctx_execute", {
+        language: "shell",
+        cwd: "linked-cwd",
+        code: "pwd",
+      });
+      expect(cwdResult?.error).toBeUndefined();
+      expect(cwdResult?.result?.isError).toBe(true);
+      expect(cwdResult?.result?.content?.[0]?.text ?? "").toContain("Invalid cwd");
+    } finally {
+      rmSync(activeProjectDir, { recursive: true, force: true });
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("uses cwd for subdirectory execution while keeping sidecars under projectDir", async () => {
     const activeProjectDir = mkdtempSync(join(tmpdir(), "context-mode-execute-cwd-active-"));
     const targetProjectDir = mkdtempSync(join(tmpdir(), "context-mode-execute-cwd-target-"));
@@ -208,6 +265,7 @@ describe("ctx_execute sidecar integration", () => {
           ...process.env,
           CLAUDE_PROJECT_DIR: activeProjectDir,
           CONTEXT_MODE_PROJECT_DIR: activeProjectDir,
+          CONTEXT_MODE_ALLOWED_PROJECT_DIRS: targetProjectDir,
           CONTEXT_MODE_DISABLE_VERSION_CHECK: "1",
         },
       });
@@ -271,6 +329,7 @@ describe("ctx_execute sidecar integration", () => {
           ...process.env,
           CLAUDE_PROJECT_DIR: activeProjectDir,
           CONTEXT_MODE_PROJECT_DIR: activeProjectDir,
+          CONTEXT_MODE_ALLOWED_PROJECT_DIRS: targetProjectDir,
           CONTEXT_MODE_DISABLE_VERSION_CHECK: "1",
         },
       });

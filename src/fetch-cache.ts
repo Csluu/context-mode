@@ -1,15 +1,31 @@
+import { createHash } from "node:crypto";
+
+function shortUrlHash(url: string): string {
+  return createHash("sha256").update(url).digest("hex").slice(0, 12);
+}
+
+function sanitizeSourceLabel(source: string | undefined, url: string): string {
+  const explicit = source?.trim();
+  if (explicit) return explicit.replace(/\s+/g, " ").slice(0, 160);
+
+  try {
+    const parsed = new URL(url);
+    parsed.username = "";
+    parsed.password = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString().replace(/\/$/, "").slice(0, 160) || "fetched-url";
+  } catch {
+    return "fetched-url";
+  }
+}
+
 /**
  * Cache-key / storage-label composition for ctx_fetch_and_index.
  *
- * Two distinct URLs that share a user-supplied `source` label MUST NOT collide
- * in the cache (or in FTS5 storage, since indexing dedups by label). Compose
- * `${source}::${url}` whenever a `source` is explicitly provided so cache
- * lookup, dedup, and re-indexing are all per-(source,url). When no `source`
- * is provided the URL itself is the unique key — no composition needed.
- *
- * `ctx_search(source: "Docs")` continues to work because LIKE-mode source
- * filtering matches on the substring "Docs" inside "Docs::https://…".
+ * The full URL remains part of identity through a hash, but token-bearing query
+ * strings and credentials are not exposed in user-visible source labels.
  */
 export function composeFetchCacheKey(source: string | undefined, url: string): string {
-  return source === undefined ? url : `${source}::${url}`;
+  return `${sanitizeSourceLabel(source, url)}#url-${shortUrlHash(url)}`;
 }

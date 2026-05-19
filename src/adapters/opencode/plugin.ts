@@ -446,7 +446,7 @@ async function createContextModePlugin(ctx: PluginContext) {
           }
 
           const result = await mod.withProjectDirOverride(
-            { projectDir: project, sessionId: toolCtx.sessionID },
+            { projectDir: project, sessionId: toolCtx.sessionID, trusted: true },
             async () => registered.handler(parsedArgs),
           );
 

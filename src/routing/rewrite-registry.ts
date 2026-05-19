@@ -212,6 +212,17 @@ function isNodeLintCommand(command: ClassifiedCommand): boolean {
   return /^(lint|eslint)(?::|$)/i.test(nodeScriptName(command));
 }
 
+function isMutatingLintCommand(command: ClassifiedCommand): boolean {
+  const script = nodeScriptName(command);
+  if (/(^|:)fix($|:)/i.test(script)) return true;
+  const argv = command.argv.map((value) => value.toLowerCase());
+  return argv.some((value) =>
+    value === "--fix"
+    || value === "--write"
+    || value === "fix"
+  );
+}
+
 function isNodeTypecheckCommand(command: ClassifiedCommand): boolean {
   const start = commandStartIndex(command);
   const first = arg(command, start);
@@ -534,9 +545,10 @@ export const REWRITE_RULES: readonly RouteRule[] = [
     dangerLevel: "low",
     autoRewriteEligible: false,
     supportsJsonFirst: false,
-    knownFlagConflicts: ["--watch", "--fix"],
+    knownFlagConflicts: ["--watch", "--fix", "--write"],
     match(command) {
       if (!isNodeLintCommand(command)) return null;
+      if (isMutatingLintCommand(command)) return null;
       return { confidence: 0.75, reasons: ["lint output can be failure-focused and sidecar-backed"] };
     },
     buildRoute(command) {

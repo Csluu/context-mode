@@ -5,7 +5,15 @@
       "mcp__plugin_context-mode_context-mode__ctx_search",
       "mcp__plugin_context-mode_context-mode__ctx_execute",
       "mcp__plugin_context-mode_context-mode__ctx_index",
-      "mcp__plugin_context-mode_context-mode__ctx_read"
+      "mcp__plugin_context-mode_context-mode__ctx_read",
+      "mcp__plugin_context-mode_context-mode__ctx_doctor",
+      "Bash(grep -B1 -A2 \"context-mode\\\\\\\\\\\\\\\\hooks\\\\|GitHub/context-mode\\\\|GitHub\\\\\\\\\\\\\\\\context-mode\")",
+      "mcp__plugin_context-mode_context-mode__ctx_fetch_and_index",
+      "Bash(mv read.ts ctx-read.ts)",
+      "Bash(mv route.ts ctx-route.ts)",
+      "Bash(mv execute.ts ctx-execute.ts)",
+      "Bash(mv search.ts ctx-search.ts)",
+      "Bash(mv batch.ts ctx-batch.ts)"
     ]
   }
 }

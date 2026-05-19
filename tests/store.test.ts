@@ -7,7 +7,7 @@
 
 import { describe, test, expect } from "vitest";
 import { strict as assert } from "node:assert";
-import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, unlinkSync, rmSync, symlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -238,6 +238,42 @@ describe("Basic Indexing", () => {
     assert.ok(result.codeChunks > 0, "React docs have code blocks");
     assert.equal(result.label, "Context7: React useEffect");
     store.close();
+  });
+
+  test("path indexing reads the opened file when a symlink changes during validation", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "context-mode-store-race-"));
+    const store = createStore();
+    try {
+      const allowedPath = join(tmp, "allowed.md");
+      const deniedPath = join(tmp, "denied.md");
+      const linkPath = join(tmp, "link.md");
+      writeFileSync(allowedPath, "# Allowed\n\nuniqueAllowedRaceToken\n", "utf8");
+      writeFileSync(deniedPath, "# Denied\n\nuniqueDeniedRaceToken\n", "utf8");
+      try {
+        symlinkSync(allowedPath, linkPath, "file");
+      } catch {
+        return;
+      }
+
+      let swapped = false;
+      store.index({
+        path: linkPath,
+        source: "race-link",
+        validatePath: () => {
+          if (swapped) return;
+          swapped = true;
+          unlinkSync(linkPath);
+          symlinkSync(deniedPath, linkPath, "file");
+        },
+      });
+
+      expect(swapped).toBe(true);
+      expect(store.search("uniqueAllowedRaceToken", 1)).toHaveLength(1);
+      expect(store.search("uniqueDeniedRaceToken", 1)).toHaveLength(0);
+    } finally {
+      store.close();
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   test("index throws when neither content nor path provided", () => {
@@ -493,6 +529,23 @@ describe("BM25 Search", () => {
     const results = store.search("Install package", 1);
     assert.ok(results.length > 0);
     assert.equal(results[0].source, "Context7: React docs");
+    store.close();
+  });
+
+  test("source filter treats LIKE wildcards as literal text", () => {
+    const store = createStore();
+    store.index({
+      content: "# Literal Percent\n\nwildcardprobe literal percent source.",
+      source: "foo% docs",
+    });
+    store.index({
+      content: "# Similar Prefix\n\nwildcardprobe similar source.",
+      source: "fooX docs",
+    });
+
+    const results = store.search("wildcardprobe", 10, "foo%");
+    assert.ok(results.length > 0);
+    assert.deepEqual([...new Set(results.map((r) => r.source))], ["foo% docs"]);
     store.close();
   });
 
@@ -1138,6 +1191,45 @@ describe("Max Chunk Size", () => {
       codeResults[0].content.includes("```typescript"),
       "Code block should be intact with opening fence",
     );
+    store.close();
+  });
+
+  test("splits very long non-code lines without emitting oversized chunks", () => {
+    const store = createStore();
+    const content = `# Long Line\n\n${"longLineToken ".repeat(600)}`;
+
+    const result = store.index({ content, source: "long-line-chunk-test" });
+    const results = store.search("longLineToken", 100, "long-line-chunk-test");
+
+    assert.ok(result.totalChunks > 1, `Expected long line to split, got ${result.totalChunks}`);
+    assert.ok(results.length > 1, "Expected search to return split long-line chunks");
+    for (const chunk of results) {
+      assert.ok(
+        Buffer.byteLength(chunk.content) <= 4096,
+        `Expected chunk <= 4096 bytes, got ${Buffer.byteLength(chunk.content)}`,
+      );
+    }
+    store.close();
+  });
+
+  test("recognizes markdown closing fences with extra backticks while splitting", () => {
+    const store = createStore();
+    const content = [
+      "# Fence Section",
+      "",
+      "```js",
+      "const marker = 'extra-fence-close';",
+      "````",
+      `${"afterFenceToken ".repeat(600)}`,
+    ].join("\n");
+
+    store.index({ content, source: "extra-fence-close-test" });
+    const results = store.search("afterFenceToken", 20, "extra-fence-close-test");
+
+    assert.ok(results.length > 0, "Expected prose after the fence to be searchable");
+    for (const chunk of results) {
+      assert.ok(!chunk.content.includes("```js"), "Prose chunks should not absorb the code fence");
+    }
     store.close();
   });
 });

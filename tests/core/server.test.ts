@@ -787,6 +787,10 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
     });
   }
 
+  function toMsysPath(filePath: string): string {
+    return `/${filePath[0].toLowerCase()}${filePath.slice(2).replace(/\\/g, "/")}`;
+  }
+
   // MCP server processes JSON-RPC requests concurrently — we have to wait for
   // each response before sending the next one in tests that depend on order
   // (e.g. index then search). The shared `collectRpcResponses` helper kills
@@ -895,6 +899,31 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
       expect(searchResp?.error).toBeUndefined();
       const searchText = searchResp?.result?.content?.[0]?.text ?? "";
       expect(searchText).toContain(uniqueMarker);
+    } finally {
+      try { proc.kill("SIGTERM"); } catch { /* best effort */ }
+    }
+  }, 30_000);
+
+  test.runIf(process.platform === "win32")("MSYS-style absolute path is normalized before ctx_index reads it", async () => {
+    const absFile = join(ctxProjectDir, ctxFileName);
+    const msysFile = toMsysPath(absFile);
+    const proc = spawnServerWithProjectDir("/non-existent-dir-on-purpose");
+    try {
+      await awaitRpc(proc, 1, {
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "ctx-index-msys-abs", version: "1.0" } },
+      });
+      sendRpc(proc, { jsonrpc: "2.0", method: "notifications/initialized" });
+
+      const indexResp = await awaitRpc(proc, 100, {
+        jsonrpc: "2.0", id: 100, method: "tools/call",
+        params: { name: "ctx_index", arguments: { path: msysFile } },
+      });
+
+      expect(indexResp?.error).toBeUndefined();
+      const indexText = indexResp?.result?.content?.[0]?.text ?? "";
+      expect(indexText).toMatch(/Indexed \d+ section/);
+      expect(indexText).toContain(`from: ${absFile}`);
     } finally {
       try { proc.kill("SIGTERM"); } catch { /* best effort */ }
     }
@@ -1775,6 +1804,13 @@ describe("Platform-aware session paths via adapter", () => {
     expect(serverSrc).toContain("function resolveStatsSessionId");
     expect(serverSrc).toContain("latest observed project session_meta row");
     expect(serverSrc).toContain("explicit ctx_stats session input");
+  });
+
+  test("projectDir overrides resolve attribution from the target project session DB", () => {
+    expect(serverSrc).toContain("resolveSessionIdFromSessionDB({ projectDir: override.projectDir })");
+    expect(serverSrc).toContain("const __cachedSessionIds = new Map");
+    expect(serverSrc).toContain("`${resolve(sessionsDir)}\\0${resolve(projectDir)}`");
+    expect(serverSrc).not.toContain("sessionId: currentAttribution()?.sessionId");
   });
 
   // ── Adapter methods used for session paths ──
@@ -2786,6 +2822,13 @@ describe("SSRF guard — ssrfGuard policy in src/server.ts", () => {
     expect(serverSrc).toContain('verdict === "private" && !allowPrivate');
   });
 
+  test("child fetch guard uses the same private-network default as the parent guard", () => {
+    expect(serverSrc).toContain('const blockPrivate = process.env.CTX_FETCH_ALLOW_PRIVATE !== "1"');
+    expect(serverSrc).toContain("const BLOCK_PRIVATE = ${JSON.stringify(blockPrivate)}");
+    expect(serverSrc).toContain("BLOCK_PRIVATE && verdict === 'private'");
+    expect(serverSrc).not.toContain("CTX_FETCH_STRICT");
+  });
+
   test("ssrfGuard runs BEFORE cache lookup (poisoned cache defense)", () => {
     // fetchOneUrl must call ssrfGuard before getSourceMeta — otherwise a
     // previously-poisoned source label could serve attacker content from cache.
@@ -3044,6 +3087,15 @@ describe("ctx_fetch_and_index cache key includes URL (Fix 6/10)", () => {
     const k1 = composeFetchCacheKey("Docs", "https://x.com/a");
     const k2 = composeFetchCacheKey("Docs", "https://x.com/a");
     expect(k1).toBe(k2);
+  });
+
+  test("composeFetchCacheKey keeps URL secrets out of visible labels", async () => {
+    const { composeFetchCacheKey } = await import("../../src/fetch-cache.js");
+    const key = composeFetchCacheKey(undefined, "https://example.com/docs?token=shh#frag");
+    expect(key).toContain("https://example.com/docs");
+    expect(key).toContain("#url-");
+    expect(key).not.toContain("token=shh");
+    expect(key).not.toContain("#frag");
   });
 
   test("server.ts uses composeFetchCacheKey for cache lookup (no bare-label collision)", () => {

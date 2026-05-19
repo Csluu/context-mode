@@ -2,9 +2,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
-import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, renameSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync } from "node:fs";
+import { existsSync, unlinkSync, readFileSync, writeFileSync, renameSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync, realpathSync } from "node:fs";
 import { execSync, spawnSync, type ChildProcess, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
-import { join, dirname, resolve, sep, isAbsolute, relative } from "node:path";
+import { join, dirname, resolve, sep, isAbsolute, relative, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir, cpus } from "node:os";
 import { request as httpsRequest } from "node:https";
@@ -38,7 +38,7 @@ import {
 } from "./runtime.js";
 import { classifyNonZeroExit } from "./exit-classify.js";
 import { startLifecycleGuard } from "./lifecycle.js";
-import { hashProjectDirCanonical, hashProjectDirLegacy, resolveContentStorePath, resolveSessionDbPath, SessionDB } from "./session/db.js";
+import { hashProjectDirCanonical, hashProjectDirLegacy, resolveContentStorePath, resolveSessionDbPath, resolveSessionPath, SessionDB } from "./session/db.js";
 import { purgeSession } from "./session/purge.js";
 import {
   emitCacheHitEvent,
@@ -247,14 +247,26 @@ const originalRegisterTool = server.registerTool.bind(server);
   return (originalRegisterTool as unknown as (...callArgs: unknown[]) => unknown)(...args);
 };
 
-type ToolContextOverride = { projectDir: string; sessionId?: string };
+type ToolContextOverride = { projectDir: string; sessionId?: string; trusted?: boolean };
 const projectDirOverride = new AsyncLocalStorage<ToolContextOverride>();
 
 export async function withProjectDirOverride<T>(
   projectDir: string | ToolContextOverride,
   fn: () => Promise<T>,
 ): Promise<T> {
-  const ctx = typeof projectDir === "string" ? { projectDir } : projectDir;
+  const inherited = projectDirOverride.getStore();
+  const input = typeof projectDir === "string" ? { projectDir } : projectDir;
+  const baseProjectDir = inherited?.projectDir ?? getProjectDir();
+  const resolvedProjectDir = resolveProjectDirOverride(input.projectDir, baseProjectDir, input.trusted === true);
+  const nextProjectDir = resolvedProjectDir ?? baseProjectDir;
+  const sameInheritedProject = inherited?.sessionId
+    && isPathInsideOrSame(inherited.projectDir, nextProjectDir)
+    && isPathInsideOrSame(nextProjectDir, inherited.projectDir);
+  const sessionId = input.sessionId ?? (sameInheritedProject ? inherited.sessionId : undefined);
+  const ctx = {
+    projectDir: nextProjectDir,
+    ...(sessionId ? { sessionId } : {}),
+  };
   return projectDirOverride.run(ctx, fn);
 }
 
@@ -263,13 +275,141 @@ function withOptionalProjectDir<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   const trimmed = projectDir?.trim();
-  return trimmed ? withProjectDirOverride(resolve(trimmed), fn) : fn();
+  if (!trimmed) return fn();
+  return withProjectDirOverride({ projectDir: trimmed }, fn);
+}
+
+function resolveProjectDirOverride(
+  projectDir: string | undefined,
+  baseProjectDir = getProjectDir(),
+  trusted = false,
+): string | undefined {
+  const trimmed = projectDir?.trim();
+  if (!trimmed) return undefined;
+
+  const resolved = requireExistingDirectory(trimmed, "projectDir");
+  const base = requireExistingDirectory(baseProjectDir, "base projectDir");
+  if (isPathInsideOrSame(base, resolved)) return resolved;
+  if (trusted) return resolved;
+  if (process.env.CONTEXT_MODE_ALLOW_PROJECT_OVERRIDE === "1") return resolved;
+
+  for (const allowedRoot of getAllowedProjectOverrideRoots()) {
+    if (isPathInsideOrSame(allowedRoot, resolved)) return resolved;
+  }
+
+  throw new Error(
+    `Invalid projectDir override: ${resolved}. ` +
+      `It must be inside ${base}, inside CONTEXT_MODE_ALLOWED_PROJECT_DIRS, ` +
+      `or CONTEXT_MODE_ALLOW_PROJECT_OVERRIDE=1 must be set by a trusted caller.`,
+  );
 }
 
 function resolveExecutionCwd(cwd: string | undefined): string | undefined {
   const trimmed = cwd?.trim();
   if (!trimmed) return undefined;
-  return isAbsolute(trimmed) ? resolve(trimmed) : resolve(getProjectDir(), trimmed);
+
+  const projectDir = requireExistingDirectory(getProjectDir(), "projectDir");
+  const resolved = requireExistingDirectory(
+    isAbsoluteForCurrentPlatform(trimmed) ? trimmed : resolve(projectDir, trimmed),
+    "cwd",
+  );
+  if (
+    !isPathInsideOrSame(projectDir, resolved)
+    && process.env.CONTEXT_MODE_ALLOW_OUTSIDE_CWD !== "1"
+  ) {
+    throw new Error(
+      `Invalid cwd: ${resolved}. ` +
+        `cwd must resolve inside projectDir (${projectDir}) unless ` +
+        `CONTEXT_MODE_ALLOW_OUTSIDE_CWD=1 is set by a trusted caller.`,
+    );
+  }
+  return resolved;
+}
+
+function normalizePathForCurrentPlatform(inputPath: string): string {
+  const trimmed = inputPath.trim();
+  if (process.platform !== "win32") return trimmed;
+  const normalized = trimmed.replace(/\\/g, "/");
+  const match = /^\/([a-zA-Z])(?:\/(.*))?$/.exec(normalized);
+  if (!match) return trimmed;
+  const rest = match[2] ? match[2].replace(/\//g, "\\") : "";
+  return `${match[1].toUpperCase()}:\\${rest}`;
+}
+
+function isAbsoluteForCurrentPlatform(inputPath: string): boolean {
+  if (isAbsolute(inputPath)) return true;
+  return process.platform === "win32" && /^\/[a-zA-Z](?:\/|$)/.test(inputPath.replace(/\\/g, "/"));
+}
+
+function requireExistingDirectory(inputPath: string, label: string): string {
+  const resolved = resolve(normalizePathForCurrentPlatform(inputPath));
+  let stats;
+  try {
+    stats = statSync(resolved);
+  } catch {
+    throw new Error(`Invalid ${label}: directory does not exist: ${resolved}`);
+  }
+  if (!stats.isDirectory()) {
+    throw new Error(`Invalid ${label}: not a directory: ${resolved}`);
+  }
+  return realpathSync.native?.(resolved) ?? realpathSync(resolved);
+}
+
+function isPathInsideOrSame(root: string, target: string): boolean {
+  const rel = relative(resolve(root), resolve(target));
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function getAllowedProjectOverrideRoots(): string[] {
+  return getAllowedDirectoryRoots(
+    process.env.CONTEXT_MODE_ALLOWED_PROJECT_DIRS,
+    "CONTEXT_MODE_ALLOWED_PROJECT_DIRS entry",
+  );
+}
+
+function getAllowedDirectoryRoots(raw: string | undefined, label: string): string[] {
+  if (!raw?.trim()) return [];
+  return raw
+    .split(delimiter)
+    .flatMap((part) => part.split(","))
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0)
+    .flatMap((part) => {
+      try {
+        return [requireExistingDirectory(part, label)];
+      } catch {
+        return [];
+      }
+    });
+}
+
+function resolveTrustedReadOnlyDir(
+  inputPath: string,
+  label: string,
+  trustedRoot: string,
+  allowedRootsEnv: string | undefined,
+  allowAllEnvName: string,
+): string {
+  const resolved = requireExistingDirectory(inputPath, label);
+  const trusted = requireExistingDirectory(trustedRoot, "trusted context-mode data root");
+  if (isPathInsideOrSame(trusted, resolved)) return resolved;
+  if (process.env[allowAllEnvName] === "1") return resolved;
+  for (const allowedRoot of getAllowedDirectoryRoots(allowedRootsEnv, `${label} allowlist entry`)) {
+    if (isPathInsideOrSame(allowedRoot, resolved)) return resolved;
+  }
+  throw new Error(
+    `Invalid ${label}: ${resolved}. ` +
+      `Override directories must be inside ${trusted}, inside ` +
+      `CONTEXT_MODE_ALLOWED_INSIGHT_DIRS, or ${allowAllEnvName}=1 must be set by a trusted caller.`,
+  );
+}
+
+function toolInputError(toolName: string, err: unknown): ToolResult {
+  const message = err instanceof Error ? err.message : String(err);
+  return trackResponse(toolName, {
+    content: [{ type: "text" as const, text: message }],
+    isError: true,
+  });
 }
 
 // Register empty prompts/resources handlers so MCP clients don't get -32601 (#168).
@@ -298,8 +438,11 @@ writeFileSync(
   `(function(){var __cm_fs=0;process.on('exit',function(){if(__cm_fs>0)try{process.stderr.write('__CM_FS__:'+__cm_fs+'\\n')}catch(e){}});try{var f=require('fs');var ors=f.readFileSync;f.readFileSync=function(){var r=ors.apply(this,arguments);if(Buffer.isBuffer(r))__cm_fs+=r.length;else if(typeof r==='string')__cm_fs+=Buffer.byteLength(r);return r;};}catch(e){}})();\n`,
 );
 
-// Lazy singleton — no DB overhead unless index/search is used
-let _store: ContentStore | null = null;
+// Lazy per-project stores — no DB overhead unless index/search is used.
+// Keying by DB path keeps explicit projectDir calls from mixing search/index state.
+const _stores = new Map<string, ContentStore>();
+const _cleanedContentDirs = new Set<string>();
+let _stalePidDbCleanupDone = false;
 
 /**
  * Build the FK-attribution object passed to every ContentStore.index*() call
@@ -320,12 +463,14 @@ export function currentAttribution(): { sessionId?: string } | undefined {
   // Works for claude-code/cursor/gemini-cli/codex/
   // kiro/opencode/zed/kilo/openclaw/qwen-code/vscode-copilot/jetbrains-copilot/
   // omp/pi/antigravity — no adapter-specific transcript path required.
-  const sessionId = process.env.CLAUDE_SESSION_ID ?? resolveSessionIdFromSessionDB();
+  const sessionId = override
+    ? resolveSessionIdFromSessionDB({ projectDir: override.projectDir })
+    : process.env.CLAUDE_SESSION_ID ?? resolveSessionIdFromSessionDB({ projectDir: getProjectDir() });
   if (!sessionId) return undefined;
   return { sessionId };
 }
 
-let __cachedSessionId: { sid: string; checkedAt: number } | undefined;
+const __cachedSessionIds = new Map<string, { sid: string; checkedAt: number }>();
 /** v1.0.134 SLICE A: opts injection for testability. Production callers pass nothing. */
 export function resolveSessionIdFromSessionDB(opts?: {
   projectDir?: string;
@@ -334,15 +479,17 @@ export function resolveSessionIdFromSessionDB(opts?: {
 }): string | undefined {
   // 2s cache — ctx_fetch_and_index can fire 5+ chunks/sec; DB open cost adds up.
   const now = Date.now();
-  if (!opts?.bypassCache && __cachedSessionId && now - __cachedSessionId.checkedAt < 2000) {
-    return __cachedSessionId.sid;
-  }
   try {
     const projectDir = opts?.projectDir
       ?? process.env.CLAUDE_PROJECT_DIR
       ?? process.env.CONTEXT_MODE_PROJECT_DIR;
     if (!projectDir) return undefined;
     const sessionsDir = opts?.sessionsDir ?? getSessionDir();
+    const cacheKey = `${resolve(sessionsDir)}\0${resolve(projectDir)}`;
+    const cached = __cachedSessionIds.get(cacheKey);
+    if (!opts?.bypassCache && cached && now - cached.checkedAt < 2000) {
+      return cached.sid;
+    }
     const dbPath = resolveSessionDbPath({ projectDir, sessionsDir });
     if (!existsSync(dbPath)) return undefined;
     const Database = loadDatabase();
@@ -352,7 +499,7 @@ export function resolveSessionIdFromSessionDB(opts?: {
         "SELECT session_id FROM session_meta ORDER BY started_at DESC, rowid DESC LIMIT 1"
       ).get() as { session_id?: string } | undefined;
       const sid = row?.session_id;
-      if (sid) __cachedSessionId = { sid, checkedAt: now };
+      if (sid) __cachedSessionIds.set(cacheKey, { sid, checkedAt: now });
       return sid;
     } finally {
       try { db.close(); } catch { /* best-effort */ }
@@ -363,25 +510,22 @@ export function resolveSessionIdFromSessionDB(opts?: {
 }
 
 /**
- * Auto-index session events files written by SessionStart hook.
- * Scans ~/.claude/context-mode/sessions/ for *-events.md files.
- * CLAUDE_PROJECT_DIR is NOT available to MCP servers — only to hooks —
- * so we glob-scan instead of computing a specific hash.
+ * Auto-index this project's session events file written by SessionStart hook.
  * Files are consumed (deleted) after indexing to prevent double-indexing.
- * Called on every getStore() — readdirSync is sub-millisecond when no files match.
+ * Called on every getStore() — the expected file check is cheap when absent.
  */
 function maybeIndexSessionEvents(store: ContentStore): void {
   try {
     const sessionsDir = getSessionDir();
     if (!existsSync(sessionsDir)) return;
-    const files = readdirSync(sessionsDir).filter(f => f.endsWith("-events.md"));
-    for (const file of files) {
-      const filePath = join(sessionsDir, file);
-      try {
-        store.index({ path: filePath, source: "session-events", attribution: currentAttribution() });
-        unlinkSync(filePath);
-      } catch { /* best-effort per file */ }
-    }
+    const filePath = resolveSessionPath({
+      projectDir: getProjectDir(),
+      sessionsDir,
+      ext: "-events.md",
+    });
+    if (!existsSync(filePath)) return;
+    store.index({ path: filePath, source: "session-events", attribution: currentAttribution() });
+    unlinkSync(filePath);
   } catch { /* best-effort — session continuity never blocks tools */ }
 }
 
@@ -523,7 +667,9 @@ function getProjectDir(): string {
  * is unrelated to where the user is working.
  */
 function resolveProjectPath(filePath: string): string {
-  return isAbsolute(filePath) ? filePath : resolve(getProjectDir(), filePath);
+  return isAbsoluteForCurrentPlatform(filePath)
+    ? resolve(normalizePathForCurrentPlatform(filePath))
+    : resolve(getProjectDir(), filePath);
 }
 
 /**
@@ -561,18 +707,19 @@ function getStorePath(): string {
 }
 
 function getStore(): ContentStore {
-  if (!_store) {
+  const projectDir = getProjectDir();
+  const dbPath = getStorePath();
+  let store = _stores.get(dbPath);
+  if (!store) {
     // Content DB cleanup on fresh start is handled by SessionStart hook.
     // Server just opens whatever DB exists (or creates new if hook deleted it).
-    const dbPath = getStorePath();
-    _store = new ContentStore(dbPath);
+    store = new ContentStore(dbPath);
 
     // Wire deny-policy hook: store re-checks the Read deny list before
     // re-reading any file_path during auto-refresh. Catches policy edits
     // made after a file was originally indexed. See #442 round-3.
-    _store.setDenyChecker((filePath: string) => {
+    store.setDenyChecker((filePath: string) => {
       try {
-        const projectDir = getProjectDir();
         const denyGlobs = readToolDenyPatterns("Read", projectDir);
         const r = evaluateFilePath(
           filePath,
@@ -590,18 +737,25 @@ function getStore(): ContentStore {
     // One-time startup cleanup: remove stale content DBs (>14 days)
     try {
       const contentDir = dirname(getStorePath());
-      cleanupStaleContentDBs(contentDir, 14);
-      _store.cleanupStaleSources(14);
-      // Also clean legacy shared dir from before platform isolation
-      const legacyDir = join(homedir(), ".context-mode", "content");
-      if (existsSync(legacyDir)) cleanupStaleContentDBs(legacyDir, 0);
+      if (!_cleanedContentDirs.has(contentDir)) {
+        cleanupStaleContentDBs(contentDir, 14);
+        _cleanedContentDirs.add(contentDir);
+        // Also clean legacy shared dir from before platform isolation
+        const legacyDir = join(homedir(), ".context-mode", "content");
+        if (existsSync(legacyDir)) cleanupStaleContentDBs(legacyDir, 0);
+      }
+      store.cleanupStaleSources(14);
     } catch { /* best-effort */ }
 
     // Also clean old PID-based DBs from migration
-    cleanupStaleDBs();
+    if (!_stalePidDbCleanupDone) {
+      cleanupStaleDBs();
+      _stalePidDbCleanupDone = true;
+    }
+    _stores.set(dbPath, store);
   }
-  maybeIndexSessionEvents(_store);
-  return _store;
+  maybeIndexSessionEvents(store);
+  return store;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1046,7 +1200,7 @@ function checkDenyPolicy(
   toolName: string,
 ): ToolResult | null {
   try {
-    const policies = readBashPolicies(process.env.CLAUDE_PROJECT_DIR);
+    const policies = readBashPolicies(getProjectDir());
     const result = evaluateCommandDenyOnly(command, policies);
     if (result.decision === "deny") {
       return trackResponse(toolName, {
@@ -1075,7 +1229,7 @@ function checkNonShellDenyPolicy(
   try {
     const commands = extractShellCommands(code, language);
     if (commands.length === 0) return null;
-    const policies = readBashPolicies(process.env.CLAUDE_PROJECT_DIR);
+    const policies = readBashPolicies(getProjectDir());
     for (const cmd of commands) {
       const result = evaluateCommandDenyOnly(cmd, policies);
       if (result.decision === "deny") {
@@ -1111,9 +1265,25 @@ function redactToolResult(response: ToolResult): ToolResult {
 function checkFilePathDenyPolicy(
   filePath: string,
   toolName: string,
+  projectDirOverride?: string,
 ): ToolResult | null {
+  const message = filePathDenyPolicyMessage(filePath, projectDirOverride);
+  if (!message) return null;
+  return trackResponse(toolName, {
+    content: [{
+      type: "text" as const,
+      text: message,
+    }],
+    isError: true,
+  });
+}
+
+function filePathDenyPolicyMessage(
+  filePath: string,
+  projectDirOverride?: string,
+): string | null {
   try {
-    const projectDir = getProjectDir();
+    const projectDir = projectDirOverride ?? getProjectDir();
     const denyGlobs = readToolDenyPatterns("Read", projectDir);
     const result = evaluateFilePath(
       filePath,
@@ -1122,18 +1292,17 @@ function checkFilePathDenyPolicy(
       projectDir,
     );
     if (result.denied) {
-      return trackResponse(toolName, {
-        content: [{
-          type: "text" as const,
-          text: `File access blocked by security policy: path matches Read deny pattern ${result.matchedPattern}`,
-        }],
-        isError: true,
-      });
+      return `File access blocked by security policy: path matches Read deny pattern ${result.matchedPattern}`;
     }
   } catch {
     // Fail-open
   }
   return null;
+}
+
+function assertFilePathAllowedByDenyPolicy(filePath: string): void {
+  const message = filePathDenyPolicyMessage(filePath);
+  if (message) throw new Error(message);
 }
 
 // Build description dynamically based on detected runtimes
@@ -1510,14 +1679,16 @@ server.registerTool(
       projectDir: z
         .string()
         .optional()
-        .describe("Optional project root override for indexing, sidecars, and default shell cwd. Use cwd for subdirectory commands."),
+        .describe("Optional project root override for indexing, sidecars, and default shell cwd. Must exist and resolve inside the detected project root unless allowlisted by trusted env."),
       cwd: z
         .string()
         .optional()
-        .describe("Optional working directory for the executed process. Relative paths resolve under projectDir/the detected project root; artifacts still use projectDir."),
+        .describe("Optional working directory for the executed process. Relative paths resolve under projectDir/the detected project root and must stay inside it unless explicitly trusted by env."),
     }),
   },
-  async ({ language, code, timeout, background, intent, parser, projectDir, cwd }) => withOptionalProjectDir(projectDir, async () => {
+  async ({ language, code, timeout, background, intent, parser, projectDir, cwd }) => {
+    try {
+      return await withOptionalProjectDir(projectDir, async () => {
     // Security: deny-only firewall
     if (language === "shell") {
       const denied = checkDenyPolicy(code, "execute");
@@ -1795,7 +1966,11 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
         isError: true,
       });
     }
-  }),
+      });
+    } catch (err: unknown) {
+      return toolInputError("ctx_execute", err);
+    }
+  },
 );
 
 // ─────────────────────────────────────────────────────────
@@ -1985,10 +2160,13 @@ function appendRunSidecarNote(
 ): string {
   try {
     const projectDir = opts.projectDir ?? getProjectDir();
+    const sessionId = opts.projectDir
+      ? resolveSessionIdFromSessionDB({ projectDir })
+      : currentAttribution()?.sessionId;
     const artifact = writeRunArtifact({
       projectDir,
       command: opts.command,
-      sessionId: currentAttribution()?.sessionId,
+      ...(sessionId ? { sessionId } : {}),
       stdout: opts.stdout,
       stderr: opts.stderr,
       status: opts.status,
@@ -2088,6 +2266,10 @@ server.registerTool(
       path: z
         .string()
         .describe("Absolute file path or relative to project root"),
+      projectDir: z
+        .string()
+        .optional()
+        .describe("Optional project root override. Must satisfy the same projectDir allowlist as execute tools."),
       language: z
         .enum([
           "javascript",
@@ -2122,9 +2304,12 @@ server.registerTool(
         ),
     }),
   },
-  async ({ path, language, code, timeout, intent }) => {
+  async ({ path, projectDir, language, code, timeout, intent }) => {
+    try {
+      return await withOptionalProjectDir(projectDir, async () => {
+    const resolvedPath = resolveProjectPath(path);
     // Security: check file path against Read deny patterns
-    const pathDenied = checkFilePathDenyPolicy(path, "ctx_execute_file");
+    const pathDenied = checkFilePathDenyPolicy(resolvedPath, "ctx_execute_file");
     if (pathDenied) return pathDenied;
 
     // Security: check code parameter against Bash deny patterns
@@ -2138,7 +2323,7 @@ server.registerTool(
 
     try {
       const result = await executor.executeFile({
-        path,
+        path: resolvedPath,
         language,
         code,
         timeout,
@@ -2164,7 +2349,7 @@ server.registerTool(
           trackIndexed(Buffer.byteLength(output));
           return trackResponse("ctx_execute_file", {
             content: [
-              { type: "text" as const, text: intentSearch(output, intent, isError ? `file:${path}:error` : `file:${path}`) },
+              { type: "text" as const, text: intentSearch(output, intent, isError ? `file:${resolvedPath}:error` : `file:${resolvedPath}`) },
             ],
             isError,
           });
@@ -2174,7 +2359,7 @@ server.registerTool(
           trackIndexed(Buffer.byteLength(output));
           return trackResponse("ctx_execute_file", {
             content: [
-              { type: "text" as const, text: intentSearch(output, "errors failures exceptions", isError ? `file:${path}:error` : `file:${path}`) },
+              { type: "text" as const, text: intentSearch(output, "errors failures exceptions", isError ? `file:${resolvedPath}:error` : `file:${resolvedPath}`) },
             ],
             isError,
           });
@@ -2193,14 +2378,14 @@ server.registerTool(
         trackIndexed(Buffer.byteLength(stdout));
         return trackResponse("ctx_execute_file", {
           content: [
-            { type: "text" as const, text: intentSearch(stdout, intent, `file:${path}`) },
+            { type: "text" as const, text: intentSearch(stdout, intent, `file:${resolvedPath}`) },
           ],
         });
       }
 
       // Auto-index large stdout into FTS5 — return pointer, not raw content
       if (Buffer.byteLength(stdout) > LARGE_OUTPUT_THRESHOLD) {
-        return trackResponse("ctx_execute_file", indexStdout(stdout, `file:${path}`));
+        return trackResponse("ctx_execute_file", indexStdout(stdout, `file:${resolvedPath}`));
       }
 
       return trackResponse("ctx_execute_file", {
@@ -2216,6 +2401,10 @@ server.registerTool(
         ],
         isError: true,
       });
+    }
+      });
+    } catch (err: unknown) {
+      return toolInputError("ctx_execute_file", err);
     }
   },
 );
@@ -2261,9 +2450,13 @@ server.registerTool(
         .describe(
           "Label for the indexed content (e.g., 'Context7: React useEffect', 'Skill: frontend-design')",
         ),
+      projectDir: z
+        .string()
+        .optional()
+        .describe("Optional project root override for this index write. Must satisfy the same projectDir allowlist as execute tools."),
     }),
   },
-  async ({ content, path, source }) => {
+  async ({ content, path, source, projectDir }) => {
     if (!content && !path) {
       return trackResponse("ctx_index", {
         content: [
@@ -2276,35 +2469,26 @@ server.registerTool(
       });
     }
 
-    // Apply Read deny-policy to prevent indexing sensitive files into the
-    // FTS5 store, which would otherwise be queryable via ctx_search and
-    // exfiltrate content into the model's context (issue #442). Mirrors the
-    // check ctx_execute_file already performs.
-    if (path) {
-      const pathDenied = checkFilePathDenyPolicy(path, "ctx_index");
-      if (pathDenied) return pathDenied;
-    }
-
     try {
+      return await withOptionalProjectDir(projectDir, async () => {
       const resolvedPath = path ? resolveProjectPath(path) : undefined;
-      // Track the raw bytes being indexed (content or file)
-      if (content) trackIndexed(Buffer.byteLength(content));
-      else if (resolvedPath) {
-        try {
-          const fs = await import("fs");
-          trackIndexed(fs.readFileSync(resolvedPath).byteLength);
-        } catch { /* ignore — file read errors handled by store */ }
+      // Apply Read deny-policy to prevent indexing sensitive files into the
+      // FTS5 store, which would otherwise be queryable via ctx_search and
+      // exfiltrate content into the model's context (issue #442). Mirrors the
+      // check ctx_execute_file already performs.
+      if (resolvedPath) {
+        const pathDenied = checkFilePathDenyPolicy(resolvedPath, "ctx_index");
+        if (pathDenied) return pathDenied;
       }
       const store = getStore();
-      const safeContent = content === undefined
-        ? (resolvedPath ? redactText(readFileSync(resolvedPath, "utf8")).text : undefined)
-        : redactText(content).text;
       const result = store.index({
-        content: safeContent,
+        content,
         path: resolvedPath,
         source: source ?? resolvedPath,
         attribution: currentAttribution(),
+        ...(resolvedPath ? { validatePath: assertFilePathAllowedByDenyPolicy } : {}),
       });
+      trackIndexed(result.indexedBytes);
 
       return trackResponse("ctx_index", {
         content: [
@@ -2314,14 +2498,9 @@ server.registerTool(
           },
         ],
       });
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return trackResponse("ctx_index", {
-        content: [
-          { type: "text" as const, text: `Index error: ${message}` },
-        ],
-        isError: true,
       });
+    } catch (err: unknown) {
+      return toolInputError("ctx_index", err);
     }
   },
 );
@@ -2391,6 +2570,10 @@ server.registerTool(
         .string()
         .optional()
         .describe("Filter to a specific indexed source (partial match)."),
+      projectDir: z
+        .string()
+        .optional()
+        .describe("Optional project root override for selecting the project-scoped search store. Must satisfy the same projectDir allowlist as execute tools."),
       contentType: z
         .enum(["code", "prose"])
         .optional()
@@ -2407,6 +2590,7 @@ server.registerTool(
   },
   async (params) => {
     try {
+      return await withOptionalProjectDir((params as Record<string, unknown>).projectDir as string | undefined, async () => {
       const store = getStore();
       const sort = (params as Record<string, unknown>).sort as string || "relevance";
 
@@ -2574,12 +2758,9 @@ server.registerTool(
       return trackResponse("ctx_search", {
         content: [{ type: "text" as const, text: output }],
       });
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return trackResponse("ctx_search", {
-        content: [{ type: "text" as const, text: `Search error: ${message}` }],
-        isError: true,
       });
+    } catch (err: unknown) {
+      return toolInputError("ctx_search", err);
     }
   },
 );
@@ -2642,7 +2823,7 @@ export function buildFetchCode(url: string, outputPath: string): string {
     classifyIpFnName === "classifyIp"
       ? `var classifyIp = ${classifyIpInner};`
       : `var ${classifyIpFnName} = ${classifyIpInner};\nvar classifyIp = ${classifyIpFnName};`;
-  const strictMode = process.env.CTX_FETCH_STRICT === "1";
+  const blockPrivate = process.env.CTX_FETCH_ALLOW_PRIVATE !== "1";
   const fetchAllowlist = getFetchAllowlistFromEnv();
   return `
 const TurndownService = require(${turndownPath});
@@ -2692,7 +2873,7 @@ delete process.env.npm_config_https_proxy;
 
 ${classifyIpSrc}
 
-const STRICT = ${JSON.stringify(strictMode)};
+const BLOCK_PRIVATE = ${JSON.stringify(blockPrivate)};
 
 // SSRF rebinding defense: every dns.lookup call inside this subprocess
 // (including the one undici performs to connect the fetch socket) is
@@ -2713,7 +2894,7 @@ dns.lookup = function patchedLookup(hostname, options, callback) {
     }
     for (var i = 0; i < records.length; i++) {
       var verdict = classifyIp(records[i].address);
-      if (verdict === 'block' || (STRICT && verdict === 'private')) {
+      if (verdict === 'block' || (BLOCK_PRIVATE && verdict === 'private')) {
         return callback(new Error(
           'SSRF blocked at connect-time: ' + hostname +
           ' resolves to ' + records[i].address +
@@ -2738,7 +2919,7 @@ dnsPromises.lookup = async function patchedPromisesLookup(hostname, options) {
   const list = Array.isArray(records) ? records : [records];
   for (var i = 0; i < list.length; i++) {
     var verdict = classifyIp(list[i].address);
-    if (verdict === 'block' || (STRICT && verdict === 'private')) {
+    if (verdict === 'block' || (BLOCK_PRIVATE && verdict === 'private')) {
       throw new Error(
         'SSRF blocked at connect-time: ' + hostname +
         ' resolves to ' + list[i].address + ' (' + verdict + ')'
@@ -2763,7 +2944,7 @@ dnsPromises.lookup = async function patchedPromisesLookup(hostname, options) {
       for (var i = 0; i < addrs.length; i++) {
         var ip = withTtl ? addrs[i].address : addrs[i];
         var v = classifyIp(ip);
-        if (v === 'block' || (STRICT && v === 'private')) {
+        if (v === 'block' || (BLOCK_PRIVATE && v === 'private')) {
           return cb(new Error(
             'SSRF blocked at connect-time: ' + hostname +
             ' resolves to ' + ip + ' (' + v + ')'
@@ -2789,7 +2970,7 @@ dns.resolve = function patchedResolveGeneric(hostname, rrtype, cb) {
       for (var i = 0; i < records.length; i++) {
         var ip = records[i];
         var v = classifyIp(ip);
-        if (v === 'block' || (STRICT && v === 'private')) {
+        if (v === 'block' || (BLOCK_PRIVATE && v === 'private')) {
           return cb(new Error(
             'SSRF blocked at connect-time: ' + hostname +
             ' resolves to ' + ip + ' (' + v + ')'
@@ -2839,7 +3020,7 @@ async function fetchWithManualRedirect(initialUrl) {
     const isIpLiteral = /^[0-9.]+$/.test(hostname) || hostname.includes(':');
     if (isIpLiteral) {
       const verdict = classifyIp(hostname);
-      if (verdict === 'block' || (STRICT && verdict === 'private')) {
+      if (verdict === 'block' || (BLOCK_PRIVATE && verdict === 'private')) {
         throw new Error('SSRF blocked: redirect to ' + hostname + ' (' + verdict + ')');
       }
     } else {
@@ -2849,7 +3030,7 @@ async function fetchWithManualRedirect(initialUrl) {
       const records = await dnsPromises.lookup(hostname, { all: true, verbatim: true });
       for (const rec of records) {
         const verdict = classifyIp(rec.address);
-        if (verdict === 'block' || (STRICT && verdict === 'private')) {
+        if (verdict === 'block' || (BLOCK_PRIVATE && verdict === 'private')) {
           throw new Error(
             'SSRF blocked: redirect target ' + hostname +
             ' resolves to ' + rec.address + ' (' + verdict + ')'
@@ -2961,7 +3142,7 @@ async function ssrfGuard(rawUrl: string): Promise<FetchOneResult | null> {
 
   const allowPrivate = process.env.CTX_FETCH_ALLOW_PRIVATE === "1";
 
-  // 2. DNS resolve + check IP ranges (hard-block + optional strict-mode block)
+  // 2. DNS resolve + check IP ranges (hard-block + default private-network block)
   try {
     const { lookup } = await import("node:dns/promises");
     const records = await lookup(parsed.hostname, { all: true, verbatim: true });
@@ -2999,7 +3180,7 @@ async function ssrfGuard(rawUrl: string): Promise<FetchOneResult | null> {
 /**
  * Classify an IP address.
  *   - "block":    always blocked (link-local/IMDS/multicast/reserved/malformed)
- *   - "private":  loopback or RFC1918 — allowed by default, blocked in strict mode
+  *   - "private":  loopback or RFC1918 — blocked by default unless CTX_FETCH_ALLOW_PRIVATE=1
  *   - "public":   safe to fetch
  *
  * Exported (via the function name) so SSRF tests can exercise the matcher directly.
@@ -3210,9 +3391,15 @@ server.registerTool(
         .boolean()
         .optional()
         .describe("Skip cache and re-fetch even if content was recently indexed"),
+      projectDir: z
+        .string()
+        .optional()
+        .describe("Optional project root override for cache lookup and indexing. Must satisfy the same projectDir allowlist as execute tools."),
     }),
   },
-  async ({ url, source, requests, concurrency, force }) => {
+  async ({ url, source, requests, concurrency, force, projectDir }) => {
+    try {
+      return await withOptionalProjectDir(projectDir, async () => {
     // Normalize input: legacy {url} or new {requests: [...]}.
     // requests wins when both are provided (explicit batch intent).
     const batch: { url: string; source?: string }[] = requests
@@ -3413,6 +3600,10 @@ server.registerTool(
       content: [{ type: "text" as const, text }],
       isError: errorCount === batch.length, // only mark error if every URL failed
     });
+      });
+    } catch (err: unknown) {
+      return toolInputError("ctx_fetch_and_index", err);
+    }
   },
 );
 
@@ -3477,14 +3668,16 @@ server.registerTool(
       projectDir: z
         .string()
         .optional()
-        .describe("Optional project root override for indexing and default command cwd. Use cwd for subdirectory commands."),
+        .describe("Optional project root override for indexing and default command cwd. Must exist and resolve inside the detected project root unless allowlisted by trusted env."),
       cwd: z
         .string()
         .optional()
-        .describe("Optional working directory for batch commands. Relative paths resolve under projectDir/the detected project root; indexed output still uses projectDir."),
+        .describe("Optional working directory for batch commands. Relative paths resolve under projectDir/the detected project root and must stay inside it unless explicitly trusted by env."),
     }),
   },
-  async ({ commands, queries, timeout, concurrency, projectDir, cwd }) => withOptionalProjectDir(projectDir, async () => {
+  async ({ commands, queries, timeout, concurrency, projectDir, cwd }) => {
+    try {
+      return await withOptionalProjectDir(projectDir, async () => {
     // Security: check each command against deny patterns
     for (const cmd of commands) {
       const denied = checkDenyPolicy(cmd.command, "batch_execute");
@@ -3584,7 +3777,11 @@ server.registerTool(
         isError: true,
       });
     }
-  }),
+      });
+    } catch (err: unknown) {
+      return toolInputError("ctx_batch_execute", err);
+    }
+  },
 );
 
 // ─────────────────────────────────────────────────────────
@@ -4087,10 +4284,11 @@ registerTool(_toolCtx, makeCtxRoute({
     );
   },
 }));
-registerTool(_toolCtx, makeCtxFetchRun({ getProjectDir }));
+registerTool(_toolCtx, makeCtxFetchRun({ getProjectDir, resolveProjectDirOverride }));
 registerTool(_toolCtx, makeCtxRead({
   getProjectDir,
-  checkFilePath: (path) => checkFilePathDenyPolicy(path, "ctx_read"),
+  resolveProjectDirOverride,
+  checkFilePath: (path, projectDir) => checkFilePathDenyPolicy(path, "ctx_read", projectDir),
 }));
 registerTool(_toolCtx, makeCtxGain({
   getProjectDir,
@@ -4102,7 +4300,12 @@ registerTool(_toolCtx, makeCtxDiscover({
   getSessionStats: () => sessionStats,
   getCurrentSessionId: () => currentAttribution()?.sessionId,
 }));
-registerTool(_toolCtx, makeCtxGuard({ getProjectDir }));
+registerTool(_toolCtx, makeCtxGuard({
+  getProjectDir,
+  resolveProjectDirOverride,
+  checkFilePath: (path, projectDir) => checkFilePathDenyPolicy(path, "ctx_guard", projectDir),
+  allowOutsideProject: () => process.env.CONTEXT_MODE_ALLOW_GUARD_OUTSIDE_PROJECT === "1",
+}));
 registerTool(_toolCtx, makeCtxEval());
 registerTool(_toolCtx, makeCtxTrace({ getProjectDir }));
 registerTool(_toolCtx, makeCtxDiff({ getProjectDir }));
@@ -4220,9 +4423,10 @@ server.registerTool(
     try {
       storePathForPurge = getStorePath();
     } catch { /* best effort — store path may be unresolvable on fresh install */ }
-    if (_store && !dryRun) {
-      try { _store.cleanup(); } catch { /* best effort */ }
-      _store = null;
+    const storeForPurge = storePathForPurge ? _stores.get(storePathForPurge) : undefined;
+    if (storeForPurge && !dryRun) {
+      try { storeForPurge.cleanup(); } catch { /* best effort */ }
+      if (storePathForPurge) _stores.delete(storePathForPurge);
     }
 
     // FTS5 store: pass contentDir so purgeSession sweeps BOTH canonical
@@ -4504,8 +4708,8 @@ server.registerTool(
       "First run installs dependencies (~30s). Subsequent runs open instantly.",
     inputSchema: z.object({
       port: z.coerce.number().int().min(1).max(65535).optional().describe("Port to serve on (default: 4747)"),
-      sessionDir: z.string().optional().describe("Override INSIGHT_SESSION_DIR: directory containing context-mode session .db files"),
-      contentDir: z.string().optional().describe("Override INSIGHT_CONTENT_DIR: directory containing context-mode content/index .db files"),
+      sessionDir: z.string().optional().describe("Read-only override for INSIGHT_SESSION_DIR. Must be an existing trusted/allowlisted context-mode data directory."),
+      contentDir: z.string().optional().describe("Read-only override for INSIGHT_CONTENT_DIR. Must be an existing trusted/allowlisted context-mode data directory."),
       insightSessionDir: z.string().optional().describe("Alias for sessionDir / INSIGHT_SESSION_DIR"),
       insightContentDir: z.string().optional().describe("Alias for contentDir / INSIGHT_CONTENT_DIR"),
     }),
@@ -4517,11 +4721,36 @@ server.registerTool(
     // __pkg_dir is build/ for tsc, plugin root for bundle — resolve to plugin root
     const pluginRoot = existsSync(resolve(__pkg_dir, "package.json")) ? __pkg_dir : dirname(__pkg_dir);
     const insightSource = resolve(pluginRoot, "insight");
-    // Use adapter-aware path by default, but allow MCP callers to pass explicit
-    // Insight data dirs for hosts whose adapter/default detection is unavailable.
-    const sessDir = explicitSessionDir ? resolve(explicitSessionDir) : getSessionDir();
-    const insightContentDirResolved = explicitContentDir ? resolve(explicitContentDir) : join(dirname(sessDir), "content");
-    const cacheDir = join(dirname(sessDir), "insight-cache");
+    // Use adapter-aware paths by default. Explicit data dirs are read-only
+    // inputs to the dashboard and must not decide where cache/build writes land.
+    let sessDir: string;
+    let insightContentDirResolved: string;
+    let cacheDir: string;
+    try {
+      const defaultSessionDir = getSessionDir();
+      const trustedDataRoot = dirname(defaultSessionDir);
+      sessDir = explicitSessionDir
+        ? resolveTrustedReadOnlyDir(
+          explicitSessionDir,
+          "sessionDir",
+          trustedDataRoot,
+          process.env.CONTEXT_MODE_ALLOWED_INSIGHT_DIRS,
+          "CONTEXT_MODE_ALLOW_INSIGHT_DIR_OVERRIDE",
+        )
+        : defaultSessionDir;
+      insightContentDirResolved = explicitContentDir
+        ? resolveTrustedReadOnlyDir(
+          explicitContentDir,
+          "contentDir",
+          trustedDataRoot,
+          process.env.CONTEXT_MODE_ALLOWED_INSIGHT_DIRS,
+          "CONTEXT_MODE_ALLOW_INSIGHT_DIR_OVERRIDE",
+        )
+        : join(trustedDataRoot, "content");
+      cacheDir = join(trustedDataRoot, "insight-cache");
+    } catch (err: unknown) {
+      return toolInputError("ctx_insight", err);
+    }
 
     // Verify source exists
     if (!existsSync(join(insightSource, "server.mjs"))) {
@@ -4600,30 +4829,30 @@ server.registerTool(
       }
 
       if (portOccupied && sourceUpdated) {
-        // Source was updated but stale server is running on port — kill it so fresh code runs
-        steps.push("Killing stale dashboard server (source updated)...");
-        const kill = killProcessOnPort(port);
-        if (kill.attemptedPids.length > 0 && kill.killedPids.length === 0) {
-          // Tried to kill, every attempt failed (perms, race, missing binary).
-          // Surface so the agent doesn't loop on the same port forever.
+        // Source was updated but something is responding on the port. Only stop
+        // a dashboard child this MCP process started; never kill by port alone.
+        if (!_insightChild || !_insightChild.pid || _insightChild.killed) {
           return trackResponse("ctx_insight", {
             content: [{
               type: "text" as const,
-              text: `Could not free port ${port} (kill failed for ${kill.attemptedPids.join(", ")}: ${kill.errors.join("; ")}). Try ctx_insight({ port: ${port + 1} }) or stop the process manually.`,
+              text: `Port ${port} is already in use by an untracked process. Try ctx_insight({ port: ${port + 1} }) or stop the process manually.`,
             }],
           });
         }
-        if (kill.errors.length > 0 && kill.attemptedPids.length === 0) {
-          // Couldn't even probe the port (e.g. lsof not installed).
+        steps.push("Stopping tracked dashboard server (source updated)...");
+        try {
+          _insightChild.kill("SIGTERM");
+        } catch (err) {
           return trackResponse("ctx_insight", {
             content: [{
               type: "text" as const,
-              text: `Cannot reclaim port ${port}: ${kill.errors.join("; ")}. Stop the process manually or pick another port.`,
+              text: `Could not stop tracked dashboard PID ${_insightChild.pid}: ${err instanceof Error ? err.message : String(err)}. Try ctx_insight({ port: ${port + 1} }) or stop the process manually.`,
             }],
           });
         }
         await new Promise(r => setTimeout(r, 500)); // Wait for port to free
-        steps.push(`Stale server killed (${kill.killedPids.length} pid${kill.killedPids.length === 1 ? "" : "s"}).`);
+        steps.push(`Tracked dashboard stopped (PID ${_insightChild.pid}).`);
+        _insightChild = null;
       } else if (portOccupied) {
         // Source unchanged, server is running fine — just open browser
         steps.push("Dashboard already running.");
@@ -4746,7 +4975,8 @@ async function main() {
   // Clean up own DB + backgrounded processes + preload script on shutdown
   const shutdown = () => {
     executor.cleanupBackgrounded();
-    if (_store) _store.close(); // persist DB for --continue sessions
+    for (const store of _stores.values()) store.close(); // persist DBs for --continue sessions
+    _stores.clear();
     try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ }
     // Remove MCP readiness sentinel (#230)
     try { unlinkSync(mcpSentinel); } catch { /* best effort */ }

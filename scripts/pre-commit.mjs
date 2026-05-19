@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 
 const checks = [
   [process.execPath, ["node_modules/typescript/bin/tsc", "--noEmit"]],
+  [process.execPath, ["node_modules/typescript/bin/tsc", "--project", "tsconfig.compare.json"]],
   [process.execPath, ["scripts/assert-asymmetric-drift.mjs"]],
 ];
 

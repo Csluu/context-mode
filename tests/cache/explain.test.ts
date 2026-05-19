@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter } from "node:path";
 import { join, resolve } from "node:path";
@@ -163,6 +163,13 @@ describe("task cache explain", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("does not inherit MCP stdin when executing approved cache commands", () => {
+    const source = readFileSync(resolve(process.cwd(), "src/cache/run.ts"), "utf8");
+
+    expect(source).toContain('stdio: ["ignore", "pipe", "pipe"]');
+    expect(source).not.toContain('stdio: ["inherit", "pipe", "pipe"]');
   });
 });
 

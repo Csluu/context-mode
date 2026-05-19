@@ -129,6 +129,69 @@ describe("Hash-based stale detection", () => {
     expect((meta as any).contentHash).toBe(expectedHash);
   });
 
+  test("file-backed index and auto-refresh store only redacted content", () => {
+    const store = createStore();
+    tempStores.push(store);
+
+    const filePath = tmpFile();
+    tempFiles.push(filePath);
+    const firstSecret = `sk-proj-${"a".repeat(32)}`;
+    const secondSecret = `sk-proj-${"b".repeat(32)}`;
+
+    writeFileSync(filePath, `# Secret Guide\n\nvisible alpha ${firstSecret}`);
+    store.index({ path: filePath, source: filePath });
+
+    const initialResults = store.search("visible alpha", 3);
+    expect(initialResults.length).toBeGreaterThan(0);
+    expect(initialResults[0].content).toContain("visible alpha");
+    expect(initialResults[0].content).toContain("<redacted>");
+    expect(initialResults[0].content).not.toContain(firstSecret);
+
+    const mtimeBefore = require("fs").statSync(filePath).mtimeMs;
+    writeFileSync(filePath, `# Secret Guide\n\nvisible beta ${secondSecret}`);
+    const mtimeAfter = require("fs").statSync(filePath).mtimeMs;
+    if (mtimeAfter <= mtimeBefore) {
+      const futureTime = Date.now() + 2000;
+      require("fs").utimesSync(filePath, futureTime / 1000, futureTime / 1000);
+    }
+
+    const refreshedResults = store.searchWithFallback("visible beta", 3);
+    expect(refreshedResults.length).toBeGreaterThan(0);
+    expect(refreshedResults[0].content).toContain("visible beta");
+    expect(refreshedResults[0].content).toContain("<redacted>");
+    expect(refreshedResults[0].content).not.toContain(secondSecret);
+  });
+
+  test("auto-refresh advances indexed_at when only redacted values changed", () => {
+    const store = createStore();
+    tempStores.push(store);
+
+    const filePath = tmpFile();
+    tempFiles.push(filePath);
+    const firstSecret = `sk-proj-${"c".repeat(32)}`;
+    const secondSecret = `sk-proj-${"d".repeat(32)}`;
+
+    writeFileSync(filePath, `# Secret Guide\n\nTOKEN=${firstSecret}`);
+    store.index({ path: filePath, source: filePath });
+    const before = store.getSourceMeta(filePath);
+    expect(before).not.toBeNull();
+
+    writeFileSync(filePath, `# Secret Guide\n\nTOKEN=${secondSecret}`);
+    const futureTime = Date.now() + 2000;
+    require("fs").utimesSync(filePath, futureTime / 1000, futureTime / 1000);
+
+    const results = store.searchWithFallback("Secret Guide", 3);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0].content).toContain("TOKEN=<redacted>");
+    expect(results[0].content).not.toContain(secondSecret);
+
+    const after = store.getSourceMeta(filePath);
+    expect(after).not.toBeNull();
+    expect(after!.contentHash).toBe(before!.contentHash);
+    expect(after!.indexedAt).not.toBe(before!.indexedAt);
+    expect(store.lastRefreshCount).toBe(0);
+  });
+
   test("index content without path, search never triggers stale check", () => {
     const store = createStore();
     tempStores.push(store);

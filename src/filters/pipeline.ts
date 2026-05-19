@@ -37,7 +37,11 @@ function redactOne(text: string, counts: Record<string, number>): string {
     const n = countMatches(out, re);
     if (n > 0) counts[name] = (counts[name] ?? 0) + n;
     if (name === "generic_secret_assignment") {
-      out = out.replace(re, "$1<redacted>");
+      out = out.replace(re, (match: string, prefix: string) => {
+        const value = match.slice(prefix.length);
+        const quote = value.startsWith("\"") ? "\"" : value.startsWith("'") ? "'" : "";
+        return quote ? `${prefix}${quote}<redacted>${quote}` : `${prefix}<redacted>`;
+      });
     } else if (name === "authorization_header") {
       out = out.replace(re, "$1$2 <redacted>");
     } else if (name === "cookie_header" || name === "api_key_header" || name === "common_cookie_assignment") {
@@ -92,7 +96,7 @@ export const failureFocusFilter: FilterStep = {
     const important = lines
       .map((line) => line.trim())
       .filter((line) => /\b(error|failed|failure|exception|timeout|expected|received)\b/i.test(line))
-      .slice(0, 25)
+      .slice(-25)
       .map((message) => ({ message }));
     input.important.push(...important);
     if (important.length > 0) input.summary = `${important.length} important failure line(s)`;

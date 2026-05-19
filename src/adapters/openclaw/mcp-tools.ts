@@ -49,14 +49,14 @@ export interface OpenClawToolDef {
   execute: (
     id: string,
     params: Record<string, unknown>,
-  ) => Promise<{ content: Array<{ type: "text"; text: string }> }>;
+  ) => Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }>;
 }
 
 /** Wrap any handler so failures become a well-formed text error rather than crashing. */
 function safe(
   handler: (
     params: Record<string, unknown>,
-  ) => Promise<{ content: Array<{ type: "text"; text: string }> }>,
+  ) => Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }>,
 ): OpenClawToolDef["execute"] {
   return async (_id, params) => {
     try {
@@ -70,6 +70,7 @@ function safe(
             text: `[context-mode] tool error: ${message}`,
           },
         ],
+        isError: true,
       };
     }
   };
@@ -104,7 +105,7 @@ function cliRedirect(toolName: string) {
  * referencing them (routing block, AGENTS.md) resolve to registered bridge
  * tools even before OpenClaw supports direct MCP handler delegation.
  */
-export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
+const OPENCLAW_BRIDGE_TOOL_DEFS: readonly OpenClawToolDef[] = [
   {
     name: "ctx_execute",
     description:
@@ -142,6 +143,7 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
         path: { type: "string", description: "File path" },
         language: { type: "string", description: "Runtime language" },
         code: { type: "string", description: "Source code" },
+        projectDir: { type: "string", description: "Optional project root override" },
         timeout: { type: "number", description: "Max execution time in ms" },
         intent: { type: "string", description: "What to extract when output is large" },
       },
@@ -178,6 +180,7 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
         content: { type: "string", description: "Text to index" },
         path: { type: "string", description: "File path to read and index without loading content into context" },
         source: { type: "string", description: "Descriptive source label" },
+        projectDir: { type: "string", description: "Optional project root override" },
       },
       additionalProperties: true,
     },
@@ -192,6 +195,7 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
         queries: { type: "array", items: { type: "string" }, description: "Search queries" },
         limit: { type: "number", description: "Results per query" },
         source: { type: "string", description: "Optional source filter" },
+        projectDir: { type: "string", description: "Optional project root override" },
         contentType: { type: "string", description: "code | prose" },
         sort: { type: "string", description: "relevance | timeline" },
       },
@@ -222,6 +226,7 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
         },
         concurrency: { type: "number", description: "Max URLs to fetch in parallel" },
         force: { type: "boolean", description: "Skip cache and fetch again" },
+        projectDir: { type: "string", description: "Optional project root override" },
       },
       additionalProperties: true,
     },
@@ -484,6 +489,13 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
     execute: cliRedirect("ctx_insight"),
   },
 ];
+
+export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = OPENCLAW_BRIDGE_TOOL_DEFS.map((tool) => ({
+  ...tool,
+  description: tool.description.startsWith("Bridge stub; does not execute.")
+    ? tool.description
+    : `Bridge stub; does not execute. ${tool.description}`,
+}));
 
 export function openClawExperimentalToolsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return (env.CTX_MODE_EXPERIMENTAL ?? env.CONTEXT_MODE_EXPERIMENTAL ?? "") === "1";

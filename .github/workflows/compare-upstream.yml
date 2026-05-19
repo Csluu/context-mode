@@ -1,0 +1,106 @@
+name: compare-upstream
+
+on:
+  pull_request:
+    branches: [main, next, tier2/refactor]
+    paths:
+      - "src/**"
+      - "tests/compare/**"
+      - "scripts/compare/**"
+      - ".github/workflows/compare-upstream.yml"
+      - "package.json"
+  schedule:
+    - cron: "0 7 * * *"   # nightly 07:00 UTC
+  workflow_dispatch:
+    inputs:
+      include_workflows:
+        description: "Run real-life workflows"
+        required: false
+        default: "true"
+      include_stats_validate:
+        description: "Run ctx_stats validation"
+        required: false
+        default: "true"
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install fork deps
+        run: npm install --no-audit --no-fund
+
+      - name: Build fork
+        run: npm run build
+
+      - name: Clone + build upstream
+        run: npm run compare:setup
+
+      - name: Run per-tool parity suites
+        run: npm run compare:all
+        continue-on-error: false
+
+      - name: Run real-life workflows
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.include_workflows != 'false' }}
+        run: npm run compare:workflows
+        continue-on-error: false
+
+      - name: Run ctx_stats validation
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.include_stats_validate != 'false' }}
+        run: npm run compare:stats-validate
+        continue-on-error: false
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compare-reports-${{ github.run_id }}
+          path: build/compare/
+          retention-days: 30
+
+      - name: Comment summary on PR
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && always()
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+            const dir = 'build/compare';
+            if (!fs.existsSync(dir)) return;
+            const files = fs.readdirSync(dir).filter(f => f.endsWith('.md')).sort();
+            const pick = (prefix) => files.filter(f => f.startsWith(prefix)).pop();
+            const parts = [];
+            const all = pick('all-');
+            const wf  = pick('workflows-');
+            const sv  = pick('stat-validate-');
+            for (const [label, f] of [['Per-tool', all], ['Workflows', wf], ['Stat validation', sv]]) {
+              if (!f) continue;
+              const body = fs.readFileSync(path.join(dir, f), 'utf8');
+              const summary = body.split('\n').slice(0, 30).join('\n');
+              parts.push(`### ${label} (\`${f}\`)\n\n${summary}\n...`);
+            }
+            if (parts.length === 0) return;
+            const out = `## Fork vs upstream comparison\n\n${parts.join('\n\n')}\n\n_Full reports in run artifacts._`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: out.slice(0, 65000),
+            });

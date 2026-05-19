@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 
 import { redactCommandShape, stableCommandHash } from "../routing/command-classifier.js";
@@ -98,8 +98,31 @@ function assertInside(root: string, target: string): void {
 }
 
 export function getRunArtifactRoot(projectDir: string): string {
-  const root = resolve(projectDir, ".context-mode", "runs");
-  assertInside(resolve(projectDir), root);
+  const resolvedProjectDir = resolve(projectDir);
+  const root = resolve(resolvedProjectDir, ".context-mode", "runs");
+  assertInside(resolvedProjectDir, root);
+  assertRunRootSafe(resolvedProjectDir, root);
+  return root;
+}
+
+function assertRunRootSafe(projectDir: string, root: string): void {
+  const contextDir = resolve(projectDir, ".context-mode");
+  for (const candidate of [contextDir, root]) {
+    if (!existsSync(candidate)) continue;
+    if (lstatSync(candidate).isSymbolicLink()) {
+      throw new Error(`artifact path must not be a symlink: ${candidate}`);
+    }
+  }
+  if (!existsSync(root)) return;
+  const safeProjectDir = realpathSync(projectDir);
+  const safeRoot = realpathSync(root);
+  assertInside(safeProjectDir, safeRoot);
+}
+
+function ensureRunArtifactRoot(projectDir: string): string {
+  const root = getRunArtifactRoot(projectDir);
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  assertRunRootSafe(resolve(projectDir), root);
   return root;
 }
 
@@ -107,26 +130,37 @@ function writeAtomic(filePath: string, content: string): void {
   mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
   const tmp = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   writeFileSync(tmp, content, { encoding: "utf8", mode: 0o600 });
-  renameSync(tmp, filePath);
+  try {
+    renameSync(tmp, filePath);
+  } catch (err) {
+    try { unlinkSync(tmp); } catch { /* best effort */ }
+    throw err;
+  }
 }
 
-function readMetadata(metadataPath: string): RunArtifactRecord | null {
+function readMetadata(metadataPath: string, expectedArtifactDir: string, runRoot: string): RunArtifactRecord | null {
   try {
-    const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as RunArtifactMetadata;
+    if (lstatSync(expectedArtifactDir).isSymbolicLink()) return null;
+    const safeRunRoot = realpathSync(runRoot);
+    const safeArtifactDir = realpathSync(expectedArtifactDir);
+    assertInside(safeRunRoot, safeArtifactDir);
+    if (lstatSync(metadataPath).isSymbolicLink()) return null;
+    const safeMetadataPath = realpathSync(metadataPath);
+    const metadata = JSON.parse(readFileSync(safeMetadataPath, "utf8")) as RunArtifactMetadata;
     if (metadata.schemaVersion !== 1 || !metadata.runId || !metadata.rawPath) return null;
     if (typeof metadata.createdAt !== "string" || !Number.isFinite(Date.parse(metadata.createdAt))) return null;
-    const artifactDir = dirname(metadataPath);
     const rawPath = resolve(metadata.rawPath);
-    const safeMetadataPath = resolve(metadataPath);
-    assertInside(artifactDir, rawPath);
-    assertInside(artifactDir, safeMetadataPath);
+    if (lstatSync(rawPath).isSymbolicLink()) return null;
+    const safeRawPath = realpathSync(rawPath);
+    assertInside(safeArtifactDir, safeMetadataPath);
+    assertInside(safeArtifactDir, safeRawPath);
     return {
       metadata: {
         ...metadata,
-        rawPath,
+        rawPath: safeRawPath,
         metadataPath: safeMetadataPath,
       },
-      artifactDir,
+      artifactDir: safeArtifactDir,
     };
   } catch {
     return null;
@@ -147,16 +181,38 @@ function sliceUtf8Bytes(text: string, maxBytes: number): string {
 
 function sliceUtf8TailBytes(text: string, maxBytes: number): string {
   let bytes = 0;
-  const chars = Array.from(text);
-  let start = chars.length;
-  for (let i = chars.length - 1; i >= 0; i--) {
-    const char = chars[i];
+  let start = text.length;
+  for (let i = text.length; i > 0;) {
+    let charStart = i - 1;
+    const low = text.charCodeAt(charStart);
+    if (low >= 0xdc00 && low <= 0xdfff && charStart > 0) {
+      const high = text.charCodeAt(charStart - 1);
+      if (high >= 0xd800 && high <= 0xdbff) charStart--;
+    }
+    const char = text.slice(charStart, i);
     const nextBytes = Buffer.byteLength(char);
     if (bytes + nextBytes > maxBytes) break;
     bytes += nextBytes;
-    start = i;
+    start = charStart;
+    i = charStart;
   }
-  return chars.slice(start).join("");
+  return text.slice(start);
+}
+
+function truncateSidecarText(redactedText: string, maxRunBytes: number, redactedBytes: number): string {
+  const marker = `[context-mode: sidecar truncated at ${maxRunBytes} bytes; original redacted bytes ${redactedBytes}; stored head and tail]`;
+  const markerWithBreaks = `\n${marker}\n`;
+  const markerBytes = Buffer.byteLength(markerWithBreaks);
+  if (markerBytes >= maxRunBytes) return sliceUtf8Bytes(marker, maxRunBytes);
+
+  const usableBytes = maxRunBytes - markerBytes;
+  const headBytes = Math.ceil(usableBytes / 2);
+  const tailBytes = usableBytes - headBytes;
+  return [
+    sliceUtf8Bytes(redactedText, headBytes),
+    marker,
+    sliceUtf8TailBytes(redactedText, tailBytes),
+  ].join("\n");
 }
 
 function deletionCandidates(records: readonly RunArtifactRecord[]): RunArtifactRecord[] {
@@ -173,31 +229,34 @@ export function cleanupRunArtifacts(
   projectDir: string,
   opts: { ttlDays?: number; maxProjectBytes?: number; now?: Date; keepRunId?: string } = {},
 ): { deleted: number; bytesDeleted: number } {
+  const ttlEnabled = opts.ttlDays !== undefined && opts.ttlDays >= 0;
+  const quotaEnabled = opts.maxProjectBytes !== undefined && opts.maxProjectBytes >= 0;
+  if (!ttlEnabled && !quotaEnabled) return { deleted: 0, bytesDeleted: 0 };
+
   const now = opts.now ?? new Date();
   let deleted = 0;
   let bytesDeleted = 0;
   const records = listRunArtifacts(projectDir, Number.MAX_SAFE_INTEGER);
 
   for (const record of deletionCandidates(records).filter((record) => record.metadata.runId !== opts.keepRunId)) {
-    if (opts.ttlDays === undefined || opts.ttlDays < 0) continue;
+    if (!ttlEnabled) continue;
     const ageMs = now.getTime() - new Date(record.metadata.createdAt).getTime();
-    if (ageMs <= opts.ttlDays * 24 * 60 * 60 * 1000) continue;
+    if (ageMs <= opts.ttlDays! * 24 * 60 * 60 * 1000) continue;
     bytesDeleted += record.metadata.storedBytes ?? record.metadata.redactedBytes ?? 0;
     rmSync(record.artifactDir, { recursive: true, force: true });
     deleted++;
   }
 
-  if (opts.maxProjectBytes !== undefined && opts.maxProjectBytes >= 0) {
-    let remaining = listRunArtifacts(projectDir, Number.MAX_SAFE_INTEGER);
+  if (quotaEnabled) {
+    const remaining = listRunArtifacts(projectDir, Number.MAX_SAFE_INTEGER);
     let total = remaining.reduce((sum, record) => sum + (record.metadata.storedBytes ?? record.metadata.redactedBytes ?? 0), 0);
     for (const record of deletionCandidates(remaining).filter((record) => record.metadata.runId !== opts.keepRunId)) {
-      if (total <= opts.maxProjectBytes) break;
+      if (total <= opts.maxProjectBytes!) break;
       const bytes = record.metadata.storedBytes ?? record.metadata.redactedBytes ?? 0;
       rmSync(record.artifactDir, { recursive: true, force: true });
       total -= bytes;
       bytesDeleted += bytes;
       deleted++;
-      remaining = remaining.filter((item) => item.metadata.runId !== record.metadata.runId);
     }
   }
 
@@ -206,7 +265,7 @@ export function cleanupRunArtifacts(
 
 export function writeRunArtifact(input: WriteRunArtifactInput): RunArtifactRecord {
   const projectDir = resolve(input.projectDir);
-  const root = getRunArtifactRoot(projectDir);
+  const root = ensureRunArtifactRoot(projectDir);
   const now = input.now ?? new Date();
   const runId = input.runId ?? randomUUID();
   const commandShape = redactCommandShape(input.command);
@@ -224,15 +283,7 @@ export function writeRunArtifact(input: WriteRunArtifactInput): RunArtifactRecor
   const redactedBytes = Buffer.byteLength(redacted.text);
   const truncated = redactedBytes > maxRunBytes;
   const storedText = truncated
-    ? (() => {
-      const headBytes = Math.max(1, Math.ceil(maxRunBytes / 2));
-      const tailBytes = Math.max(1, maxRunBytes - headBytes);
-      return [
-        sliceUtf8Bytes(redacted.text, headBytes),
-        `[context-mode: sidecar truncated at ${maxRunBytes} bytes; original redacted bytes ${redactedBytes}; stored head and tail]`,
-        sliceUtf8TailBytes(redacted.text, tailBytes),
-      ].join("\n");
-    })()
+    ? truncateSidecarText(redacted.text, maxRunBytes, redactedBytes)
     : redacted.text;
   const rawPath = join(artifactDir, "raw.log");
   const metadataPath = join(artifactDir, "metadata.json");
@@ -274,15 +325,34 @@ export function writeRunArtifact(input: WriteRunArtifactInput): RunArtifactRecor
 export function listRunArtifacts(projectDir: string, limit = 20): RunArtifactRecord[] {
   const root = getRunArtifactRoot(projectDir);
   if (!existsSync(root)) return [];
+  let safeRoot: string;
+  try {
+    safeRoot = realpathSync(root);
+  } catch {
+    return [];
+  }
   const records: RunArtifactRecord[] = [];
   for (const day of readdirSync(root)) {
-    const dayDir = join(root, day);
-    if (!statSync(dayDir).isDirectory()) continue;
-    for (const child of readdirSync(dayDir)) {
-      const metadataPath = join(dayDir, child, "metadata.json");
-      if (!existsSync(metadataPath)) continue;
-      const record = readMetadata(metadataPath);
-      if (record) records.push(record);
+    try {
+      const dayDir = join(root, day);
+      const dayStat = lstatSync(dayDir);
+      if (dayStat.isSymbolicLink() || !dayStat.isDirectory()) continue;
+      assertInside(safeRoot, realpathSync(dayDir));
+      for (const child of readdirSync(dayDir)) {
+        try {
+          const artifactDir = join(dayDir, child);
+          const artifactStat = lstatSync(artifactDir);
+          if (artifactStat.isSymbolicLink() || !artifactStat.isDirectory()) continue;
+          const metadataPath = join(artifactDir, "metadata.json");
+          if (!existsSync(metadataPath)) continue;
+          const record = readMetadata(metadataPath, artifactDir, safeRoot);
+          if (record) records.push(record);
+        } catch {
+          // Another process may clean up a run between readdir and stat/read.
+        }
+      }
+    } catch {
+      // Another process may clean up a day directory between readdir and stat/read.
     }
   }
   return records
@@ -296,14 +366,18 @@ export function listRunArtifacts(projectDir: string, limit = 20): RunArtifactRec
 
 export function fetchRunArtifact(options: FetchRunOptions): FetchedRunArtifact | null {
   const maxBytes = Math.max(1, options.maxBytes ?? DEFAULT_MAX_BYTES);
-  const records = listRunArtifacts(options.projectDir, 200);
-  const wantedRunId = options.runId;
-  const record = wantedRunId
-    ? records.find((item) =>
+  const wantedRunId = options.runId?.trim();
+  const records = wantedRunId
+    ? listRunArtifacts(options.projectDir, Number.MAX_SAFE_INTEGER)
+    : listRunArtifacts(options.projectDir, 200);
+  const matches = wantedRunId && wantedRunId.length >= 6
+    ? records.filter((item) =>
       item.metadata.runId === wantedRunId
       || item.metadata.runId.startsWith(wantedRunId)
-      || basename(item.artifactDir).endsWith(wantedRunId)
     )
+    : [];
+  const record = wantedRunId
+    ? matches.length === 1 ? matches[0] : undefined
     : options.latest
       ? records[0]
       : undefined;

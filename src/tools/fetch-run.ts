@@ -7,6 +7,7 @@ import type { ToolContext, ToolDefinition } from "./types.js";
 
 interface FetchRunDeps {
   readonly getProjectDir: () => string;
+  readonly resolveProjectDirOverride?: (projectDir: string | undefined) => string | undefined;
 }
 
 interface FetchRunInput {
@@ -64,7 +65,17 @@ export function makeCtxFetchRun(deps: FetchRunDeps): ToolDefinition<FetchRunInpu
       }),
     },
     handler(input: FetchRunInput, ctx: ToolContext): ToolTextResult {
-      const projectDir = input.projectDir?.trim() || deps.getProjectDir();
+      let projectDir: string;
+      try {
+        projectDir = input.projectDir?.trim()
+          ? deps.resolveProjectDirOverride?.(input.projectDir) ?? input.projectDir.trim()
+          : deps.getProjectDir();
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }],
+          isError: true,
+        };
+      }
       const budget = getAdapterOutputBudget(ctx.getAdapterId?.() ?? "unknown");
       if (input.list || (!input.runId && !input.latest)) {
         return { content: [{ type: "text", text: renderList(projectDir, input.limit ?? 20) }] };
@@ -108,7 +119,11 @@ export function makeCtxFetchRun(deps: FetchRunDeps): ToolDefinition<FetchRunInpu
       if (m.pinned) lines.push("pinned: true");
       if (input.raw) {
         const preview = input.preview ?? "head";
-        lines.push("", `--- redacted raw preview (${preview}) ---`, artifact.raw ?? "");
+        lines.push(
+          "",
+          artifact.truncated ? `--- redacted raw preview (${preview}) ---` : "--- redacted raw ---",
+          artifact.raw ?? "",
+        );
         if (artifact.truncated) {
           lines.push("", `...[${preview} preview truncated at ${input.maxBytes ?? budget.maxSidecarPreviewBytes} bytes]`);
         }

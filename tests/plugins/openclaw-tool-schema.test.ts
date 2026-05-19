@@ -65,6 +65,9 @@ describe("OpenClaw tool schemas", () => {
     const fetchTool = OPENCLAW_TOOL_DEFS.find((tool) => tool.name === "ctx_fetch_and_index");
 
     expect(fetchTool?.parameters.required).toBeUndefined();
+    expect(fetchTool?.parameters.properties).toMatchObject({
+      projectDir: { type: "string" },
+    });
     expect(fetchTool?.parameters.properties.requests.items).toMatchObject({
       type: "object",
       required: ["url"],
@@ -122,18 +125,21 @@ describe("OpenClaw tool schemas", () => {
       content: { type: "string" },
       path: { type: "string" },
       source: { type: "string" },
+      projectDir: { type: "string" },
     });
   });
 
   it("keeps OpenClaw stable tool schemas aligned with MCP optional inputs", () => {
     const executeFileTool = OPENCLAW_TOOL_DEFS.find((tool) => tool.name === "ctx_execute_file");
     expect(executeFileTool?.parameters.properties).toMatchObject({
+      projectDir: { type: "string" },
       timeout: { type: "number" },
       intent: { type: "string" },
     });
 
     const searchTool = OPENCLAW_TOOL_DEFS.find((tool) => tool.name === "ctx_search");
     expect(searchTool?.parameters.properties).toMatchObject({
+      projectDir: { type: "string" },
       limit: { type: "number" },
       contentType: { type: "string" },
     });
@@ -164,5 +170,23 @@ describe("OpenClaw tool schemas", () => {
       insightSessionDir: { type: "string" },
       insightContentDir: { type: "string" },
     });
+  });
+
+  it("makes OpenClaw bridge stubs explicit in descriptions and runtime output", async () => {
+    for (const tool of OPENCLAW_TOOL_DEFS) {
+      expect(tool.description).toMatch(/^Bridge stub; does not execute\./);
+    }
+
+    const indexTool = OPENCLAW_TOOL_DEFS.find((tool) => tool.name === "ctx_index");
+    const result = await indexTool?.execute("test", { path: "README.md", source: "readme" });
+
+    expect(result?.isError).toBeUndefined();
+    expect(result?.content[0].text).toContain("OpenClaw bridge stub, not the real Context Mode MCP tool");
+  });
+
+  it("marks OpenClaw bridge handler failures as MCP errors", () => {
+    const source = readFileSync(resolve(import.meta.dirname, "../../src/adapters/openclaw/mcp-tools.ts"), "utf8");
+
+    expect(source).toContain("isError: true");
   });
 });

@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
+import { isAbsolute, relative, resolve } from "node:path";
 import { z } from "zod";
 
 import { fetchRunArtifact, listRunArtifacts } from "../artifacts/run-store.js";
@@ -19,6 +20,7 @@ interface GuardInput {
   readonly text?: string;
   readonly surface?: GuardSurface;
   readonly path?: string;
+  readonly projectDir?: string;
   readonly runId?: string;
   readonly latest?: boolean;
   readonly limit?: number;
@@ -28,6 +30,9 @@ interface GuardInput {
 
 interface GuardDeps {
   readonly getProjectDir: () => string;
+  readonly resolveProjectDirOverride?: (projectDir: string | undefined) => string | undefined;
+  readonly checkFilePath?: (path: string, projectDir: string) => ToolTextResult | null;
+  readonly allowOutsideProject?: () => boolean;
 }
 
 type ToolTextResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
@@ -111,6 +116,38 @@ function renderReport(report: GuardScanReport): string {
   ].join("\n");
 }
 
+function isPathInsideOrSame(root: string, target: string): boolean {
+  const rel = relative(root, target);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function normalizePathForCurrentPlatform(inputPath: string): string {
+  const trimmed = inputPath.trim();
+  if (process.platform !== "win32") return trimmed;
+  const normalized = trimmed.replace(/\\/g, "/");
+  const match = /^\/([a-zA-Z])(?:\/(.*))?$/.exec(normalized);
+  if (!match) return trimmed;
+  const rest = match[2] ? match[2].replace(/\//g, "\\") : "";
+  return `${match[1].toUpperCase()}:\\${rest}`;
+}
+
+function isAbsoluteForCurrentPlatform(inputPath: string): boolean {
+  if (isAbsolute(inputPath)) return true;
+  return process.platform === "win32" && /^\/[a-zA-Z](?:\/|$)/.test(inputPath.replace(/\\/g, "/"));
+}
+
+function resolveGuardFilePath(filePath: string, projectDir: string, allowOutsideProject: boolean): string {
+  const resolved = isAbsoluteForCurrentPlatform(filePath)
+    ? resolve(normalizePathForCurrentPlatform(filePath))
+    : resolve(projectDir, filePath);
+  const realProjectDir = realpathSync(projectDir);
+  const realFilePath = realpathSync(resolved);
+  if (!allowOutsideProject && !isPathInsideOrSame(realProjectDir, realFilePath)) {
+    throw new Error(`CTX_GUARD_PATH_OUTSIDE_PROJECT: ${realFilePath}`);
+  }
+  return realFilePath;
+}
+
 export function runGuardFixtureSelfTest() {
   const subjects = FIXTURES.map((fixture) => ({
     surface: fixture.surface,
@@ -158,6 +195,11 @@ function fixtureReport(json: boolean): ToolTextResult {
 }
 
 export function makeCtxGuard(deps: GuardDeps): ToolDefinition<GuardInput, ToolTextResult> {
+  const resolveGuardProjectDir = (projectDir: string | undefined): string => {
+    if (!projectDir?.trim()) return deps.getProjectDir();
+    return deps.resolveProjectDirOverride?.(projectDir) ?? projectDir;
+  };
+
   return {
     name: "ctx_guard",
     experimental: true,
@@ -170,6 +212,7 @@ export function makeCtxGuard(deps: GuardDeps): ToolDefinition<GuardInput, ToolTe
         text: z.string().optional().describe("Text to scan for scan-output"),
         surface: z.enum(SURFACES).optional().describe("Persistence/return surface being scanned"),
         path: z.string().optional().describe("Local file path to scan for scan-file"),
+        projectDir: z.string().optional().describe("Project root for scan-file and scan-sidecars path resolution"),
         runId: z.string().optional().describe("Run artifact id/prefix for scan-sidecars"),
         latest: z.boolean().optional().describe("Scan latest run artifact"),
         limit: z.coerce.number().int().positive().max(100).optional().describe("Max sidecars to scan"),
@@ -194,15 +237,38 @@ export function makeCtxGuard(deps: GuardDeps): ToolDefinition<GuardInput, ToolTe
         if (!input.path) {
           return { content: [{ type: "text", text: "CTX_GUARD_PATH_REQUIRED" }], isError: true };
         }
-        const bytes = readFileSync(input.path);
-        const decision = scanGuardBuffer(bytes, input.surface ?? "release-artifact");
-        return {
-          content: [{ type: "text", text: json ? JSON.stringify(publicDecision(decision, input.includePreview === true), null, 2) : renderDecision(decision, input.path, false) }],
-          isError: decision.status === "blocked" || decision.status === "unavailable",
-        };
+        try {
+          const projectDir = resolveGuardProjectDir(input.projectDir);
+          const filePath = resolveGuardFilePath(
+            input.path,
+            projectDir,
+            deps.allowOutsideProject?.() === true,
+          );
+          const denied = deps.checkFilePath?.(filePath, projectDir);
+          if (denied) return denied;
+          const bytes = readFileSync(filePath);
+          const decision = scanGuardBuffer(bytes, input.surface ?? "release-artifact");
+          return {
+            content: [{ type: "text", text: json ? JSON.stringify(publicDecision(decision, input.includePreview === true), null, 2) : renderDecision(decision, filePath, false) }],
+            isError: decision.status === "blocked" || decision.status === "unavailable",
+          };
+        } catch (err) {
+          return {
+            content: [{ type: "text", text: `CTX_GUARD_SCAN_FILE_FAILED: ${err instanceof Error ? err.message : String(err)}` }],
+            isError: true,
+          };
+        }
       }
 
-      const projectDir = deps.getProjectDir();
+      let projectDir: string;
+      try {
+        projectDir = resolveGuardProjectDir(input.projectDir);
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `CTX_GUARD_PROJECT_DIR_INVALID: ${err instanceof Error ? err.message : String(err)}` }],
+          isError: true,
+        };
+      }
       const records = input.runId || input.latest
         ? [fetchRunArtifact({ projectDir, runId: input.runId, latest: input.latest, maxBytes: 5 * 1024 * 1024 })].filter(Boolean)
         : listRunArtifacts(projectDir, input.limit ?? 20)

@@ -32,7 +32,6 @@ describe("route explainability", () => {
       { command: "CI=1 npm --prefix frontend run build", rule: "node-build-generic", parser: "generic-failure" },
       { command: "npm --prefix frontend run build", rule: "node-build-generic", parser: "generic-failure" },
       { command: "npm.cmd run lint", rule: "node-lint-generic", parser: "generic-failure" },
-      { command: "npm --prefix frontend run lint:fix", rule: "node-lint-generic", parser: "generic-failure" },
       { command: "npx.cmd eslint src", rule: "node-lint-generic", parser: "generic-failure" },
       { command: "npx.cmd tsc --noEmit", rule: "node-typecheck-generic", parser: "generic-failure" },
       { command: "CI=1 npx.cmd tsc --noEmit", rule: "node-typecheck-generic", parser: "generic-failure" },
@@ -49,6 +48,18 @@ describe("route explainability", () => {
       expect(decision.selectedRule).toBe(item.rule);
       expect(decision.route?.parser).toBe(item.parser);
       expect(decision.safety.reason).toContain("recommendation-only");
+    }
+  });
+
+  it("does not route mutating lint commands as low-risk log commands", () => {
+    for (const command of [
+      "npm --prefix frontend run lint:fix",
+      "npm run lint -- --fix",
+      "npx.cmd eslint src --fix",
+    ]) {
+      const decision = routeCommand(command, { mode: "recommend", adapterCanRewrite: true });
+      expect(decision.selectedRule).not.toBe("node-lint-generic");
+      expect(decision.route?.parser).not.toBe("generic-failure");
     }
   });
 

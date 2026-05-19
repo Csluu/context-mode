@@ -70,6 +70,8 @@ describe("ctx_fetch_run tool", () => {
 
       const raw = await tool.handler({ runId: "44444444", raw: true }, testContext());
       expect(raw.content[0].text).toContain("Run artifact 44444444-4444-4444-8444-444444444444");
+      expect(raw.content[0].text).toContain("--- redacted raw ---");
+      expect(raw.content[0].text).not.toContain("--- redacted raw preview");
       expect(raw.content[0].text).toContain("TOKEN=<redacted>");
       expect(raw.content[0].text).not.toContain("abc123");
       expect(raw.content[0].text).toContain("path: .context-mode/runs/");

@@ -11,10 +11,11 @@
 import type { Database as DatabaseInstance } from "better-sqlite3";
 import { loadDatabase, applyWALPragmas, closeDB, cleanOrphanedWALFiles, withRetry, deleteDBFiles, isSQLiteCorruptionError } from "./db-base.js";
 import type { PreparedStatement } from "./db-base.js";
-import { readFileSync, readdirSync, unlinkSync, existsSync, statSync, openSync, fstatSync, closeSync } from "node:fs";
+import { readFileSync, readdirSync, unlinkSync, existsSync, statSync, openSync, fstatSync, closeSync, realpathSync, type Stats } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { redactText } from "./filters/pipeline.js";
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -24,6 +25,13 @@ interface Chunk {
   title: string;
   content: string;
   hasCode: boolean;
+}
+
+function sameFile(a: Stats, b: Stats): boolean {
+  if (a.dev !== 0 || b.dev !== 0 || a.ino !== 0 || b.ino !== 0) {
+    return a.dev === b.dev && a.ino === b.ino;
+  }
+  return a.size === b.size && a.mtimeMs === b.mtimeMs;
 }
 
 type SourceMatchMode = "like" | "exact";
@@ -82,6 +90,10 @@ function dedupeTokens(tokens: string[]): string[] {
     }
   }
   return out;
+}
+
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, (match) => `\\${match}`);
 }
 
 export function sanitizeQuery(query: string, mode: "AND" | "OR" = "AND"): string {
@@ -196,8 +208,9 @@ function isProcessAlive(pid: number): boolean {
 /**
  * Clean up stale per-project content store DBs older than maxAgeDays.
  * Scans the given directory for *.db files and checks mtime.
- * Also detects zombie processes holding WAL locks — if a WAL file exists
- * but the owning PID is dead, the DB files are cleaned up regardless of age.
+ * Also treats non-empty WAL files that have been idle for over an hour as
+ * stale. SQLite WAL files do not expose an owning PID here, so this is a
+ * conservative mtime heuristic rather than process-owner detection.
  */
 export function cleanupStaleContentDBs(contentDir: string, maxAgeDays: number): number {
   let cleaned = 0;
@@ -212,9 +225,9 @@ export function cleanupStaleContentDBs(contentDir: string, maxAgeDays: number): 
         const mtime = statSync(filePath).mtimeMs;
         let shouldClean = mtime < cutoff;
 
-        // Detect zombie processes holding WAL locks:
-        // If a WAL file exists, try to read the WAL header to extract the PID.
-        // WAL files from dead processes can block new connections.
+        // Non-empty WAL files that have not changed recently can block new
+        // connections after a crash. Use mtime staleness as a conservative
+        // cleanup heuristic; no PID is encoded in the WAL header.
         if (!shouldClean) {
           const walPath = filePath + "-wal";
           if (existsSync(walPath)) {
@@ -618,7 +631,7 @@ export class ContentStore {
         highlight(chunks, 1, char(2), char(3)) AS highlighted
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
-      WHERE chunks MATCH ? AND sources.label LIKE ?
+      WHERE chunks MATCH ? AND sources.label LIKE ? ESCAPE '\\'
       ORDER BY rank
       LIMIT ?
     `);
@@ -663,7 +676,7 @@ export class ContentStore {
         highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
-      WHERE chunks_trigram MATCH ? AND sources.label LIKE ?
+      WHERE chunks_trigram MATCH ? AND sources.label LIKE ? ESCAPE '\\'
       ORDER BY rank
       LIMIT ?
     `);
@@ -710,7 +723,7 @@ export class ContentStore {
         highlight(chunks, 1, char(2), char(3)) AS highlighted
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
-      WHERE chunks MATCH ? AND sources.label LIKE ? AND chunks.content_type = ?
+      WHERE chunks MATCH ? AND sources.label LIKE ? ESCAPE '\\' AND chunks.content_type = ?
       ORDER BY rank
       LIMIT ?
     `);
@@ -755,7 +768,7 @@ export class ContentStore {
         highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
-      WHERE chunks_trigram MATCH ? AND sources.label LIKE ? AND chunks_trigram.content_type = ?
+      WHERE chunks_trigram MATCH ? AND sources.label LIKE ? ESCAPE '\\' AND chunks_trigram.content_type = ?
       ORDER BY rank
       LIMIT ?
     `);
@@ -843,8 +856,9 @@ export class ContentStore {
      * chunks fall back to empty-string columns (legacy behaviour).
      */
     attribution?: { sessionId?: string; eventId?: string };
+    validatePath?: (filePath: string) => void;
   }): IndexResult {
-    const { content, path, source, attribution } = options;
+    const { content, path, source, attribution, validatePath } = options;
 
     // Treat empty string as "no content" so an empty `content` paired with a
     // valid `path` falls back to reading the file. Some MCP clients
@@ -857,14 +871,12 @@ export class ContentStore {
       throw new Error("Either content or path must be provided");
     }
 
-    // Read file via fd to close the TOCTOU window between the security
-    // gate (security.ts evaluateFilePath calls realpathSync) and the read
-    // here. Lexical re-read by path string allowed an attacker to swap a
-    // symlink to a denied target (e.g. ~/.ssh/id_rsa) AFTER gate passed.
-    // openSync + fstat + readFileSync(fd) binds the read to the inode
-    // captured at gate-time. fstat also rejects non-regular files
-    // (directories, character devices) which would otherwise read as ""
-    // or throw inconsistently. See #442 round-3.
+    // Read file via fd and validate the same opened object before reading.
+    // A separate "check path, then open path" sequence is still raceable:
+    // a symlink can be swapped between the check and open. Here we open
+    // first, confirm the current path still names the opened file, then
+    // run the deny-policy callback against the canonical opened target
+    // while the fd remains bound to that object.
     let text: string;
     if (hasContent) {
       text = content!;
@@ -875,11 +887,19 @@ export class ContentStore {
         if (!st.isFile()) {
           throw new Error(`refusing to index ${path}: not a regular file`);
         }
+        const canonicalPath = realpathSync(path!);
+        const currentPathStat = statSync(canonicalPath);
+        if (!sameFile(st, currentPathStat)) {
+          throw new Error(`refusing to index ${path}: file changed during validation`);
+        }
+        validatePath?.(path!);
+        if (canonicalPath !== path) validatePath?.(canonicalPath);
         text = readFileSync(fd, "utf-8");
       } finally {
         closeSync(fd);
       }
     }
+    text = redactText(text).text;
     const label = source ?? path ?? "untitled";
     const chunks = this.#chunkMarkdown(text);
 
@@ -903,6 +923,7 @@ export class ContentStore {
     linesPerChunk: number = 20,
     attribution?: { sessionId?: string; eventId?: string },
   ): IndexResult {
+    content = redactText(content).text;
     if (!content || content.trim().length === 0) {
       return this.#insertChunks([], source, "", undefined, undefined, attribution);
     }
@@ -934,6 +955,7 @@ export class ContentStore {
     maxChunkBytes: number = MAX_CHUNK_BYTES,
     attribution?: { sessionId?: string; eventId?: string },
   ): IndexResult {
+    content = redactText(content).text;
     if (!content || content.trim().length === 0) {
       return this.indexPlainText("", source, undefined, attribution);
     }
@@ -1032,6 +1054,7 @@ export class ContentStore {
       label,
       totalChunks: chunks.length,
       codeChunks,
+      indexedBytes: Buffer.byteLength(text),
     };
   }
 
@@ -1050,7 +1073,7 @@ export class ContentStore {
   }
 
   #sourceFilterParam(source: string, sourceMatchMode: SourceMatchMode): string {
-    return sourceMatchMode === "exact" ? source : `%${source}%`;
+    return sourceMatchMode === "exact" ? source : `%${escapeLikePattern(source)}%`;
   }
 
   search(
@@ -1349,15 +1372,25 @@ export class ContentStore {
         } finally {
           closeSync(fd);
         }
-        const newHash = createHash("sha256").update(newContent).digest("hex");
-        if (newHash === src.content_hash) continue; // content identical — skip
+        const redactedContent = redactText(newContent).text;
+        const newHash = createHash("sha256").update(redactedContent).digest("hex");
+        if (newHash === src.content_hash) {
+          // The raw file changed but redacts to the same stored content. Advance
+          // indexed_at so every later search does not repeatedly reopen and
+          // redact the same file forever.
+          const refreshedAt = new Date(Math.max(Date.now(), mtime.getTime() + 1000))
+            .toISOString()
+            .replace(/\.\d{3}Z$/, "");
+          this.#db.prepare("UPDATE sources SET indexed_at = ? WHERE label = ?").run(refreshedAt, src.label);
+          continue;
+        }
 
         // File genuinely changed — re-index using already-read content
         // (avoids a second open/read race) but preserve file_path/hash
         // by going through index() which stores them. Since we pass
         // content, index() does NOT re-read; the bytes hashed above
         // are exactly the bytes indexed.
-        this.index({ content: newContent, path: src.file_path, source: src.label });
+        this.index({ content: redactedContent, path: src.file_path, source: src.label });
         this.lastRefreshCount++;
       } catch {
         // Graceful degradation — never break search for stale detection
@@ -1620,7 +1653,8 @@ export class ContentStore {
       i++;
       while (i < lines.length) {
         codeLines.push(lines[i]);
-        if (lines[i].startsWith(fence) && lines[i].trim() === fence) break;
+        const trimmedLine = lines[i].trim();
+        if (trimmedLine.startsWith(fence) && /^`+$/.test(trimmedLine)) break;
         i++;
       }
       units.push({ text: codeLines.join("\n"), hasCode: true });
@@ -1628,28 +1662,40 @@ export class ContentStore {
 
     let partIndex = 1;
     let current: Array<{ text: string; hasCode: boolean }> = [];
+    let currentBytes = 0;
+    let currentHasCode = false;
 
     const pushCurrent = () => {
       const part = current.map((unit) => unit.text).join("\n").trim();
-      if (part.length === 0) return;
-      chunks.push({
-        title: `${title} (${partIndex})`,
-        content: part,
-        hasCode: current.some((unit) => unit.hasCode),
-      });
-      partIndex++;
+      if (part.length > 0) {
+        chunks.push({
+          title: `${title} (${partIndex})`,
+          content: part,
+          hasCode: currentHasCode,
+        });
+        partIndex++;
+      }
       current = [];
+      currentBytes = 0;
+      currentHasCode = false;
+    };
+
+    const appendCurrent = (unit: { text: string; hasCode: boolean }, unitBytes = Buffer.byteLength(unit.text)) => {
+      currentBytes += (current.length > 0 ? 1 : 0) + unitBytes;
+      currentHasCode ||= unit.hasCode;
+      current.push(unit);
     };
 
     for (const unit of units) {
-      const candidate = [...current, unit].map((item) => item.text).join("\n");
-      if (Buffer.byteLength(candidate) <= maxChunkBytes) {
-        current.push(unit);
+      const unitBytes = Buffer.byteLength(unit.text);
+      const candidateBytes = currentBytes + (current.length > 0 ? 1 : 0) + unitBytes;
+      if (candidateBytes <= maxChunkBytes) {
+        appendCurrent(unit, unitBytes);
         continue;
       }
       pushCurrent();
-      if (Buffer.byteLength(unit.text) <= maxChunkBytes) {
-        current.push(unit);
+      if (unitBytes <= maxChunkBytes) {
+        appendCurrent(unit, unitBytes);
         continue;
       }
       if (unit.hasCode) {
@@ -1663,8 +1709,10 @@ export class ContentStore {
       }
 
       let segment = "";
-      for (const char of Array.from(unit.text)) {
-        if (Buffer.byteLength(segment + char) > maxChunkBytes && segment.length > 0) {
+      let segmentBytes = 0;
+      for (const char of unit.text) {
+        const charBytes = Buffer.byteLength(char);
+        if (segmentBytes + charBytes > maxChunkBytes && segment.length > 0) {
           chunks.push({
             title: `${title} (${partIndex})`,
             content: segment,
@@ -1672,10 +1720,12 @@ export class ContentStore {
           });
           partIndex++;
           segment = "";
+          segmentBytes = 0;
         }
         segment += char;
+        segmentBytes += charBytes;
       }
-      if (segment.length > 0) current.push({ text: segment, hasCode: false });
+      if (segment.length > 0) appendCurrent({ text: segment, hasCode: false }, segmentBytes);
     }
     pushCurrent();
   }

@@ -72,6 +72,19 @@ describe("filter pipeline", () => {
     expect(result.counts.private_key_block).toBe(1);
   });
 
+  it("preserves quote style for generic secret assignments", () => {
+    const result = redactText([
+      "TOKEN=\"quoted-secret-value\"",
+      "API_KEY='single-quoted-secret'",
+      "PASSWORD=bare-secret",
+    ].join("\n"));
+
+    expect(result.text).toContain("TOKEN=\"<redacted>\"");
+    expect(result.text).toContain("API_KEY='<redacted>'");
+    expect(result.text).toContain("PASSWORD=<redacted>");
+    expect(result.counts.generic_secret_assignment).toBe(3);
+  });
+
   it("fails open when a filter throws", () => {
     const throwingStep: FilterStep = {
       name: "broken-parser",
@@ -116,6 +129,23 @@ describe("filter pipeline", () => {
       "ERROR expected true received false",
       "timeout after 5000ms",
     ]);
+  });
+
+  it("keeps the tail of long failure streams", () => {
+    const result = runFilterPipeline(
+      {
+        command: "npm test",
+        stdout: Array.from({ length: 30 }, (_, i) => `Error early failure ${i}`).join("\n"),
+        stderr: "Final exception root cause",
+        exitCode: 1,
+        durationMs: 99,
+      },
+      [failureFocusFilter],
+    );
+
+    expect(result.important).toHaveLength(25);
+    expect(result.important.map((item) => item.message)).not.toContain("Error early failure 0");
+    expect(result.important.at(-1)?.message).toBe("Final exception root cause");
   });
 
   it("redactText can be used without the full pipeline", () => {

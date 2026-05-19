@@ -106,7 +106,7 @@ function executeApproved(argv: { command: string; args: string[] }, cwd: string,
   const child = spawnSync(argv.command, argv.args, {
     cwd,
     env,
-    stdio: ["inherit", "pipe", "pipe"],
+    stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf8",
     maxBuffer,
   });

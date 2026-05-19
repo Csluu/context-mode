@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 type ServerModule = typeof import("../src/server.js");
 
@@ -87,12 +90,17 @@ describe("server native plugin support", () => {
 
   it("propagates session attribution through withProjectDirOverride", async () => {
     const mod = await importEmbeddedServer();
+    const projectDir = mkdtempSync(join(tmpdir(), "context-mode-native-test-"));
 
-    await mod.withProjectDirOverride(
-      { projectDir: "C:/tmp/context-mode-native-test", sessionId: "native-session-1" },
-      async () => {
-        expect(mod.currentAttribution()).toEqual({ sessionId: "native-session-1" });
-      },
-    );
+    try {
+      await mod.withProjectDirOverride(
+        { projectDir, sessionId: "native-session-1", trusted: true },
+        async () => {
+          expect(mod.currentAttribution()).toEqual({ sessionId: "native-session-1" });
+        },
+      );
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
   });
 });
