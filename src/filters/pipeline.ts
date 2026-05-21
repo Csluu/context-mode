@@ -7,11 +7,11 @@ const REDACTIONS: Array<[string, RegExp]> = [
   ["openai_token", /\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b/g],
   ["jwt", /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g],
   ["private_key_block", /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g],
-  ["cookie_header", /\b((?:Set-)?Cookie:\s*)[^\r\n]+/gi],
-  ["api_key_header", /\b((?:x-api-key|api-key):\s*)[^\r\n]+/gi],
+  ["cookie_header", /(^|\r?\n)(\s*(?:Set-)?Cookie:\s*)[^\r\n]+/gi],
+  ["api_key_header", /(^|\r?\n)(\s*(?:x-api-key|api-key):\s*)[^\r\n]+/gi],
   ["generic_secret_assignment", /\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API[_-]?KEY|AUTH|COOKIE)[A-Z0-9_]*=)(?:"[^"]*"|'[^']*'|[^\s]+)/gi],
   ["common_cookie_assignment", /\b((?:sessionid|session_id|sid|connect\.sid)=)[^\s;]+/gi],
-  ["authorization_header", /\b(Authorization:\s*)(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi],
+  ["authorization_header", /(^|\r?\n)(\s*Authorization:\s*)(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi],
   ["credentialed_url", /(https?:\/\/)([^:\s/@]+):([^@\s]+)@/gi],
 ];
 
@@ -43,8 +43,10 @@ function redactOne(text: string, counts: Record<string, number>): string {
         return quote ? `${prefix}${quote}<redacted>${quote}` : `${prefix}<redacted>`;
       });
     } else if (name === "authorization_header") {
-      out = out.replace(re, "$1$2 <redacted>");
-    } else if (name === "cookie_header" || name === "api_key_header" || name === "common_cookie_assignment") {
+      out = out.replace(re, (_match: string, lineStart: string, prefix: string, scheme: string) => `${lineStart}${prefix}${scheme} <redacted>`);
+    } else if (name === "cookie_header" || name === "api_key_header") {
+      out = out.replace(re, (_match: string, lineStart: string, prefix: string) => `${lineStart}${prefix}<redacted>`);
+    } else if (name === "common_cookie_assignment") {
       out = out.replace(re, "$1<redacted>");
     } else if (name === "credentialed_url") {
       out = out.replace(re, "$1<user>:<redacted>@");

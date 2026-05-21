@@ -130,6 +130,27 @@ describe("OpenClaw tool schemas", () => {
   });
 
   it("keeps OpenClaw stable tool schemas aligned with MCP optional inputs", () => {
+    const readTool = OPENCLAW_TOOL_DEFS.find((tool) => tool.name === "ctx_read");
+    expect(readTool?.parameters.properties).toMatchObject({
+      compact: { type: "boolean" },
+    });
+
+    const codeTool = OPENCLAW_TOOL_DEFS.find((tool) => tool.name === "ctx_code");
+    expect(codeTool?.parameters.properties).toMatchObject({
+      action: { type: "string" },
+      projectDir: { type: "string" },
+      query: { type: "string" },
+      symbol: { type: "string" },
+      file: { type: "string" },
+      kind: { type: "string" },
+      budgetBytes: { type: "number" },
+    });
+
+    const diffTool = OPENCLAW_TOOL_DEFS.find((tool) => tool.name === "ctx_diff");
+    expect(diffTool?.parameters.properties).toMatchObject({
+      summary: { type: "boolean" },
+    });
+
     const executeFileTool = OPENCLAW_TOOL_DEFS.find((tool) => tool.name === "ctx_execute_file");
     expect(executeFileTool?.parameters.properties).toMatchObject({
       projectDir: { type: "string" },
@@ -148,6 +169,7 @@ describe("OpenClaw tool schemas", () => {
     expect(routeTool?.parameters.properties).toMatchObject({
       adapterCanRewrite: { type: "boolean" },
     });
+    expect(routeTool?.parameters.properties.explain.description).toContain("compact JSON");
 
     const doctorTool = OPENCLAW_TOOL_DEFS.find((tool) => tool.name === "ctx_doctor");
     expect(doctorTool?.parameters.properties).toMatchObject({

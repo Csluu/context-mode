@@ -30,7 +30,21 @@ describe("ctx_read tool", () => {
       expect(ok.isError).toBeUndefined();
       expect(ok.content[0].text).toContain("ctx_read symbols:");
       expect(ok.content[0].text).toMatch(/provider: (typescript-compiler|heuristic)/);
-      expect(ok.content[0].text).toContain("binding");
+      expect(ok.content[0].text).toMatch(/(function|binding)/);
+
+      const compact = await tool.handler({ path: "src/App.ts", mode: "symbols", compact: true }, testContext());
+      expect(compact.isError).toBeUndefined();
+      expect(compact.content[0].text).toContain("symbols compact");
+      expect(compact.content[0].text).toMatch(/provider: (typescript-compiler confidence=high|heuristic confidence=low)/);
+      expect(compact.content[0].text).toMatch(/L00001 (function|binding) App/);
+
+      const compactSlice = await tool.handler({ path: "src/App.ts", mode: "slice", compact: true, start: 1, end: 1 }, testContext());
+      expect(compactSlice.isError).toBeUndefined();
+      expect(compactSlice.content[0].text).toBe("1: export const App = () => null;");
+
+      const autoCompactSlice = await tool.handler({ path: "src/App.ts", mode: "slice", start: 1, end: 1 }, testContext());
+      expect(autoCompactSlice.isError).toBeUndefined();
+      expect(autoCompactSlice.content[0].text).toBe("1: export const App = () => null;");
 
       const err = await tool.handler({ path: "../outside.ts" }, testContext());
       expect(err.isError).toBe(true);
@@ -111,6 +125,21 @@ describe("ctx_read tool", () => {
       else process.env.CONTEXT_MODE_ALLOWED_READ_DIRS = previousAllowed;
       rmSync(defaultProjectDir, { recursive: true, force: true });
       rmSync(actualProjectDir, { recursive: true, force: true });
+    }
+  });
+
+  test.runIf(process.platform === "win32")("reports likely unescaped drive-relative Windows paths", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "context-mode-read-winpath-"));
+    try {
+      const tool = makeCtxRead({ getProjectDir: () => projectDir });
+
+      const result = await tool.handler({ path: "C:Users\\chris\\file.ts", mode: "symbols" }, testContext());
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("drive-relative or unescaped");
+      expect(result.content[0].text).toContain("C:/path");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
     }
   });
 

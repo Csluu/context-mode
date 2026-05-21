@@ -102,21 +102,114 @@ describe("ctxRead", () => {
     try {
       const file = join(projectDir, "component.ts");
       writeFileSync(file, [
+        "import { readFileSync } from 'node:fs';",
         "export interface Props { enabled: boolean }",
         "export class Component {",
+        "  private status = 'ready';",
+        "  constructor() {}",
         "  render(): string {",
         "    return 'ok';",
         "  }",
         "}",
+        "export const App = () => null;",
+        "const alpha = 1, beta = 2;",
         ...Array.from({ length: 520 }, (_, i) => `const filler${i} = ${i};`),
       ].join("\n"), "utf8");
 
       const result = ctxRead({ projectDir, path: file, mode: "symbols" });
 
       expect(result.provider).toBe("typescript-compiler");
+      expect(result.providerConfidence).toBe("high");
       expect(result.text).toContain("interface");
       expect(result.text).toContain("class");
       expect(result.text).toContain("method");
+      expect(result.text).toContain("property");
+      expect(result.text).toContain("export const App");
+      expect(result.text).toContain("const alpha");
+      expect(result.text).toContain("const beta");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns compact outline and symbol output with stable line metadata", () => {
+    const projectDir = tempProject();
+    try {
+      const file = join(projectDir, "compact.ts");
+      writeFileSync(file, [
+        "import path from 'node:path';",
+        "export interface Config { enabled: boolean }",
+        "export class Runner {",
+        "  start(): void {}",
+        "}",
+        "export const run = () => true;",
+        ...Array.from({ length: 520 }, (_, i) => `const filler${i} = ${i};`),
+      ].join("\n"), "utf8");
+
+      const normal = ctxRead({ projectDir, path: file, mode: "outline" });
+      const compactOutline = ctxRead({ projectDir, path: file, mode: "outline", compact: true });
+      const compactSymbols = ctxRead({ projectDir, path: file, mode: "symbols", compact: true });
+
+      expect(compactOutline.provider).toBe("typescript-compiler");
+      expect(compactOutline.providerConfidence).toBe("high");
+      expect(compactOutline.text).toContain("outline compact");
+      expect(compactOutline.text).toContain("provider: typescript-compiler confidence=high");
+      expect(compactOutline.text).toMatch(/L00002 interface Config/);
+      expect(compactOutline.text).toMatch(/L00006 function run \(export const\)/);
+      expect(compactOutline.text.length).toBeLessThan(normal.text.length);
+
+      expect(compactSymbols.text).toContain("symbols compact");
+      expect(compactSymbols.text).toMatch(/L00003 class Runner/);
+      expect(compactSymbols.text).toMatch(/L00004 method start/);
+      expect(compactSymbols.text).not.toContain("Suggested slices:");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns compact slice output without padded line-number overhead", () => {
+    const projectDir = tempProject();
+    try {
+      const file = join(projectDir, "slice.ts");
+      writeFileSync(file, [
+        "export const one = 1;",
+        "export const two = 2;",
+        "export const three = 3;",
+      ].join("\n"), "utf8");
+
+      const normal = ctxRead({ projectDir, path: file, mode: "slice", start: 1, end: 3 });
+      const compact = ctxRead({ projectDir, path: file, mode: "slice", compact: true, start: 1, end: 3 });
+
+      expect(normal.text).toContain("    1: export const one");
+      expect(compact.text).toContain("1: export const one");
+      expect(compact.text).not.toContain("    1:");
+      expect(compact.text.length).toBeLessThan(normal.text.length);
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("renders decorated TypeScript declarations by declaration line instead of decorator line", () => {
+    const projectDir = tempProject();
+    try {
+      const file = join(projectDir, "decorated.ts");
+      writeFileSync(file, [
+        "function Injectable(): ClassDecorator { return () => undefined; }",
+        "function Log(): MethodDecorator { return () => undefined; }",
+        "@Injectable()",
+        "export class Service {",
+        "  @Log()",
+        "  run(): void {}",
+        "}",
+      ].join("\n"), "utf8");
+
+      const result = ctxRead({ projectDir, path: file, mode: "symbols" });
+
+      expect(result.provider).toBe("typescript-compiler");
+      expect(result.text).toContain("export class Service");
+      expect(result.text).toContain("run(): void");
+      expect(result.text).not.toContain("class     @Injectable()");
+      expect(result.text).not.toContain("method    @Log()");
     } finally {
       rmSync(projectDir, { recursive: true, force: true });
     }
@@ -162,12 +255,74 @@ describe("ctxRead", () => {
     }
   });
 
-  it("blocks binary files and path traversal", () => {
+  it("detects Python functions with the heuristic symbol provider", () => {
+    const projectDir = tempProject();
+    try {
+      const file = join(projectDir, "evaluate.py");
+      writeFileSync(file, [
+        "from pathlib import Path",
+        "import json",
+        "",
+        "async def score_async(value):",
+        "    return value",
+        "",
+        "def evaluate(path):",
+        "    return Path(path).exists()",
+        "",
+        "class Runner:",
+        "    pass",
+      ].join("\n"), "utf8");
+
+      const result = ctxRead({ projectDir, path: file, mode: "symbols" });
+
+      expect(result.provider).toBe("heuristic");
+      expect(result.text).toContain("import");
+      expect(result.text).toContain("async def score_async");
+      expect(result.text).toContain("def evaluate");
+      expect(result.text).toContain("class Runner");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("detects Rust symbols with the heuristic symbol provider", () => {
+    const projectDir = tempProject();
+    try {
+      const file = join(projectDir, "lib.rs");
+      writeFileSync(file, [
+        "pub mod worker;",
+        "pub struct Worker { id: String }",
+        "impl Worker {",
+        "  pub fn new(id: String) -> Self { Self { id } }",
+        "}",
+        "pub async fn build_worker() -> Worker {",
+        "  Worker::new(\"default\".to_string())",
+        "}",
+      ].join("\n"), "utf8");
+
+      const result = ctxRead({ projectDir, path: file, mode: "symbols" });
+
+      expect(result.provider).toBe("heuristic");
+      expect(result.text).toContain("module");
+      expect(result.text).toContain("struct");
+      expect(result.text).toContain("impl");
+      expect(result.text).toContain("pub fn new");
+      expect(result.text).toContain("pub async fn build_worker");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns binary metadata stubs and still blocks path traversal", () => {
     const projectDir = tempProject();
     try {
       const binary = join(projectDir, "image.bin");
       writeFileSync(binary, Buffer.from([0, 1, 2, 3, 4, 5]));
-      expect(() => ctxRead({ projectDir, path: binary, mode: "full" })).toThrow(/binary file blocked/);
+      const result = ctxRead({ projectDir, path: binary, mode: "full" });
+      expect(result.provider).toBe("binary-stub");
+      expect(result.text).toContain("binary: application/octet-stream");
+      expect(result.text).toContain("bytes: 6");
+      expect(result.text).toContain("magic: 00 01 02 03 04 05");
       expect(() => resolveReadPath(projectDir, "../outside.txt")).toThrow(/escapes project root/);
     } finally {
       rmSync(projectDir, { recursive: true, force: true });
@@ -183,6 +338,24 @@ describe("ctxRead", () => {
 
       expect(() => ctxRead({ projectDir, path: ".env", mode: "full" })).toThrow(/sensitive file blocked/);
       expect(() => ctxRead({ projectDir, path: join(".ssh", "id_ed25519"), mode: "full" })).toThrow(/sensitive file blocked/);
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks sensitive-looking requested paths before following symlinks", () => {
+    const projectDir = tempProject();
+    try {
+      const target = join(projectDir, "plain.txt");
+      const link = join(projectDir, ".env");
+      writeFileSync(target, "not-secret", "utf8");
+      try {
+        symlinkSync(target, link, "file");
+      } catch {
+        return;
+      }
+
+      expect(() => ctxRead({ projectDir, path: ".env", mode: "full" })).toThrow(/sensitive file blocked/);
     } finally {
       rmSync(projectDir, { recursive: true, force: true });
     }

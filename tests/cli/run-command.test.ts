@@ -128,6 +128,23 @@ describe("context-mode run", () => {
     expect(allowed.stdout).toContain("ctx_cache");
   });
 
+  it("allows git diff CLI without experimental opt-in", () => {
+    const result = spawnSync(process.execPath, [
+      TSX_CLI,
+      CLI_TS,
+      "diff",
+      "--json",
+    ], {
+      cwd: ROOT,
+      env: { ...process.env, CTX_MODE_EXPERIMENTAL: "", CONTEXT_MODE_EXPERIMENTAL: "" },
+      encoding: "utf8",
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).not.toContain("experimental");
+    expect(JSON.parse(result.stdout).schemaVersion).toBe(1);
+  });
+
   it("preserves argv boundaries when command is passed as separate arguments", () => {
     const result = spawnSync(process.execPath, [
       TSX_CLI,

@@ -10,7 +10,8 @@
 //     written by one side never leaks into the other.
 //   - Reported ms/bytes: median + p95 over the N iterations.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +26,12 @@ export const reportDir = join(repoRoot, "build", "compare");
 export const DEFAULT_ITERATIONS = 5;
 export const DEFAULT_WARMUPS = 1;
 export const DIVERGENCE_PREVIEW_LINES = 5;
+
+export function makeCompareRuntimeDir(prefix: string): string {
+  const root = join(reportDir, "runtime");
+  mkdirSync(root, { recursive: true });
+  return mkdtempSync(join(root, `${prefix}-`));
+}
 
 export interface Scenario {
   name: string;
@@ -41,6 +48,10 @@ export interface Scenario {
   /** Correctness oracle. Return [] if OK, else list of issue strings.
    *  Receives the canonicalized text of the LAST measured iteration. */
   assert?: (text: string) => string[];
+  /** Mark expected behavior divergence (fork superset, intentional shape
+   *  difference). Parity is still graded + reported, but exitOnFailure
+   *  ignores this row. Use sparingly — document the reason. */
+  expectDivergence?: boolean;
 }
 
 export interface IterStats {
@@ -70,6 +81,7 @@ export interface Row {
   fork: SideMetric;
   upstream: SideMetric;
   parity: "match" | "equivalent" | "divergent" | "error";
+  expectedDivergence: boolean;
   assertIssues: string[];
   diffPreview: string;
   notes: string;
@@ -223,6 +235,7 @@ export async function runScenario(
     fork: emptySide(),
     upstream: emptySide(),
     parity: "error",
+    expectedDivergence: s.expectDivergence === true,
     assertIssues: [],
     diffPreview: "",
     notes: "",
@@ -270,11 +283,16 @@ export async function runScenario(
 
   for (let i = 0; i < iterations; i++) {
     const f = await oneCall(fork, s);
-    if (f.ok) { forkMs.push(f.ms); forkBytes.push(f.bytes); lastForkText = f.text; }
+    // Capture text on every iteration, including isError responses — assert
+    // hooks may want to validate error-shaped output (e.g. value-trace's
+    // "missing-db" response when session hooks aren't installed).
+    if (f.text) lastForkText = f.text;
+    if (f.ok) { forkMs.push(f.ms); forkBytes.push(f.bytes); }
     else { forkFailures++; forkErr = f.err || forkErr; }
     if (upstream) {
       const u = await oneCall(upstream, s);
-      if (u.ok) { upMs.push(u.ms); upBytes.push(u.bytes); lastUpText = u.text; }
+      if (u.text) lastUpText = u.text;
+      if (u.ok) { upMs.push(u.ms); upBytes.push(u.bytes); }
       else { upFailures++; upErr = u.err || upErr; }
     }
   }
@@ -398,10 +416,26 @@ export function readPinnedSha(): string {
   return "unknown";
 }
 
+function gitText(args: string[]): string | null {
+  try {
+    return execFileSync("git", ["-C", repoRoot, ...args], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
 export function buildMeta(suite: string): ReportMeta {
+  const status = gitText(["status", "--porcelain=v1"]) ?? "";
+  const dirtyLines = status.split(/\r?\n/).filter(Boolean);
   return {
     suite,
-    fork_sha: process.env.GITHUB_SHA || "local",
+    fork_sha: process.env.GITHUB_SHA || gitText(["rev-parse", "--short", "HEAD"]) || "local",
+    fork_dirty: dirtyLines.length > 0 ? "true" : "false",
+    fork_dirty_count: String(dirtyLines.length),
+    fork_changed_files: String(new Set(dirtyLines.map((line) => line.slice(3).trim().split(" -> ").pop() ?? "")).size),
     upstream_pin: readPinnedSha(),
     node: process.version,
     platform: `${process.platform} ${process.arch}`,
@@ -463,9 +497,15 @@ export function logRow(r: Row): void {
 }
 
 export function exitOnFailure(rows: Row[]): never | void {
-  const failed = rows.filter((r) => r.parity === "divergent" || r.parity === "error" || r.assertIssues.length > 0);
+  const failed = rows.filter((r) => {
+    if (r.assertIssues.length > 0) return true;
+    if (r.expectedDivergence) return false; // covers divergent + error (test env)
+    if (r.parity === "error") return true;
+    if (r.parity === "divergent") return true;
+    return false;
+  });
   if (failed.length > 0) {
-    console.error(`[compare] ${failed.length} scenario(s) divergent / errored / assert-failed`);
+    console.error(`[compare] ${failed.length} scenario(s) failed (excluding expected divergences)`);
     process.exit(1);
   }
 }

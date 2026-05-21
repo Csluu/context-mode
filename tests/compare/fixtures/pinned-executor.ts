@@ -781,5 +781,7 @@ export class PolyglotExecutor {
         // names (e.g. `System.Text.Json.JsonDocument`) instead of `using`.
         return `var FILE_CONTENT_PATH = ${escaped};\nvar file_path = FILE_CONTENT_PATH;\nvar FILE_CONTENT = System.IO.File.ReadAllText(FILE_CONTENT_PATH);\n${code}`;
     }
+    const _exhaustive: never = language;
+    return _exhaustive;
   }
 }

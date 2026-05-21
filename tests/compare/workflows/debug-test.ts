@@ -21,21 +21,25 @@ console.log("[vitest] 2 failed | 47 passed");
 const wf: Workflow = {
   name: "debug-test",
   description: "Simulate vitest output via sandbox, search for FAIL markers, read the implicated file's outline.",
+  forkOnly: true, // ctx_read is fork-only
   steps: [
     {
       label: "simulate-vitest",
       tool: "ctx_execute",
       args: { language: "javascript", code: simulateVitest, intent: "failing tests" },
+      assert: (t) => /FAIL|vitest|AssertionError|indexed/i.test(t),
     },
     {
       label: "search-fail",
       tool: "ctx_search",
       args: { queries: ["FAIL", "AssertionError"] },
+      assert: (t) => /FAIL|AssertionError/i.test(t),
     },
     {
       label: "read-store-outline",
       tool: "ctx_read",
       args: { path: join(repoRoot, "src", "store.ts"), mode: "outline" },
+      assert: (t) => /ContentStore|class|function|export/i.test(t),
     },
   ],
 };

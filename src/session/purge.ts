@@ -341,14 +341,17 @@ export function purgeSession(opts: PurgeOpts): PurgeResult {
     : [canonicalHash, legacyHash];
 
   let sessDbFound = false;
+  let codeIndexFound = false;
   let eventsFound = false;
   for (const h of hashes) {
     const base = join(sessionsDir, `${h}${worktreeSuffix}`);
     if (tryUnlinkSqliteTriple(`${base}.db`, wipedPaths, dryRun)) sessDbFound = true;
+    if (tryUnlinkSqliteTriple(`${base}.code-index.db`, wipedPaths, dryRun)) codeIndexFound = true;
     if (tryUnlink(`${base}-events.md`, wipedPaths, dryRun)) eventsFound = true;
     tryUnlink(`${base}.cleanup`, wipedPaths, dryRun); // no user-facing label
   }
   if (sessDbFound) deleted.push("session events DB");
+  if (codeIndexFound) deleted.push("static code index DB");
   if (eventsFound) deleted.push("session events markdown");
 
   return { deleted, wipedPaths, dryRun };

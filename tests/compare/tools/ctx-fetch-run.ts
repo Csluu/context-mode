@@ -16,6 +16,7 @@ async function seed(client: McpStdioClient): Promise<void> {
 
 const suite: Suite = {
   name: "ctx-fetch-run",
+  forkOnly: true,
   scenarios: [
     {
       tool: "ctx_fetch_run", name: "list", args: { list: true }, setup: seed,

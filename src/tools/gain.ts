@@ -35,6 +35,11 @@ function fmtBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(2)}MB`;
 }
 
+function fmtIso(ms: number | undefined): string | undefined {
+  if (!Number.isFinite(ms)) return undefined;
+  return new Date(ms!).toISOString();
+}
+
 function requestedPersistentTelemetry(input: GainInput): boolean {
   return Boolean(input.session || input.lastDays);
 }
@@ -130,7 +135,22 @@ export function makeCtxGain(deps: GainDeps): ToolDefinition<GainInput, ToolTextR
           lastDays: input.lastDays,
         })
         : undefined;
+      const currentSessionId = deps.getCurrentSessionId?.();
+      const sessionStartIso = fmtIso(stats.sessionStart);
+      const scope = {
+        label: "current runtime session",
+        projectDir: deps.getProjectDir(),
+        sessionId: currentSessionId,
+        sessionStart: sessionStartIso,
+        sidecarFilter: currentSessionId
+          ? "sessionId"
+          : sessionStartIso
+            ? "sessionStart"
+            : "project artifacts",
+        includesHistoricalRuntimeActivity: Boolean(stats.sessionStart && Date.now() - stats.sessionStart > 60 * 60 * 1000),
+      };
       const payload = {
+        scope,
         returnedBytes: returned,
         keptOutBytes: keptOut,
         savedPercent,
@@ -147,6 +167,14 @@ export function makeCtxGain(deps: GainDeps): ToolDefinition<GainInput, ToolTextR
       }
       const lines = [
         "ctx_gain current session",
+        `scope: ${scope.label}`,
+        `project: ${scope.projectDir}`,
+        ...(scope.sessionId ? [`session id: ${scope.sessionId}`] : []),
+        ...(scope.sessionStart ? [`session started: ${scope.sessionStart}`] : ["session started: unknown"]),
+        `sidecar filter: ${scope.sidecarFilter}`,
+        ...(scope.includesHistoricalRuntimeActivity
+          ? ["note: this runtime session is over 1h old; numbers may include earlier work in the same long-running session."]
+          : []),
         "",
         `returned: ${fmtBytes(returned)}`,
         `kept out: ${fmtBytes(keptOut)}`,

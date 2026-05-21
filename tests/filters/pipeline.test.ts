@@ -154,4 +154,23 @@ describe("filter pipeline", () => {
     expect(result.text).toBe("https://<user>:<redacted>@example.com/path");
     expect(result.counts.credentialed_url).toBe(1);
   });
+
+  it("does not redact harmless source code that mentions header patterns mid-line", () => {
+    const source = [
+      "const cookiePattern = /Cookie:\\s*[^\\r\\n]+/gi;",
+      "const authExample = \"Authorization: Bearer token-shape-in-docs\";",
+      "const apiKeyHeader = /x-api-key:\\s*[^\\r\\n]+/gi;",
+      "max_tokens: z.number().optional(),",
+    ].join("\n");
+
+    const result = redactText(source);
+
+    expect(result.text).toContain("Cookie:\\s*");
+    expect(result.text).toContain("Authorization: Bearer token-shape-in-docs");
+    expect(result.text).toContain("x-api-key:\\s*");
+    expect(result.text).toContain("max_tokens");
+    expect(result.counts.cookie_header).toBeUndefined();
+    expect(result.counts.authorization_header).toBeUndefined();
+    expect(result.counts.api_key_header).toBeUndefined();
+  });
 });

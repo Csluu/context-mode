@@ -110,6 +110,7 @@ Added layered config and richer diagnostics:
 - `src/tools/doctor.ts`
 
 `ctx_doctor` now reports router/config/tier information, including JSON output.
+`ctx_diff` is now a stable default tool for git-text diff inventory, optional Difftastic-style summaries, ref ranges, and raw sidecars.
 
 ### Experimental features
 
@@ -118,7 +119,6 @@ Implemented but kept hidden by default:
 - `ctx_guard`: scanner for secrets, prompt-injection markers, unsafe terminal controls.
 - `ctx_eval`: fixture harness for parser/router/redaction/no-critical-omission correctness.
 - `ctx_trace`: local trace summary and why-big analysis.
-- `ctx_diff`: git-text diff inventory plus optional Difftastic-style direction.
 - `ctx_cache`: explain cache eligibility and run an explicit `tsc --noEmit` serving canary.
 
 These remain gated by:
@@ -165,7 +165,7 @@ Added `.gitignore` exceptions so those docs are not ignored by `/docs/*`.
 
 Updated platform instruction/config files so agents know about:
 
-- stable tools: `ctx_read`, `ctx_route`, `ctx_fetch_run`, `ctx_gain`, `ctx_discover`
+- stable tools: `ctx_read`, `ctx_route`, `ctx_fetch_run`, `ctx_gain`, `ctx_discover`, `ctx_diff`
 - experimental tools hidden by default
 - Graphify first for repo-wide architecture
 - Serena for exact symbol/reference navigation
@@ -288,13 +288,13 @@ Default stable new tools:
 - `ctx_fetch_run`
 - `ctx_gain`
 - `ctx_discover`
+- `ctx_diff`
 
 Default hidden experimental tools:
 
 - `ctx_guard`
 - `ctx_eval`
 - `ctx_trace`
-- `ctx_diff`
 - `ctx_cache`
 
 ### Bundle drift

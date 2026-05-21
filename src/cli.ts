@@ -202,7 +202,6 @@ if (args[0] === "doctor") {
   requireExperimentalCliCommand("trace");
   cliTrace(args.slice(1)).then((code) => process.exit(code));
 } else if (args[0] === "diff") {
-  requireExperimentalCliCommand("diff");
   process.exit(cliDiff(args.slice(1)));
 } else if (args[0] === "cache") {
   requireExperimentalCliCommand("cache");
@@ -483,6 +482,8 @@ function cliDiff(argv: string[]): number {
   const result = collectGitTextDiff({
     repoDir: process.cwd(),
     staged: hasFlag(argv, "--staged"),
+    from: valueAfter(argv, "--from"),
+    to: valueAfter(argv, "--to"),
     semantic: hasFlag(argv, "--semantic"),
     includeRaw: false,
   });

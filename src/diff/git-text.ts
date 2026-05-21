@@ -65,6 +65,8 @@ export interface CtxDiffResult {
 export interface CollectGitTextDiffOptions {
   readonly repoDir: string;
   readonly staged?: boolean;
+  readonly from?: string;
+  readonly to?: string;
   readonly maxInputBytes?: number;
   readonly includeRaw?: boolean;
   readonly semantic?: boolean;
@@ -80,14 +82,46 @@ function git(repoDir: string, args: readonly string[], maxBuffer: number): strin
   });
 }
 
-function runDifftastic(repoDir: string, baseArgs: readonly string[], maxBuffer: number, command = "difft"): { version?: string; diff: string } {
+function normalizeDiffRef(ref: string | undefined, name: "from" | "to"): string | undefined {
+  const trimmed = ref?.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.startsWith("-") || /[\0\r\n]/.test(trimmed)) {
+    throw new Error(`ctx_diff ${name} ref must be a Git revision, not an option or multiline value`);
+  }
+  return trimmed;
+}
+
+function verifyDiffRef(repoDir: string, ref: string, name: "from" | "to", maxBuffer: number): void {
+  try {
+    git(repoDir, ["rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`], maxBuffer);
+  } catch {
+    throw new Error(`ctx_diff ${name} ref does not resolve to a Git revision`);
+  }
+}
+
+function diffScopeArgs(opts: CollectGitTextDiffOptions, maxBuffer: number): string[] {
+  if (opts.staged && (opts.from?.trim() || opts.to?.trim())) {
+    throw new Error("ctx_diff staged mode cannot be combined with from/to refs");
+  }
+  if (opts.staged) return ["--cached"];
+  const from = normalizeDiffRef(opts.from, "from");
+  const to = normalizeDiffRef(opts.to, "to");
+  if (to && !from) {
+    throw new Error("ctx_diff to ref requires a from ref");
+  }
+  if (from) verifyDiffRef(opts.repoDir, from, "from", maxBuffer);
+  if (to) verifyDiffRef(opts.repoDir, to, "to", maxBuffer);
+  return from ? (to ? [from, to] : [from]) : [];
+}
+
+function runDifftastic(repoDir: string, scopeArgs: readonly string[], maxBuffer: number, command = "difft"): { version?: string; diff: string } {
   const version = execFileSync(command, ["--version"], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
     timeout: 2000,
     maxBuffer: 256 * 1024,
   }).trim().split(/\r?\n/)[0];
-  const diff = execFileSync("git", ["-C", repoDir, "-c", `diff.external=${command}`, ...baseArgs, "--", "."], {
+  const diff = execFileSync("git", ["-C", repoDir, "-c", `diff.external=${command}`, "diff", ...scopeArgs, "--", "."], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
     timeout: 10_000,
@@ -227,18 +261,27 @@ function riskFor(items: readonly DiffInventoryItem[], rawDiff: string | undefine
   };
 }
 
+function displayText(value: string): string {
+  return value.replace(/[\0-\x1F\x7F]/g, (char) => {
+    if (char === "\n") return "\\n";
+    if (char === "\r") return "\\r";
+    if (char === "\t") return "\\t";
+    return `\\x${char.charCodeAt(0).toString(16).padStart(2, "0")}`;
+  });
+}
+
 export function collectGitTextDiff(opts: CollectGitTextDiffOptions): CtxDiffResult {
   const started = Date.now();
   const maxInputBytes = opts.maxInputBytes ?? 2 * 1024 * 1024;
-  const baseArgs = opts.staged ? ["diff", "--cached"] : ["diff"];
   const warnings: string[] = [];
   try {
+    const scopeArgs = diffScopeArgs(opts, maxInputBytes);
     if (!existsSync(join(opts.repoDir, ".git"))) {
       warnings.push("repoDir does not contain a .git directory; git may still resolve via parent worktree");
     }
-    const nameStatus = git(opts.repoDir, [...baseArgs, "--name-status", "-z"], maxInputBytes);
-    const numstat = parseNumstat(git(opts.repoDir, [...baseArgs, "--numstat"], maxInputBytes));
-    const summary = git(opts.repoDir, [...baseArgs, "--summary"], maxInputBytes);
+    const nameStatus = git(opts.repoDir, ["diff", "--name-status", "-z", ...scopeArgs, "--", "."], maxInputBytes);
+    const numstat = parseNumstat(git(opts.repoDir, ["diff", "--numstat", ...scopeArgs, "--", "."], maxInputBytes));
+    const summary = git(opts.repoDir, ["diff", "--summary", ...scopeArgs, "--", "."], maxInputBytes);
     const inventory = withStats(parseNameStatusZ(nameStatus), numstat, detectModeChanges(summary));
     let rawDiff: string | undefined;
     let rawFallbackReason: string | undefined;
@@ -248,7 +291,7 @@ export function collectGitTextDiff(opts: CollectGitTextDiffOptions): CtxDiffResu
     let providerVersion: string | undefined;
     if (opts.includeRaw) {
       try {
-        rawDiff = git(opts.repoDir, [...baseArgs, "--", "."], maxInputBytes);
+        rawDiff = git(opts.repoDir, ["diff", ...scopeArgs, "--", "."], maxInputBytes);
       } catch (err) {
         rawFallbackReason = err instanceof Error ? err.message : String(err);
         warnings.push(`raw diff omitted: ${rawFallbackReason}`);
@@ -256,7 +299,7 @@ export function collectGitTextDiff(opts: CollectGitTextDiffOptions): CtxDiffResu
     }
     if (opts.semantic) {
       try {
-        const difftastic = runDifftastic(opts.repoDir, baseArgs, maxInputBytes, opts.difftasticCommand);
+        const difftastic = runDifftastic(opts.repoDir, scopeArgs, maxInputBytes, opts.difftasticCommand);
         providerName = "difftastic";
         providerVersion = difftastic.version;
         semanticDiff = difftastic.diff;
@@ -317,20 +360,72 @@ export function renderDiffSummary(result: CtxDiffResult): string {
       const stat = item.additions !== undefined || item.deletions !== undefined
         ? ` +${item.additions ?? "?"}/-${item.deletions ?? "?"}`
         : "";
-      const old = item.oldPath ? ` from ${item.oldPath}` : "";
-      lines.push(`- ${item.status} ${item.path}${old}${stat}${item.binary ? " binary" : ""}`);
+      const old = item.oldPath ? ` from ${displayText(item.oldPath)}` : "";
+      lines.push(`- ${item.status} ${displayText(item.path)}${old}${stat}${item.binary ? " binary" : ""}`);
     }
   }
   if (result.semanticGroups.length > 0) {
     lines.push("", "Semantic groups:");
     for (const semantic of result.semanticGroups) {
-      const names = semantic.files.slice(0, 8).map((file) => basename(file)).join(", ");
+      const names = semantic.files.slice(0, 8).map((file) => displayText(basename(file))).join(", ");
       lines.push(`- ${semantic.kind}: ${semantic.files.length} file(s) ${names} — ${semantic.summary}`);
     }
   }
   if (result.warnings.length > 0) {
     lines.push("", "Warnings:");
-    for (const warning of result.warnings) lines.push(`- ${warning}`);
+    for (const warning of result.warnings) lines.push(`- ${displayText(warning)}`);
+  }
+  return lines.join("\n");
+}
+
+export function renderDiffCompact(result: CtxDiffResult): string {
+  // Summary mode: keep file inventory, drop semantic-group prose. Mirrors
+  // `git diff --stat` shape but with status codes instead of bars.
+  const lines = [
+    `ctx_diff ${result.provider.status} (compact) files: ${result.inventory.length} risk: ${result.risk.level}`,
+  ];
+  if (result.inventory.length > 0) {
+    for (const item of result.inventory.slice(0, 50)) {
+      const stat = item.additions !== undefined || item.deletions !== undefined
+        ? ` +${item.additions ?? "?"}/-${item.deletions ?? "?"}`
+        : "";
+      const old = item.oldPath ? ` from ${displayText(item.oldPath)}` : "";
+      lines.push(`- ${item.status} ${displayText(item.path)}${old}${stat}${item.binary ? " binary" : ""}`);
+    }
+    if (result.inventory.length > 50) lines.push(`... ${result.inventory.length - 50} more`);
+  }
+  if (result.risk.reasonCodes.length > 0) {
+    lines.push(`risk-codes: ${result.risk.reasonCodes.join(", ")}`);
+  }
+  return lines.join("\n");
+}
+
+export function renderDiffRiskFocus(result: CtxDiffResult): string {
+  // Risk mode: lead with risk verdict, list only files that triggered a risk
+  // code. Drops textual inventory and the generic semantic groups.
+  const lines = [
+    `ctx_diff risk=${result.risk.level} files: ${result.inventory.length}`,
+    `summary: ${result.risk.summary}`,
+  ];
+  if (result.risk.reasonCodes.length > 0) {
+    lines.push(`codes: ${result.risk.reasonCodes.join(", ")}`);
+  } else {
+    lines.push("codes: none");
+  }
+  const riskyFiles = result.inventory.filter((item) =>
+    item.binary
+    || item.status === "deleted"
+    || item.status === "renamed"
+    || isLockfile(item.path)
+    || isApi(item.path)
+  );
+  if (riskyFiles.length > 0) {
+    lines.push("", "risky-files:");
+    for (const item of riskyFiles.slice(0, 30)) {
+      const tag = item.binary ? "binary" : isLockfile(item.path) ? "lockfile" : isApi(item.path) ? "api" : item.status;
+      lines.push(`- ${tag} ${displayText(item.path)}`);
+    }
+    if (riskyFiles.length > 30) lines.push(`... ${riskyFiles.length - 30} more`);
   }
   return lines.join("\n");
 }

@@ -285,7 +285,7 @@ Node:      v20.x  | Bun: v1.x  | OS: win32 26200
 | `compare:fetch` | `ctx_fetch_and_index` only (local fixture server) |
 | `compare:stats` | `ctx_stats`/`ctx_gain`/`ctx_discover` shape parity |
 | `compare:value-parsers` | Dim 4 — parser-driven bytes reduction (fork-only) |
-| `compare:value-diff` | Dim 4 — `ctx_diff` (fork-only, experimental) |
+| `compare:value-diff` | Dim 4 — `ctx_diff` (fork-only) |
 | `compare:value-trace` | Dim 4 — `ctx_trace` (fork-only, experimental) |
 
 ## CI

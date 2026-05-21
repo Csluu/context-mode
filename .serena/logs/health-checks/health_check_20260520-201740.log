@@ -1,0 +1,6 @@
+INFO  2026-05-20 20:17:40,427 serena.cli:health_check:939 - Starting health check for project: C:\Users\chris\Documents\GitHub\context-mode
+INFO  2026-05-20 20:17:40,430 serena.cli:health_check:943 - Creating SerenaAgent with disabled dashboard...
+INFO  2026-05-20 20:17:40,434 serena.util.file_system:_load_gitignore_files:152 - Processing .gitignore file: C:\Users\chris\Documents\GitHub\context-mode\.serena\.gitignore
+INFO  2026-05-20 20:17:40,436 serena.util.file_system:_load_gitignore_files:152 - Processing .gitignore file: C:\Users\chris\Documents\GitHub\context-mode\insight\.gitignore
+INFO  2026-05-20 20:17:40,466 serena.util.file_system:stop:336 - Loading of .gitignore files completed in 0.040 seconds
+INFO  2026-05-20 20:17:40,467 serena.project:stop:336 - Gathering ignore spec for project context-mode completed in 0.041 seconds

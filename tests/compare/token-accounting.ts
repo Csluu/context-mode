@@ -21,6 +21,7 @@ export type ToolCategory =
   | "fetch"
   | "route"
   | "index"
+  | "diff"
   | "diag"
   | "experimental"
   | "other";
@@ -56,7 +57,7 @@ const META: Record<string, ToolMeta> = {
   ctx_discover:          { tool: "ctx_discover",          category: "diag",         displaces: "(none)" },
   ctx_purge:             { tool: "ctx_purge",             category: "diag",         displaces: "(none)" },
   ctx_upgrade:           { tool: "ctx_upgrade",           category: "diag",         displaces: "(none)" },
-  ctx_diff:              { tool: "ctx_diff",              category: "experimental", displaces: "Bash" },
+  ctx_diff:              { tool: "ctx_diff",              category: "diff",         displaces: "Bash" },
   ctx_trace:             { tool: "ctx_trace",             category: "experimental", displaces: "(none)" },
   ctx_eval:              { tool: "ctx_eval",              category: "experimental", displaces: "(none)" },
   ctx_guard:             { tool: "ctx_guard",             category: "experimental", displaces: "(none)" },

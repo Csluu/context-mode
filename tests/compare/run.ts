@@ -6,9 +6,10 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { existsSync } from "node:fs";
 import {
-  buildMeta, exitOnFailure, isolateEnv, logRow, preflight, runScenario,
-  type Row, withClients, withForkOnly, writeReport,
+  buildMeta, exitOnFailure, forkServer, isolateEnv, logRow, preflight, runScenario,
+  upstreamServer, type Row, withClients, withForkOnly, writeReport,
 } from "./lib.js";
+import { McpStdioClient } from "./runner.js";
 import type { Suite } from "./suite.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -28,13 +29,42 @@ async function loadSuite(name: string): Promise<Suite> {
   return suite;
 }
 
+async function runScenariosFreshClients(suite: Suite, forkEnvBase: Record<string, string>, upEnvBase: Record<string, string> | null): Promise<Row[]> {
+  const out: Row[] = [];
+  for (let i = 0; i < suite.scenarios.length; i++) {
+    const s = suite.scenarios[i];
+    const forkEnv = { ...isolateEnv(`${suite.name}-fork-s${i}`), ...(suite.env || {}) };
+    const fork = new McpStdioClient(forkServer, { env: forkEnv });
+    let upstream: McpStdioClient | null = null;
+    if (upEnvBase) {
+      const upEnv = { ...isolateEnv(`${suite.name}-up-s${i}`), ...(suite.env || {}) };
+      upstream = new McpStdioClient(upstreamServer, { env: upEnv });
+    }
+    try {
+      await fork.initialize();
+      if (upstream) await upstream.initialize();
+      const row = await runScenario(fork, upstream, s);
+      out.push(row);
+      logRow(row);
+    } finally {
+      fork.close();
+      upstream?.close();
+    }
+  }
+  // suppress lint
+  void forkEnvBase; void upEnvBase;
+  return out;
+}
+
 export async function runSuite(suite: Suite): Promise<Row[]> {
   if (suite.beforeAll) await suite.beforeAll.call(suite);
   const forkEnv = { ...isolateEnv(`${suite.name}-fork`), ...(suite.env || {}) };
   const upEnv = { ...isolateEnv(`${suite.name}-upstream`), ...(suite.env || {}) };
   let rows: Row[] = [];
   try {
-    if (suite.forkOnly) {
+    if (suite.freshClientPerScenario) {
+      rows = await runScenariosFreshClients(suite, forkEnv, suite.forkOnly ? null : upEnv);
+    } else if (suite.forkOnly) {
       rows = await withForkOnly(forkEnv, async (fork) => {
         const out: Row[] = [];
         for (const s of suite.scenarios) {
@@ -77,4 +107,8 @@ async function main(): Promise<void> {
   exitOnFailure(rows);
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+// Only run main() when invoked directly, not when imported by run-all.ts.
+const invokedDirectly = process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url;
+if (invokedDirectly) {
+  main().catch((e) => { console.error(e); process.exit(1); });
+}

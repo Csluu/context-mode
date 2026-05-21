@@ -54,12 +54,13 @@ Use `ctx_execute(language: "shell", code: "grep ...")` in sandbox.
 | `ctx_fetch_run` | List/fetch redacted sidecar output created by previous runs. |
 | `ctx_gain` | Show current-session context savings from sandbox/index/cache/sidecars. |
 | `ctx_discover` | Show missed savings, bypass categories, and noisy tool patterns. |
+| `ctx_diff` | Summarize Git changes with inventory, semantic groups, and risk reason codes. |
 | `ctx_execute` / `ctx_batch_execute` | Sandbox command/data processing; only selected stdout enters context. |
 | `ctx_search` / `ctx_index` / `ctx_fetch_and_index` | Knowledge-base search/index/web ingestion. |
 
 ## Experimental tools
 
-`ctx_guard`, `ctx_eval`, `ctx_trace`, `ctx_diff`, and `ctx_cache` are hidden unless `CTX_MODE_EXPERIMENTAL=1` or `CONTEXT_MODE_EXPERIMENTAL=1`. Do not assume they exist during normal agent work. Prefer stable tools above.
+`ctx_guard`, `ctx_eval`, `ctx_trace`, and `ctx_cache` are hidden unless `CTX_MODE_EXPERIMENTAL=1` or `CONTEXT_MODE_EXPERIMENTAL=1`. Do not assume they exist during normal agent work. Prefer stable tools above.
 
 ## Parallel I/O batches
 

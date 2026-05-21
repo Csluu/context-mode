@@ -36,31 +36,34 @@ Use `ctx_execute(language: "shell", code: "grep ...")` in sandbox.
 ## Tool selection
 
 0. **MEMORY**: `ctx_search(sort: "timeline")` — after resume, check prior context before asking user.
-1. **FILE MAPS**: `ctx_read(path, mode)` — first choice for file exploration, repeated reads, symbol maps, outlines, and bounded slices.
-2. **ROUTING**: `ctx_route(command, explain: true)` — classify noisy commands before running them; use for `git diff`, tests, broad `rg`, logs, and long shell output.
-3. **GATHER**: `ctx_batch_execute(commands, queries)` — runs commands, auto-indexes, returns search. ONE call replaces 30+. Each command: `{label: "header", command: "..."}`.
-4. **FOLLOW-UP**: `ctx_search(queries: ["q1", "q2", ...])` — all questions as array, ONE call (default relevance mode).
-5. **PROCESSING**: `ctx_execute(language, code)` | `ctx_execute_file(path, language, code)` — sandbox, only stdout enters context.
-6. **WEB**: `ctx_fetch_and_index(url, source)` then `ctx_search(queries)` — raw HTML never enters context.
-7. **SIDECARS**: `ctx_fetch_run(list: true | latest: true | runId, raw: true)` — retrieve saved raw artifacts. Do not rerun only to see full output.
-8. **MEASURE**: `ctx_gain()` for current-session savings; `ctx_discover()` for bypass/noisy-tool audit.
-9. **INDEX**: `ctx_index(content, source)` — store in FTS5 for later search.
+1. **CODE NAVIGATION**: `ctx_code(action)` — default for TS/JS/Rust static symbol lookup, symbol reads, file outlines, refs-lite, related files, likely tests, and bounded context packs. No LSP or daemon.
+2. **FILE MAPS**: `ctx_read(path, mode)` — first choice for file exploration, repeated reads, symbol maps, outlines, and bounded slices.
+3. **ROUTING**: `ctx_route(command, explain: true)` — classify noisy commands before running them; use for `git diff`, tests, broad `rg`, logs, and long shell output.
+4. **GATHER**: `ctx_batch_execute(commands, queries)` — runs commands, auto-indexes, returns search. ONE call replaces 30+. Each command: `{label: "header", command: "..."}`.
+5. **FOLLOW-UP**: `ctx_search(queries: ["q1", "q2", ...])` — all questions as array, ONE call (default relevance mode).
+6. **PROCESSING**: `ctx_execute(language, code)` | `ctx_execute_file(path, language, code)` — sandbox, only stdout enters context.
+7. **WEB**: `ctx_fetch_and_index(url, source)` then `ctx_search(queries)` — raw HTML never enters context.
+8. **SIDECARS**: `ctx_fetch_run(list: true | latest: true | runId, raw: true)` — retrieve saved raw artifacts. Do not rerun only to see full output.
+9. **MEASURE**: `ctx_gain()` for current-session savings; `ctx_discover()` for bypass/noisy-tool audit.
+10. **INDEX**: `ctx_index(content, source)` — store in FTS5 for later search.
 
 ## Stable MCP tools
 
 | Tool | Use |
 |------|-----|
+| `ctx_code` | Static code navigation and context packs for TS/JS/Rust without Serena/LSP. Default for code symbol work. |
 | `ctx_read` | File map/outline/symbols/slice/full. Default for non-edit file inspection. |
 | `ctx_route` | Explain routing decision for noisy commands before execution. |
 | `ctx_fetch_run` | List/fetch redacted sidecar output created by previous runs. |
 | `ctx_gain` | Show current-session context savings from sandbox/index/cache/sidecars. |
 | `ctx_discover` | Show missed savings, bypass categories, and noisy tool patterns. |
+| `ctx_diff` | Summarize Git changes with inventory, semantic groups, and risk reason codes. |
 | `ctx_execute` / `ctx_batch_execute` | Sandbox command/data processing; only selected stdout enters context. |
 | `ctx_search` / `ctx_index` / `ctx_fetch_and_index` | Knowledge-base search/index/web ingestion. |
 
 ## Experimental tools
 
-`ctx_guard`, `ctx_eval`, `ctx_trace`, `ctx_diff`, and `ctx_cache` are hidden unless `CTX_MODE_EXPERIMENTAL=1` or `CONTEXT_MODE_EXPERIMENTAL=1`. Do not assume they exist during normal agent work. Prefer stable tools above.
+`ctx_guard`, `ctx_eval`, `ctx_trace`, and `ctx_cache` are hidden unless `CTX_MODE_EXPERIMENTAL=1` or `CONTEXT_MODE_EXPERIMENTAL=1`. Do not assume they exist during normal agent work. Prefer stable tools above.
 
 ## Parallel I/O batches
 

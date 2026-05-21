@@ -7,7 +7,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { McpStdioClient } from "../runner.js";
 import {
-  buildMeta, extractText, isolateEnv, readPinnedSha, reportDir, withClients,
+  buildMeta, extractText, isolateEnv, readPinnedSha, reportDir, repoRoot, withClients, withForkOnly,
   type ReportMeta,
 } from "../lib.js";
 
@@ -24,6 +24,11 @@ export interface WorkflowStep {
   args: ArgsBuilder;
   /** Optional setup that runs once on each client before this step (e.g. write a temp file). */
   setup?: (client: McpStdioClient, ctx: WorkflowContext) => Promise<void>;
+  /** Treat MCP isError output as a valid step result when the oracle accepts the error text. */
+  allowError?: boolean;
+  /** Quality oracle — receives text payload, returns true|[] for pass, false|[issue]
+   *  for fail. Used to compute "was the answer sufficient" alongside bytes. */
+  assert?: (text: string) => boolean | string[];
 }
 
 export interface Workflow {
@@ -38,6 +43,9 @@ export interface Workflow {
   /** Optional async global setup (e.g. start fixture server). */
   beforeAll?(): Promise<void>;
   afterAll?(): Promise<void>;
+  /** If true, the workflow uses tools upstream doesn't expose; skip upstream
+   *  client and report fork-only totals. Upstream columns render as `n/a`. */
+  forkOnly?: boolean;
 }
 
 export interface StepResult {
@@ -49,6 +57,12 @@ export interface StepResult {
   bytes: number;
   ok: boolean;
   err?: string;
+  /** Whether a quality oracle was defined for this step. */
+  hasOracle?: boolean;
+  /** Did the response payload pass the oracle? null = no oracle defined. */
+  oracleOk?: boolean | null;
+  /** Optional issues reported by the oracle. Empty array means pass. */
+  oracleIssues?: string[];
 }
 
 export interface WorkflowSideResult {
@@ -56,6 +70,9 @@ export interface WorkflowSideResult {
   totalMs: number;
   totalBytes: number;
   steps: StepResult[];
+  /** Oracle pass count / oracle defined count (excludes steps without oracles). */
+  oraclePassed?: number;
+  oracleTotal?: number;
 }
 
 export interface WorkflowRow {
@@ -70,6 +87,23 @@ export interface WorkflowRow {
 
 function resolveArgs(b: ArgsBuilder, ctx: WorkflowContext): Record<string, unknown> {
   return typeof b === "function" ? b(ctx) : b;
+}
+
+const PROJECT_DIR_TOOLS = new Set([
+  "ctx_batch_execute",
+  "ctx_diff",
+  "ctx_execute",
+  "ctx_execute_file",
+  "ctx_fetch_and_index",
+  "ctx_fetch_run",
+  "ctx_index",
+  "ctx_read",
+  "ctx_search",
+]);
+
+function withDefaultProjectDir(tool: string, args: Record<string, unknown>): Record<string, unknown> {
+  if (!PROJECT_DIR_TOOLS.has(tool) || typeof args.projectDir === "string") return args;
+  return { ...args, projectDir: repoRoot };
 }
 
 async function runSide(client: McpStdioClient, wf: Workflow): Promise<WorkflowSideResult> {
@@ -94,30 +128,54 @@ async function runSide(client: McpStdioClient, wf: Workflow): Promise<WorkflowSi
         break;
       }
     }
-    const args = resolveArgs(step.args, ctx);
+    const args = withDefaultProjectDir(step.tool, resolveArgs(step.args, ctx));
     const argsBytes = Buffer.byteLength(JSON.stringify(args ?? {}), "utf8");
-    const res: StepResult = { label: step.label, tool: step.tool, argsBytes, ms: 0, bytes: 0, ok: false };
+    const hasOracle = typeof step.assert === "function";
+    const res: StepResult = { label: step.label, tool: step.tool, argsBytes, ms: 0, bytes: 0, ok: false, hasOracle, oracleOk: null, oracleIssues: [] };
+    let text = "";
     try {
       const r = await client.call(step.tool, args);
       res.ms = r.ms;
       res.bytes = r.bytes;
+      text = extractText(r.result);
+      ctx.outputs[step.label] = text;
       if (r.isError) {
-        res.err = r.errorText || "tool returned isError: true";
-        ctx.outputs[step.label] = extractText(r.result);
+        if (step.allowError) res.ok = true;
+        else res.err = r.errorText || "tool returned isError: true";
       } else {
         res.ok = true;
-        ctx.outputs[step.label] = extractText(r.result);
       }
     } catch (e: any) {
       res.err = e.message;
       ctx.outputs[step.label] = "";
+    }
+    if (hasOracle) {
+      try {
+        const verdict = step.assert!(text);
+        if (verdict === true) { res.oracleOk = true; res.oracleIssues = []; }
+        else if (verdict === false) { res.oracleOk = false; res.oracleIssues = ["oracle returned false"]; }
+        else if (Array.isArray(verdict)) {
+          res.oracleIssues = verdict;
+          res.oracleOk = verdict.length === 0;
+        } else {
+          res.oracleOk = null;
+          res.oracleIssues = ["oracle returned non-boolean / non-array"];
+        }
+      } catch (e: any) {
+        res.oracleOk = false;
+        res.oracleIssues = [`oracle threw: ${e.message}`];
+      }
     }
     totalMs += res.ms;
     totalBytes += res.bytes;
     steps.push(res);
     if (!res.ok) break;
   }
-  return { ok: steps.length === wf.steps.length && steps.every((step) => step.ok), totalMs, totalBytes, steps };
+  const oracleTotal = steps.filter((s) => s.hasOracle).length;
+  const oraclePassed = steps.filter((s) => s.hasOracle && s.oracleOk === true).length;
+  const toolsOk = steps.length === wf.steps.length && steps.every((step) => step.ok);
+  const oraclesOk = steps.every((step) => !step.hasOracle || step.oracleOk === true);
+  return { ok: toolsOk && oraclesOk, totalMs, totalBytes, steps, oracleTotal, oraclePassed };
 }
 
 export async function runWorkflowWithClients(
@@ -151,12 +209,30 @@ export function workflowRowOk(row: WorkflowRow): boolean {
 export async function runWorkflow(wf: Workflow): Promise<WorkflowRow> {
   if (wf.beforeAll) await wf.beforeAll();
   const forkEnv = { ...isolateEnv(`${wf.name}-fork`), ...(wf.env || {}) };
-  const upEnv = { ...isolateEnv(`${wf.name}-upstream`), ...(wf.env || {}) };
   let row: WorkflowRow;
   try {
-    row = await withClients(forkEnv, upEnv, async (fork, upstream) => {
-      return runWorkflowWithClients(wf, fork, upstream);
-    });
+    if (wf.forkOnly) {
+      row = await withForkOnly(forkEnv, async (fork) => {
+        const forkRes = await runSide(fork, wf);
+        const out: WorkflowRow = {
+          workflow: wf.name,
+          description: wf.description,
+          fork: forkRes,
+          upstream: { ok: true, totalMs: 0, totalBytes: 0, steps: [] },
+        };
+        if (wf.rawBaseline) {
+          const raw = await wf.rawBaseline();
+          out.rawBaseline = raw;
+          if (raw > 0) out.forkSavingsPct = (1 - forkRes.totalBytes / raw) * 100;
+        }
+        return out;
+      });
+    } else {
+      const upEnv = { ...isolateEnv(`${wf.name}-upstream`), ...(wf.env || {}) };
+      row = await withClients(forkEnv, upEnv, async (fork, upstream) => {
+        return runWorkflowWithClients(wf, fork, upstream);
+      });
+    }
   } finally {
     if (wf.afterAll) await wf.afterAll();
   }
@@ -178,11 +254,13 @@ export function renderWorkflowMd(rows: WorkflowRow[], meta: ReportMeta): string 
 
   lines.push(`## Summary`);
   lines.push("");
-  lines.push(`| Workflow | Status | Steps | Fork ms | Up ms | Δ ms | Fork B | Up B | Δ B | Raw B | Fork save % | Up save % |`);
-  lines.push(`|----------|--------|-------|---------|-------|------|--------|------|-----|-------|-------------|-----------|`);
+  lines.push(`| Workflow | Status | Steps | Fork ms | Up ms | Δ ms | Fork B | Up B | Δ B | Raw B | Fork save % | Up save % | Oracle (fork) | Oracle (up) |`);
+  lines.push(`|----------|--------|-------|---------|-------|------|--------|------|-----|-------|-------------|-----------|---------------|-------------|`);
   for (const r of rows) {
+    const orF = (r.fork.oracleTotal ?? 0) === 0 ? "—" : `${r.fork.oraclePassed}/${r.fork.oracleTotal}`;
+    const orU = (r.upstream.oracleTotal ?? 0) === 0 ? "—" : `${r.upstream.oraclePassed}/${r.upstream.oracleTotal}`;
     lines.push(
-      `| ${r.workflow} | ${workflowRowOk(r) ? "ok" : "failed"} | ${r.fork.steps.length} | ${r.fork.totalMs.toFixed(0)} | ${r.upstream.totalMs.toFixed(0)} | ${pct(r.fork.totalMs, r.upstream.totalMs)} | ${r.fork.totalBytes} | ${r.upstream.totalBytes} | ${pct(r.fork.totalBytes, r.upstream.totalBytes)} | ${r.rawBaseline ?? "-"} | ${r.forkSavingsPct !== undefined ? r.forkSavingsPct.toFixed(1) : "-"} | ${r.upstreamSavingsPct !== undefined ? r.upstreamSavingsPct.toFixed(1) : "-"} |`,
+      `| ${r.workflow} | ${workflowRowOk(r) ? "ok" : "failed"} | ${r.fork.steps.length} | ${r.fork.totalMs.toFixed(0)} | ${r.upstream.totalMs.toFixed(0)} | ${pct(r.fork.totalMs, r.upstream.totalMs)} | ${r.fork.totalBytes} | ${r.upstream.totalBytes} | ${pct(r.fork.totalBytes, r.upstream.totalBytes)} | ${r.rawBaseline ?? "-"} | ${r.forkSavingsPct !== undefined ? r.forkSavingsPct.toFixed(1) : "-"} | ${r.upstreamSavingsPct !== undefined ? r.upstreamSavingsPct.toFixed(1) : "-"} | ${orF} | ${orU} |`,
     );
   }
   lines.push("");
@@ -192,13 +270,15 @@ export function renderWorkflowMd(rows: WorkflowRow[], meta: ReportMeta): string 
     lines.push("");
     lines.push(r.description);
     lines.push("");
-    lines.push(`| # | Label | Tool | Fork | Up | Fork ms | Up ms | Fork B | Up B |`);
-    lines.push(`|---|-------|------|------|----|---------|-------|--------|------|`);
+    lines.push(`| # | Label | Tool | Fork | Up | Fork ms | Up ms | Fork B | Up B | Oracle (fork) | Oracle (up) |`);
+    lines.push(`|---|-------|------|------|----|---------|-------|--------|------|---------------|-------------|`);
     for (let i = 0; i < r.fork.steps.length; i++) {
       const f = r.fork.steps[i];
       const u = r.upstream.steps[i];
+      const orF = f.hasOracle ? (f.oracleOk === true ? "✓" : f.oracleOk === false ? `✗ ${(f.oracleIssues ?? []).slice(0, 1).join(";").slice(0, 60)}` : "?") : "—";
+      const orU = u?.hasOracle ? (u.oracleOk === true ? "✓" : u.oracleOk === false ? `✗ ${(u.oracleIssues ?? []).slice(0, 1).join(";").slice(0, 60)}` : "?") : "—";
       lines.push(
-        `| ${i + 1} | ${f.label} | ${f.tool} | ${f.ok ? "ok" : `FAIL: ${f.err ?? ""}`} | ${u?.ok ? "ok" : `FAIL: ${u?.err ?? ""}`} | ${f.ms.toFixed(1)} | ${(u?.ms ?? 0).toFixed(1)} | ${f.bytes} | ${u?.bytes ?? 0} |`,
+        `| ${i + 1} | ${f.label} | ${f.tool} | ${f.ok ? "ok" : `FAIL: ${f.err ?? ""}`} | ${u?.ok ? "ok" : `FAIL: ${u?.err ?? ""}`} | ${f.ms.toFixed(1)} | ${(u?.ms ?? 0).toFixed(1)} | ${f.bytes} | ${u?.bytes ?? 0} | ${orF} | ${orU} |`,
       );
     }
     lines.push("");

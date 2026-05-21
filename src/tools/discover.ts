@@ -38,6 +38,11 @@ function requestedPersistentTelemetry(input: DiscoverInput): boolean {
   return Boolean(input.session || input.lastDays);
 }
 
+function fmtIso(ms: number | undefined): string | undefined {
+  if (!Number.isFinite(ms)) return undefined;
+  return new Date(ms!).toISOString();
+}
+
 function renderPersistentTelemetry(summary: TelemetrySummary): string[] {
   if (!summary.available) {
     return [`Persistent telemetry (${summary.scope}): unavailable`];
@@ -138,6 +143,14 @@ export function makeCtxDiscover(deps: DiscoverDeps): ToolDefinition<DiscoverInpu
       const sidecarBytes = sidecars.reduce((sum, record) => sum + record.metadata.rawBytes, 0);
       const observedNativeFileTools = noisyTools.filter((row) => row.bypassKind === "native-file-tool");
       const observedNonCtxTools = noisyTools.filter((row) => !isCtxTool(row.tool));
+      const currentSessionId = deps.getCurrentSessionId?.();
+      const sessionStartIso = fmtIso(stats.sessionStart);
+      const observability = {
+        confidence: observedNonCtxTools.length > 0 ? "medium" : "low",
+        nativeToolVisibility: observedNativeFileTools.length > 0 ? "observed-via-host-telemetry" : "partial-or-unavailable",
+        directShellVisibility: observedNonCtxTools.some((row) => row.bypassKind === "shell-or-host-tool") ? "observed-via-host-telemetry" : "not-observed-by-this-process",
+        note: "none-observed only means this context-mode process was not told about a bypass; host-native shell/read tools can still be unobservable.",
+      };
       const bypassCategories = [
         {
           category: "observable-bypass",
@@ -179,6 +192,13 @@ export function makeCtxDiscover(deps: DiscoverDeps): ToolDefinition<DiscoverInpu
         })
         : undefined;
       const payload = {
+        scope: {
+          label: "current runtime session",
+          projectDir: deps.getProjectDir(),
+          sessionId: currentSessionId,
+          sessionStart: sessionStartIso,
+        },
+        observability,
         noisyTools,
         sidecars: {
           count: sidecars.length,
@@ -193,6 +213,14 @@ export function makeCtxDiscover(deps: DiscoverDeps): ToolDefinition<DiscoverInpu
       }
       const lines = [
         "ctx_discover current session",
+        `scope: current runtime session`,
+        `project: ${deps.getProjectDir()}`,
+        ...(currentSessionId ? [`session id: ${currentSessionId}`] : []),
+        ...(sessionStartIso ? [`session started: ${sessionStartIso}`] : ["session started: unknown"]),
+        `observability confidence: ${observability.confidence}`,
+        `native tool visibility: ${observability.nativeToolVisibility}`,
+        `direct shell visibility: ${observability.directShellVisibility}`,
+        `note: ${observability.note}`,
         "",
         "Top returned tools and bypass candidates:",
         ...(noisyTools.length > 0

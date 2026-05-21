@@ -83,7 +83,7 @@ Restart Claude Code (or run `/reload-plugins`).
 
 All checks should show `[x]`. The doctor validates runtimes, hooks, FTS5, and plugin registration.
 
-**Routing:** Automatic. The SessionStart hook injects routing instructions at runtime — no file is written to your project. The plugin registers all hooks (PreToolUse, PostToolUse, PreCompact, SessionStart) and 16 stable MCP tools: the original execute/search/fetch/stats/admin tools plus `ctx_read`, `ctx_route`, `ctx_fetch_run`, `ctx_gain`, and `ctx_discover`. Experimental tools (`ctx_guard`, `ctx_eval`, `ctx_trace`, `ctx_diff`, `ctx_cache`) are hidden unless `CTX_MODE_EXPERIMENTAL=1` or `CONTEXT_MODE_EXPERIMENTAL=1`.
+**Routing:** Automatic. The SessionStart hook injects routing instructions at runtime — no file is written to your project. The plugin registers all hooks (PreToolUse, PostToolUse, PreCompact, SessionStart) and 17 stable MCP tools: the original execute/search/fetch/stats/admin tools plus `ctx_read`, `ctx_route`, `ctx_fetch_run`, `ctx_gain`, `ctx_discover`, and `ctx_diff`. Experimental tools (`ctx_guard`, `ctx_eval`, `ctx_trace`, `ctx_cache`) are hidden unless `CTX_MODE_EXPERIMENTAL=1` or `CONTEXT_MODE_EXPERIMENTAL=1`.
 
 | Slash Command | What it does |
 |---|---|

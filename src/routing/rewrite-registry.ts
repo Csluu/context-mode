@@ -316,6 +316,44 @@ export const REWRITE_RULES: readonly RouteRule[] = [
     },
   },
   {
+    id: "git-log",
+    priority: 83,
+    command: "git log",
+    parser: "git-log",
+    category: "git",
+    dangerLevel: "low",
+    autoRewriteEligible: true,
+    supportsJsonFirst: false,
+    knownFlagConflicts: ["--format=%B", "--patch", "-p"],
+    match(command) {
+      if (gitSubcommand(command.argv) !== "log") return null;
+      return { confidence: 0.84, reasons: ["git log can be summarized by commit/message lines"] };
+    },
+    buildRoute(command) {
+      return route("ctx_execute", "git-log", command, "Return compact git history summary instead of raw commit output.");
+    },
+  },
+  {
+    id: "file-list",
+    priority: 74,
+    command: "ls/find/tree",
+    parser: "file-list",
+    category: "file",
+    dangerLevel: "low",
+    autoRewriteEligible: true,
+    supportsJsonFirst: false,
+    knownFlagConflicts: ["-exec", "-delete", "-ok"],
+    match(command) {
+      const first = commandArg(command, 0);
+      if (!["ls", "dir", "tree", "find"].includes(first)) return null;
+      if (first === "find" && hasAnyFlag(command, ["-exec", "-delete", "-ok"]).length > 0) return null;
+      return { confidence: 0.76, reasons: ["file listing output can be counted and sampled"] };
+    },
+    buildRoute(command) {
+      return route("ctx_execute", "file-list", command, "Return compact file listing counts and representative entries.");
+    },
+  },
+  {
     id: "rg-search",
     priority: 82,
     command: "rg",
@@ -486,7 +524,7 @@ export const REWRITE_RULES: readonly RouteRule[] = [
     id: "node-test-generic",
     priority: 72,
     command: "npm test",
-    parser: "node-test-generic",
+    parser: "npm",
     category: "test",
     dangerLevel: "low",
     autoRewriteEligible: false,
@@ -497,14 +535,15 @@ export const REWRITE_RULES: readonly RouteRule[] = [
       return { confidence: 0.76, reasons: ["test output can be failure-focused"] };
     },
     buildRoute(command) {
-      return route("ctx_execute", "node-test-generic", command, "Return failure-only test summary.");
+      const parser = isPackageManager(commandArg(command, 0)) ? "npm" : "node-test-generic";
+      return route("ctx_execute", parser, command, "Return compact test summary and failure focus.");
     },
   },
   {
     id: "node-typecheck-generic",
     priority: 73,
     command: "npx tsc",
-    parser: "generic-failure",
+    parser: "tsc",
     category: "typecheck",
     dangerLevel: "low",
     autoRewriteEligible: false,
@@ -515,14 +554,14 @@ export const REWRITE_RULES: readonly RouteRule[] = [
       return { confidence: 0.77, reasons: ["typecheck output can be failure-focused and sidecar-backed"] };
     },
     buildRoute(command) {
-      return route("ctx_execute", "generic-failure", command, "Return failure-focused typecheck summary with raw log in a sidecar.");
+      return route("ctx_execute", "tsc", command, "Return compact TypeScript diagnostic summary with raw log in a sidecar.");
     },
   },
   {
     id: "node-build-generic",
     priority: 71,
     command: "npm run build",
-    parser: "generic-failure",
+    parser: "npm",
     category: "build",
     dangerLevel: "low",
     autoRewriteEligible: false,
@@ -533,14 +572,14 @@ export const REWRITE_RULES: readonly RouteRule[] = [
       return { confidence: 0.74, reasons: ["build output can be failure-focused and sidecar-backed"] };
     },
     buildRoute(command) {
-      return route("ctx_execute", "generic-failure", command, "Return failure-focused build summary with raw log in a sidecar.");
+      return route("ctx_execute", "npm", command, "Return compact package-manager build summary with raw log in a sidecar.");
     },
   },
   {
     id: "node-lint-generic",
     priority: 72,
     command: "npm run lint",
-    parser: "generic-failure",
+    parser: "eslint",
     category: "lint",
     dangerLevel: "low",
     autoRewriteEligible: false,
@@ -552,7 +591,7 @@ export const REWRITE_RULES: readonly RouteRule[] = [
       return { confidence: 0.75, reasons: ["lint output can be failure-focused and sidecar-backed"] };
     },
     buildRoute(command) {
-      return route("ctx_execute", "generic-failure", command, "Return failure-focused lint summary with raw log in a sidecar.");
+      return route("ctx_execute", "eslint", command, "Return compact ESLint problem summary with raw log in a sidecar.");
     },
   },
   {
@@ -595,7 +634,7 @@ export const REWRITE_RULES: readonly RouteRule[] = [
     id: "cargo-test",
     priority: 72,
     command: "cargo test",
-    parser: "generic-failure",
+    parser: "cargo",
     category: "test",
     dangerLevel: "low",
     autoRewriteEligible: false,
@@ -606,7 +645,49 @@ export const REWRITE_RULES: readonly RouteRule[] = [
       return { confidence: 0.77, reasons: ["cargo test output can be failure-focused"] };
     },
     buildRoute(command) {
-      return route("ctx_execute", "generic-failure", command, "Return failure-only cargo test summary.");
+      return route("ctx_execute", "cargo", command, "Return compact Cargo test/diagnostic summary.");
+    },
+  },
+  {
+    id: "cargo-build-check",
+    priority: 71,
+    command: "cargo check",
+    parser: "cargo",
+    category: "build",
+    dangerLevel: "low",
+    autoRewriteEligible: false,
+    supportsJsonFirst: true,
+    knownFlagConflicts: ["--watch"],
+    match(command) {
+      if (commandArg(command, 0) !== "cargo") return null;
+      if (!["build", "check", "clippy"].includes(commandArg(command, 1))) return null;
+      return { confidence: 0.76, reasons: ["Cargo diagnostics can be failure-focused"] };
+    },
+    buildRoute(command) {
+      return route("ctx_execute", "cargo", command, "Return compact Cargo diagnostic summary with sidecar-backed raw output.");
+    },
+  },
+  {
+    id: "pip-install",
+    priority: 70,
+    command: "pip install",
+    parser: "pip",
+    category: "package-manager",
+    dangerLevel: "low",
+    autoRewriteEligible: false,
+    supportsJsonFirst: false,
+    knownFlagConflicts: [],
+    match(command) {
+      const first = commandArg(command, 0);
+      const second = commandArg(command, 1);
+      if (first === "pip" && ["install", "sync", "uninstall"].includes(second)) return { confidence: 0.7, reasons: ["pip package output can be summarized"] };
+      if (first === "python" && command.argv.some((arg) => arg === "-m") && command.argv.some((arg) => canonicalToken(arg) === "pip")) {
+        return { confidence: 0.68, reasons: ["python -m pip output can be summarized"] };
+      }
+      return null;
+    },
+    buildRoute(command) {
+      return route("ctx_execute", "pip", command, "Return compact pip package/install summary.");
     },
   },
   {
@@ -644,6 +725,52 @@ export const REWRITE_RULES: readonly RouteRule[] = [
     },
     buildRoute(command) {
       return route("ctx_execute", "generic-failure", command, "Run OpenClaw status/log commands through ctx_execute with compact output and sidecar storage.");
+    },
+  },
+  {
+    id: "docker-logs",
+    priority: 74,
+    command: "docker logs",
+    parser: "docker-logs",
+    category: "container-logs",
+    dangerLevel: "medium",
+    autoRewriteEligible: false,
+    supportsJsonFirst: false,
+    knownFlagConflicts: ["-f", "--follow", "--tail=0"],
+    match(command) {
+      if (commandArg(command, 0) !== "docker" || commandArg(command, 1) !== "logs") return null;
+      return { confidence: 0.8, reasons: ["docker logs can be compressed by severity and kept sidecar-backed"] };
+    },
+    buildRoute(command) {
+      return route("ctx_execute", "docker-logs", command, "Return Docker log severity summary with raw log in a sidecar.");
+    },
+  },
+  {
+    id: "gh-read",
+    priority: 73,
+    command: "gh",
+    parser: "gh",
+    category: "github",
+    dangerLevel: "low",
+    autoRewriteEligible: false,
+    supportsJsonFirst: true,
+    knownFlagConflicts: ["--web", "--interactive", "-i"],
+    match(command) {
+      if (commandArg(command, 0) !== "gh") return null;
+      const first = commandArg(command, 1);
+      const second = commandArg(command, 2);
+      const readOnly = (
+        (first === "pr" && ["checks", "list", "status", "view"].includes(second))
+        || (first === "issue" && ["list", "status", "view"].includes(second))
+        || (first === "run" && ["list", "view"].includes(second))
+        || (first === "repo" && second === "view")
+        || first === "search"
+      );
+      if (!readOnly) return null;
+      return { confidence: 0.78, reasons: ["read-only gh output can be summarized or parsed from JSON"] };
+    },
+    buildRoute(command) {
+      return route("ctx_execute", "gh", command, "Return compact GitHub CLI summary with raw output in a sidecar.");
     },
   },
   {

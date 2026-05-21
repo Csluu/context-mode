@@ -20,6 +20,9 @@ interface FetchRunInput {
   readonly maxBytes?: number;
   readonly limit?: number;
   readonly preview?: "head" | "tail";
+  readonly query?: string;
+  readonly contextLines?: number;
+  readonly maxMatches?: number;
 }
 
 type ToolTextResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
@@ -32,10 +35,11 @@ function displayPath(projectDir: string, rawPath: string): string {
 function renderList(projectDir: string, limit: number): string {
   const records = listRunArtifacts(projectDir, limit);
   if (records.length === 0) {
-    return "No run artifacts found.";
+    return `No run artifacts found for project: ${projectDir}`;
   }
   return [
     `Run artifacts (${records.length}):`,
+    `project: ${projectDir}`,
     "",
     ...records.map((record) => {
       const m = record.metadata;
@@ -43,6 +47,87 @@ function renderList(projectDir: string, limit: number): string {
       return `- ${m.runId} ${m.status}${pin} ${m.redactedBytes}B ${m.createdAt} ${m.commandShape}`;
     }),
   ].join("\n");
+}
+
+function byteLength(text: string): number {
+  return Buffer.byteLength(text, "utf8");
+}
+
+function clipUtf8(text: string, maxBytes: number): string {
+  if (byteLength(text) <= maxBytes) return text;
+  let bytes = 0;
+  let end = 0;
+  for (const char of text) {
+    const next = byteLength(char);
+    if (bytes + next > maxBytes) break;
+    bytes += next;
+    end += char.length;
+  }
+  return text.slice(0, end);
+}
+
+function renderQueryMatches(args: {
+  readonly raw: string;
+  readonly query: string;
+  readonly maxBytes: number;
+  readonly contextLines: number;
+  readonly maxMatches: number;
+}): { text: string; matchCount: number; emittedMatches: number; truncated: boolean } {
+  const needle = args.query.trim().toLowerCase();
+  if (!needle) {
+    return { text: "query was empty", matchCount: 0, emittedMatches: 0, truncated: false };
+  }
+
+  const lines = args.raw.split(/\r?\n/);
+  const matchIndexes: number[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].toLowerCase().includes(needle)) matchIndexes.push(i);
+  }
+
+  const ranges: Array<{ start: number; end: number; matchIndexes: number[] }> = [];
+  for (const idx of matchIndexes.slice(0, args.maxMatches)) {
+    const start = Math.max(0, idx - args.contextLines);
+    const end = Math.min(lines.length - 1, idx + args.contextLines);
+    const last = ranges[ranges.length - 1];
+    if (last && start <= last.end + 1) {
+      last.end = Math.max(last.end, end);
+      last.matchIndexes.push(idx);
+    } else {
+      ranges.push({ start, end, matchIndexes: [idx] });
+    }
+  }
+
+  const out: string[] = [];
+  let emittedMatches = 0;
+  let truncated = false;
+  for (const range of ranges) {
+    const blockLines: string[] = [];
+    if (out.length > 0) blockLines.push("--");
+    for (let i = range.start; i <= range.end; i++) {
+      blockLines.push(`${i + 1}: ${lines[i]}`);
+    }
+    const block = `${blockLines.join("\n")}\n`;
+    if (byteLength(out.join("\n") + block) > args.maxBytes) {
+      truncated = true;
+      break;
+    }
+    out.push(block.trimEnd());
+    emittedMatches += range.matchIndexes.length;
+  }
+
+  if (matchIndexes.length > args.maxMatches) truncated = true;
+  if (out.length === 0 && matchIndexes.length > 0) {
+    truncated = true;
+    const first = `${matchIndexes[0] + 1}: ${lines[matchIndexes[0]]}`;
+    out.push(clipUtf8(first, args.maxBytes));
+    emittedMatches = 1;
+  }
+  return {
+    text: out.join("\n"),
+    matchCount: matchIndexes.length,
+    emittedMatches,
+    truncated,
+  };
 }
 
 export function makeCtxFetchRun(deps: FetchRunDeps): ToolDefinition<FetchRunInput, ToolTextResult> {
@@ -62,6 +147,9 @@ export function makeCtxFetchRun(deps: FetchRunDeps): ToolDefinition<FetchRunInpu
         maxBytes: z.coerce.number().int().positive().max(200_000).optional().describe("Max raw preview bytes."),
         limit: z.coerce.number().int().positive().max(100).optional().describe("Max list entries."),
         preview: z.enum(["head", "tail"]).optional().describe("Raw preview window. Use tail for final test/build summaries at the end of long logs."),
+        query: z.string().optional().describe("Return compact matching excerpts from redacted raw output instead of a broad preview."),
+        contextLines: z.coerce.number().int().min(0).max(5).optional().describe("Context lines around each query match, default 1."),
+        maxMatches: z.coerce.number().int().positive().max(50).optional().describe("Maximum query matches to emit, default 8."),
       }),
     },
     handler(input: FetchRunInput, ctx: ToolContext): ToolTextResult {
@@ -109,6 +197,7 @@ export function makeCtxFetchRun(deps: FetchRunDeps): ToolDefinition<FetchRunInpu
       const m = artifact.metadata;
       const lines = [
         `Run artifact ${m.runId}`,
+        `project: ${projectDir}`,
         `status: ${m.status}${m.exitCode === undefined ? "" : ` exit=${m.exitCode}`}`,
         `created: ${m.createdAt}`,
         `command: ${m.commandShape}`,
@@ -117,7 +206,31 @@ export function makeCtxFetchRun(deps: FetchRunDeps): ToolDefinition<FetchRunInpu
       ];
       if (m.summary) lines.push(`summary: ${m.summary}`);
       if (m.pinned) lines.push("pinned: true");
-      if (input.raw) {
+      if (input.query?.trim()) {
+        const queryBudget = input.maxBytes ?? Math.min(budget.maxSidecarPreviewBytes, 12_000);
+        const fullArtifact = artifact.raw && !artifact.truncated
+          ? artifact
+          : fetchRunArtifact({
+            projectDir,
+            runId: artifact.metadata.runId,
+            maxBytes: Math.max(1, Math.min(5 * 1024 * 1024, artifact.metadata.storedBytes)),
+          }) ?? artifact;
+        const matches = renderQueryMatches({
+          raw: fullArtifact.raw ?? "",
+          query: input.query,
+          maxBytes: queryBudget,
+          contextLines: input.contextLines ?? 1,
+          maxMatches: input.maxMatches ?? 8,
+        });
+        lines.push(
+          "",
+          `--- redacted raw matches: ${JSON.stringify(input.query.trim())} (${matches.emittedMatches}/${matches.matchCount}) ---`,
+          matches.text || "No matches found.",
+        );
+        if (matches.truncated) {
+          lines.push("", `...[match excerpt truncated at ${queryBudget} bytes or ${input.maxMatches ?? 8} matches]`);
+        }
+      } else if (input.raw) {
         const preview = input.preview ?? "head";
         lines.push(
           "",
@@ -128,7 +241,7 @@ export function makeCtxFetchRun(deps: FetchRunDeps): ToolDefinition<FetchRunInpu
           lines.push("", `...[${preview} preview truncated at ${input.maxBytes ?? budget.maxSidecarPreviewBytes} bytes]`);
         }
       } else {
-        lines.push("", "Use ctx_fetch_run({ runId, raw: true }) for redacted raw preview.");
+        lines.push("", "Use ctx_fetch_run({ runId, query: \"...\" }) for compact excerpts or raw: true for redacted raw preview.");
       }
       return { content: [{ type: "text", text: lines.join("\n") }] };
     },

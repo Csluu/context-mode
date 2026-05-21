@@ -44,6 +44,9 @@ describe("ctx_discover tool", () => {
 
       const text = await tool.handler({ minBytes: 1000 }, testContext());
       expect(text.content[0].text).toContain("ctx_discover current session");
+      expect(text.content[0].text).toContain(`project: ${projectDir}`);
+      expect(text.content[0].text).toContain("observability confidence:");
+      expect(text.content[0].text).toContain("native tool visibility:");
       expect(text.content[0].text).toContain("ctx_execute");
       expect(text.content[0].text).toContain("observable-bypass");
       expect(text.content[0].text).toContain("unobservable-native-tool");
@@ -52,6 +55,14 @@ describe("ctx_discover tool", () => {
 
       const json = await tool.handler({ json: true, minBytes: 1000 }, testContext());
       const payload = JSON.parse(json.content[0].text);
+      expect(payload.scope).toMatchObject({
+        label: "current runtime session",
+        projectDir,
+      });
+      expect(payload.observability).toMatchObject({
+        confidence: "medium",
+        nativeToolVisibility: "observed-via-host-telemetry",
+      });
       expect(payload.noisyTools).toHaveLength(3);
       expect(payload.noisyTools.find((item: { tool: string }) => item.tool === "ctx_execute")).toMatchObject({
         category: "managed-context-output",

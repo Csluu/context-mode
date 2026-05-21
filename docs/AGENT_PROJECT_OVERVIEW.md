@@ -49,6 +49,7 @@ These tools should be visible by default and are the ones agents should actually
 | `ctx_gain` | Savings view for current or historical sessions | Shows kept-out bytes/tokens, sidecars, per-tool latency, and rollups |
 | `ctx_discover` | Missed savings and bypass analysis | Classifies native-tool bypasses, hook gaps, and noisy patterns |
 | `ctx_doctor` | Diagnostics | Reports runtimes, hooks, router mode, config source, and adapter tier |
+| `ctx_diff` | Git-text diff inventory with optional Difftastic fallback | Preserves canonical Git file inventory, supports ref ranges, and can store raw diff sidecars |
 
 Existing stable tools remain important:
 
@@ -72,7 +73,6 @@ These are hidden unless `CTX_MODE_EXPERIMENTAL=1` or `CONTEXT_MODE_EXPERIMENTAL=
 | `ctx_guard` | Secret/prompt-injection/control-sequence scanner | Real scanner and fixtures exist; mostly pipeline/validation surface |
 | `ctx_eval` | Deterministic parser/router/redaction/omission fixture harness | Better as CLI/CI gate than normal agent tool |
 | `ctx_trace` | Local trace summaries and why-big analysis | Useful for debugging agent behavior; not public default surface |
-| `ctx_diff` | Git-text diff inventory with optional Difftastic fallback | Text/git mode exists; broad semantic mode remains future-scoped |
 | `ctx_cache` | Explain cache eligibility and run approved cache canary | Experimental; explicit `tsc --noEmit` canary only |
 
 Do not assume these tools exist during normal agent work. Prefer the stable surface.
@@ -82,9 +82,10 @@ Do not assume these tools exist during normal agent work. Prefer the stable surf
 The intended agent workflow is:
 
 1. For repo-wide architecture or feature location, use Graphify first when `graphify-out/` exists.
-2. For exact symbol/reference navigation, use Serena when configured.
-3. For broad/noisy command output, use context-mode tools.
-4. Use shell only for focused reads, edits, tests, git writes, and small command output.
+2. For TS/JS/Rust symbol navigation and context packs, use `ctx_code` first.
+3. Use Serena only as an optional precision fallback for exact semantic refactors, type-aware rename, or LSP-level references.
+4. For broad/noisy command output, use context-mode tools.
+5. Use shell only for focused reads, edits, tests, git writes, and small command output.
 
 Preferred decisions:
 

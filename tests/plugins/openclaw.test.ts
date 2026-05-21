@@ -503,6 +503,7 @@ describe("OpenClawPlugin", () => {
       "ctx_execute",
       "ctx_execute_file",
       "ctx_read",
+      "ctx_code",
       "ctx_index",
       "ctx_search",
       "ctx_fetch_and_index",
@@ -512,6 +513,7 @@ describe("OpenClawPlugin", () => {
       "ctx_stats",
       "ctx_gain",
       "ctx_discover",
+      "ctx_diff",
       "ctx_doctor",
       "ctx_upgrade",
       "ctx_purge",
@@ -522,21 +524,38 @@ describe("OpenClawPlugin", () => {
       "ctx_guard",
       "ctx_eval",
       "ctx_trace",
-      "ctx_diff",
       "ctx_cache",
     ] as const;
 
-    function withExperimentalTools<T>(fn: () => Promise<T>): Promise<T> {
-      const previous = process.env.CTX_MODE_EXPERIMENTAL;
-      process.env.CTX_MODE_EXPERIMENTAL = "1";
+    function withToolEnv<T>(
+      ctxValue: string | undefined,
+      contextValue: string | undefined,
+      fn: () => Promise<T>,
+    ): Promise<T> {
+      const previousCtx = process.env.CTX_MODE_EXPERIMENTAL;
+      const previousContext = process.env.CONTEXT_MODE_EXPERIMENTAL;
+      if (ctxValue === undefined) delete process.env.CTX_MODE_EXPERIMENTAL;
+      else process.env.CTX_MODE_EXPERIMENTAL = ctxValue;
+      if (contextValue === undefined) delete process.env.CONTEXT_MODE_EXPERIMENTAL;
+      else process.env.CONTEXT_MODE_EXPERIMENTAL = contextValue;
       return fn().finally(() => {
-        if (previous === undefined) delete process.env.CTX_MODE_EXPERIMENTAL;
-        else process.env.CTX_MODE_EXPERIMENTAL = previous;
+        if (previousCtx === undefined) delete process.env.CTX_MODE_EXPERIMENTAL;
+        else process.env.CTX_MODE_EXPERIMENTAL = previousCtx;
+        if (previousContext === undefined) delete process.env.CONTEXT_MODE_EXPERIMENTAL;
+        else process.env.CONTEXT_MODE_EXPERIMENTAL = previousContext;
       });
     }
 
+    function withStableTools<T>(fn: () => Promise<T>): Promise<T> {
+      return withToolEnv(undefined, undefined, fn);
+    }
+
+    function withExperimentalTools<T>(fn: () => Promise<T>): Promise<T> {
+      return withToolEnv("1", undefined, fn);
+    }
+
     it("registers stable ctx_* tools via api.registerTool", async () => {
-      const mock = await createTestPlugin(join(tempDir, "register-tool"));
+      const mock = await withStableTools(() => createTestPlugin(join(tempDir, "register-tool")));
       const names = mock.tools.map((t) => t.name);
       for (const expected of STABLE_EXPECTED_NAMES) {
         expect(names).toContain(expected);
@@ -557,7 +576,7 @@ describe("OpenClawPlugin", () => {
     });
 
     it("each tool definition has description + parameters schema", async () => {
-      const mock = await createTestPlugin(join(tempDir, "register-tool-shape"));
+      const mock = await withStableTools(() => createTestPlugin(join(tempDir, "register-tool-shape")));
       for (const tool of mock.tools) {
         expect(tool.description.length).toBeGreaterThan(0);
         expect(tool.parameters.type).toBe("object");
@@ -566,7 +585,7 @@ describe("OpenClawPlugin", () => {
     });
 
     it("execute() returns MCP-shaped { content: [{type, text}] } response", async () => {
-      const mock = await createTestPlugin(join(tempDir, "register-tool-exec"));
+      const mock = await withStableTools(() => createTestPlugin(join(tempDir, "register-tool-exec")));
       const tool = mock.tools.find((t) => t.name === "ctx_search");
       expect(tool).toBeDefined();
       const out = await tool!.execute("call-1", { queries: ["hello"] });

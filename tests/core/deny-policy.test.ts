@@ -124,10 +124,10 @@ describe("effective project security helpers", () => {
     expect(handler).not.toBeNull();
     const body = handler![0];
     expect(body.indexOf("resolveProjectDirForRead")).toBeLessThan(body.indexOf("checkFilePath"));
-    expect(body).toContain("const effectivePath = isAbsoluteForCurrentPlatform(input.path)");
-    expect(body).toContain("const resolvedPath = isAbsoluteForCurrentPlatform(effectivePath)");
-    expect(readSrc).toContain("function normalizePathForCurrentPlatform");
+    expect(readSrc).toContain("resolveReadTargetPath");
+    expect(readSrc).toContain("resolveProjectDirForRead");
+    expect(body).toContain("const resolvedPath = resolveReadTargetPath(input.path, projectDir)");
     expect(body).toContain("deps.checkFilePath?.(resolvedPath, projectDir)");
-    expect(body).toContain("ctxRead({ ...input, path: resolvedPath, projectDir })");
+    expect(body).toContain("ctxRead({ ...input, compact: effectiveCompact, path: resolvedPath, projectDir })");
   });
 });

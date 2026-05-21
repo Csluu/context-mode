@@ -1,4 +1,4 @@
-import { spawn, execSync, execFileSync } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -186,8 +186,9 @@ const OS_TMPDIR = (() => {
 /** Kill process tree — on Windows uses taskkill /T; on Unix kills the process group. */
 function killTree(proc: ReturnType<typeof spawn>): void {
   if (isWin && proc.pid) {
+    try { proc.kill("SIGKILL"); } catch { /* already dead */ }
     try {
-      execSync(`taskkill /F /T /PID ${proc.pid}`, { stdio: "pipe" });
+      execFileSync("taskkill", ["/F", "/T", "/PID", String(proc.pid)], { stdio: "pipe", timeout: 5_000, windowsHide: true });
     } catch { /* already dead */ }
   } else if (proc.pid) {
     try {
@@ -781,5 +782,7 @@ export class PolyglotExecutor {
         // names (e.g. `System.Text.Json.JsonDocument`) instead of `using`.
         return `var FILE_CONTENT_PATH = ${escaped};\nvar file_path = FILE_CONTENT_PATH;\nvar FILE_CONTENT = System.IO.File.ReadAllText(FILE_CONTENT_PATH);\n${code}`;
     }
+    const _exhaustive: never = language;
+    return _exhaustive;
   }
 }

@@ -53,12 +53,13 @@ Use `context-mode_ctx_execute(language: "shell", code: "grep ...")` in sandbox.
 | `context-mode_ctx_fetch_run` | List/fetch redacted sidecar output created by previous runs. |
 | `context-mode_ctx_gain` | Show current-session context savings from sandbox/index/cache/sidecars. |
 | `context-mode_ctx_discover` | Show missed savings, bypass categories, and noisy tool patterns. |
+| `context-mode_ctx_diff` | Summarize Git changes with inventory, semantic groups, and risk reason codes. |
 | `context-mode_ctx_execute` / `context-mode_ctx_batch_execute` | Sandbox command/data processing; only selected stdout enters context. |
 | `context-mode_ctx_search` / `context-mode_ctx_index` / `context-mode_ctx_fetch_and_index` | Knowledge-base search/index/web ingestion. |
 
 ## Experimental tools
 
-`context-mode_ctx_guard`, `context-mode_ctx_eval`, `context-mode_ctx_trace`, `context-mode_ctx_diff`, and `context-mode_ctx_cache` are hidden unless `CTX_MODE_EXPERIMENTAL=1` or `CONTEXT_MODE_EXPERIMENTAL=1`. Do not assume they exist during normal agent work. Prefer stable tools above.
+`context-mode_ctx_guard`, `context-mode_ctx_eval`, `context-mode_ctx_trace`, and `context-mode_ctx_cache` are hidden unless `CTX_MODE_EXPERIMENTAL=1` or `CONTEXT_MODE_EXPERIMENTAL=1`. Do not assume they exist during normal agent work. Prefer stable tools above.
 
 ## Parallel I/O batches
 

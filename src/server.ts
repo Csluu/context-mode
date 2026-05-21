@@ -2,7 +2,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
-import { existsSync, unlinkSync, readFileSync, writeFileSync, renameSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync, realpathSync } from "node:fs";
+import { existsSync, unlinkSync, readFileSync, writeFileSync, renameSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync, realpathSync, readdirSync } from "node:fs";
 import { execSync, spawnSync, type ChildProcess, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
 import { join, dirname, resolve, sep, isAbsolute, relative, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -65,6 +65,7 @@ import { makeCtxEval } from "./tools/eval.js";
 import { makeCtxTrace } from "./tools/trace.js";
 import { makeCtxDiff } from "./tools/diff.js";
 import { makeCtxCache } from "./tools/cache.js";
+import { makeCtxCode } from "./tools/code.js";
 import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
 import { applyToolResultBudget, getAdapterOutputBudget } from "./adapters/output-budget.js";
 import { resolveCodexConfigDir } from "./adapters/codex/paths.js";
@@ -74,9 +75,10 @@ import { resolveProjectDir } from "./util/project-dir.js";
 import { loadDatabase } from "./db-base.js";
 import { AnalyticsEngine, formatReport, getConversationStats, getContentBytesAllSessions, getLifetimeStats, getMultiAdapterLifetimeStats, getRealBytesStats, OPUS_INPUT_PRICE_PER_TOKEN, type RealBytesStats } from "./session/analytics.js";
 import { listRunArtifacts, writeRunArtifact } from "./artifacts/run-store.js";
-import { redactText } from "./filters/pipeline.js";
+import { DEFAULT_FILTER_PIPELINE, redactText, runFilterPipeline } from "./filters/pipeline.js";
 import { getOutputParser, parseCommandOutput, renderParsedOutput } from "./parsers/registry.js";
 import type { ParserConfidence, ParserInput } from "./parsers/types.js";
+import { routeCommand } from "./routing/rewrite-registry.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
 const VERSION: string = (() => {
   for (const rel of ["../package.json", "./package.json"]) {
@@ -307,10 +309,11 @@ function resolveProjectDirOverride(
 function resolveExecutionCwd(cwd: string | undefined): string | undefined {
   const trimmed = cwd?.trim();
   if (!trimmed) return undefined;
+  const normalizedCwd = normalizePathForCurrentPlatform(trimmed);
 
   const projectDir = requireExistingDirectory(getProjectDir(), "projectDir");
   const resolved = requireExistingDirectory(
-    isAbsoluteForCurrentPlatform(trimmed) ? trimmed : resolve(projectDir, trimmed),
+    isAbsoluteForCurrentPlatform(normalizedCwd) ? normalizedCwd : resolve(projectDir, normalizedCwd),
     "cwd",
   );
   if (
@@ -328,6 +331,9 @@ function resolveExecutionCwd(cwd: string | undefined): string | undefined {
 
 function normalizePathForCurrentPlatform(inputPath: string): string {
   const trimmed = inputPath.trim();
+  if (process.platform === "win32" && /^[A-Za-z]:(?![\\/])/.test(trimmed)) {
+    throw new Error(`Windows path appears drive-relative or unescaped: ${trimmed}. Use C:\\\\path or C:/path.`);
+  }
   if (process.platform !== "win32") return trimmed;
   const normalized = trimmed.replace(/\\/g, "/");
   const match = /^\/([a-zA-Z])(?:\/(.*))?$/.exec(normalized);
@@ -1431,6 +1437,37 @@ export function extractSnippet(
   return parts.join("\n\n");
 }
 
+function inlineCompactText(text: string, maxLen: number): string {
+  const oneLine = stripMarkers(text).replace(/\s+/g, " ").trim();
+  if (oneLine.length <= maxLen) return oneLine;
+  return oneLine.slice(0, Math.max(0, maxLen - 3)).trimEnd() + "...";
+}
+
+type TinySearchResult = Pick<SearchResult, "title" | "content" | "source" | "highlighted">;
+
+export function formatTinySearchResults(query: string, results: readonly TinySearchResult[]): string {
+  return results
+    .map((r) => {
+      const title = r.title && r.title !== r.source ? ` > ${inlineCompactText(r.title, 80)}` : "";
+      const snippet = inlineCompactText(extractSnippet(r.content, query, 220, r.highlighted), 220);
+      return `${inlineCompactText(r.source, 120)}${title}: ${snippet}`;
+    })
+    .join("\n");
+}
+
+export function shouldUseTinySearchFormat(args: {
+  compact?: boolean;
+  queryCount: number;
+  sort: string;
+  storeChunks: number;
+  results: readonly TinySearchResult[];
+}): boolean {
+  if (args.sort === "timeline" || args.results.length === 0) return false;
+  if (args.compact) return args.results.length <= 3;
+  const contentBytes = args.results.reduce((sum, r) => sum + Buffer.byteLength(r.content, "utf8"), 0);
+  return args.queryCount === 1 && args.storeChunks <= 3 && args.results.length <= 2 && contentBytes <= 800;
+}
+
 export function formatBatchQueryResults(
   store: ContentStore,
   queries: string[],
@@ -1789,6 +1826,22 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
         result.stderr = result.stderr.replace(/\n?__CM_FS__:\d+\n?/g, "");
       }
 
+      const commandShape = executionCommandShape(language, code);
+      const filtered = runFilterPipeline({
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.exitCode,
+        commandShape,
+        parserName: parser,
+      }, DEFAULT_FILTER_PIPELINE);
+      result.stdout = filtered.stdout;
+      result.stderr = filtered.stderr;
+      const inferredParser = parser?.trim()
+        ? undefined
+        : (inferShellParser(language, code) ?? inferParserFromOutput(result.stdout, result.stderr));
+      const effectiveParser = parser?.trim() || inferredParser;
+      const effectiveIntent = intent?.trim() || inferShellIntent(language, code, result.exitCode);
+
       if (result.timedOut) {
         const partialOutput = result.stdout?.trim();
         if (result.backgrounded && partialOutput) {
@@ -1828,13 +1881,13 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
         const { isError, output } = classifyNonZeroExit({
           language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
         });
-        if (parser && parser.trim().length > 0) {
+        if (effectiveParser) {
           return trackResponse("ctx_execute", {
             content: [
               {
                 type: "text" as const,
                 text: renderParsedExecuteOutput({
-                  parser,
+                  parser: effectiveParser,
                   language,
                   code,
                   stdout: result.stdout,
@@ -1848,20 +1901,20 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
             isError,
           });
         }
-        if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
+        if (effectiveIntent && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
           trackIndexed(Buffer.byteLength(output));
-          const text = intentSearch(output, intent, isError ? `execute:${language}:error` : `execute:${language}`);
+          const text = intentSearch(output, effectiveIntent, isError ? `execute:${language}:error` : `execute:${language}`);
           return trackResponse("ctx_execute", {
             content: [
               {
                 type: "text" as const,
                 text: appendRunSidecarNote(text, {
-                  command: executionCommandShape(language, code),
+                  command: commandShape,
                   stdout: output,
                   status: isError ? "failed" : "unknown",
                   exitCode: result.exitCode,
                   parser: "intent-search",
-                  summary: `Intent search for ${intent}`,
+                  summary: `Intent search for ${effectiveIntent}`,
                 }),
               },
             ],
@@ -1869,15 +1922,15 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
           });
         }
         // Auto-index large error output into FTS5 — no data loss
-        if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
+        if (Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
           trackIndexed(Buffer.byteLength(output));
-          const text = intentSearch(output, "errors failures exceptions", isError ? `execute:${language}:error` : `execute:${language}`);
+          const text = intentSearch(output, inferShellIntent(language, code, result.exitCode), isError ? `execute:${language}:error` : `execute:${language}`);
           return trackResponse("ctx_execute", {
             content: [
               {
                 type: "text" as const,
                 text: appendRunSidecarNote(text, {
-                  command: executionCommandShape(language, code),
+                  command: commandShape,
                   stdout: output,
                   status: isError ? "failed" : "unknown",
                   exitCode: result.exitCode,
@@ -1899,13 +1952,13 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
 
       const stdout = result.stdout || "(no output)";
 
-      if (parser && parser.trim().length > 0) {
+      if (effectiveParser) {
         return trackResponse("ctx_execute", {
           content: [
             {
               type: "text" as const,
               text: renderParsedExecuteOutput({
-                parser,
+                parser: effectiveParser,
                 language,
                 code,
                 stdout: result.stdout,
@@ -1920,19 +1973,19 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
       }
 
       // Intent-driven search: if intent provided and output is large enough
-      if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
+      if (effectiveIntent && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
         trackIndexed(Buffer.byteLength(stdout));
-        const text = intentSearch(stdout, intent, `execute:${language}`);
+        const text = intentSearch(stdout, effectiveIntent, `execute:${language}`);
         return trackResponse("ctx_execute", {
           content: [
             {
               type: "text" as const,
               text: appendRunSidecarNote(text, {
-                command: executionCommandShape(language, code),
+                command: commandShape,
                 stdout,
                 status: "succeeded",
                 parser: "intent-search",
-                summary: `Intent search for ${intent}`,
+                summary: `Intent search for ${effectiveIntent}`,
               }),
             },
           ],
@@ -1943,7 +1996,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
       if (Buffer.byteLength(stdout) > LARGE_OUTPUT_THRESHOLD) {
         const indexed = indexStdout(stdout, `execute:${language}`);
         indexed.content[0].text = appendRunSidecarNote(indexed.content[0].text, {
-          command: executionCommandShape(language, code),
+          command: commandShape,
           stdout,
           status: "succeeded",
           parser: "large-output",
@@ -1997,6 +2050,64 @@ function indexStdout(
 function executionCommandShape(language: string, code: string): string {
   const firstLine = code.trim().split(/\r?\n/, 1)[0] ?? "";
   return `${language}: ${firstLine.slice(0, 180)}`;
+}
+
+function simpleShellCommand(code: string): string | null {
+  let trimmed = code.trim();
+  if (!trimmed || /[\r\n]/.test(trimmed)) return null;
+  if (trimmed.includes("|")) {
+    const parts = trimmed.split("|").map((part) => part.trim());
+    if (parts.length !== 2 || !/^(head|tail)(?:\s+|$)/i.test(parts[1])) return null;
+    trimmed = parts[0];
+  }
+  if (/[;&<>`$]/.test(trimmed)) return null;
+  return trimmed;
+}
+
+function inferShellParser(language: string, code: string): string | undefined {
+  if (language !== "shell") return undefined;
+  const command = simpleShellCommand(code);
+  if (!command) return undefined;
+  const routedParser = routeCommand(command, { mode: "recommend" }).route?.parser;
+  if (routedParser && getOutputParser(routedParser)) return routedParser;
+  const lowered = command.toLowerCase();
+  if (/^git\s+log\b/.test(lowered)) return "git-log";
+  if (/^git\s+status\b/.test(lowered)) return "git-status";
+  if (/^git\s+diff\b/.test(lowered)) return "git-diff";
+  if (/^(rg|grep|egrep|fgrep)\b/.test(lowered)) return "rg";
+  if (/^(ls|dir|tree|find)\b/.test(lowered)) return "file-list";
+  if (/^(cat|type)\s+["']?(?:\.\/)?package\.json["']?$/i.test(command)) return "package-json";
+  if (/^(npm|pnpm|yarn|bun)\b/.test(lowered)) return "npm";
+  if (/^cargo\s+(test|build|check|clippy)\b/.test(lowered)) return "cargo";
+  if (/^(pip|pip3)\s+/.test(lowered) || /^python\s+-m\s+pip\b/.test(lowered)) return "pip";
+  if (/^docker\s+logs\b/.test(lowered)) return "docker-logs";
+  if (/^gh\s+/.test(lowered)) return "gh";
+  return undefined;
+}
+
+function inferParserFromOutput(stdout: string, stderr: string): string | undefined {
+  const text = `${stdout}\n${stderr}`;
+  if (/^\s*\{/.test(stdout) && /"name"\s*:/.test(stdout) && /"scripts"\s*:/.test(stdout)) return "package-json";
+  if (/^\s*[\[{]/.test(stdout)) return undefined;
+  if (/##\[(?:group|endgroup|error|warning)\]/i.test(text)) return "ci-log";
+  if (/\b(vite|webpack|rollup)\b/i.test(text) && /\b(error|failed|warning|built|compiled)\b/i.test(text)) return "ci-log";
+  if (/\btest result:\s+/i.test(text) || /^\s*(?:error|warning)(?:\[[^\]]+\])?:/im.test(text)) return "cargo";
+  return undefined;
+}
+
+function inferShellIntent(language: string, code: string, exitCode: number): string {
+  if (language !== "shell") return exitCode === 0 ? "summary important errors warnings markers" : "errors failures exceptions";
+  const command = simpleShellCommand(code)?.toLowerCase() ?? "";
+  if (/^git\s+diff\b/.test(command)) return "changed files hunks additions deletions";
+  if (/^git\s+log\b/.test(command)) return "recent commits changed files authors";
+  if (/^git\s+status\b/.test(command)) return "branch changed untracked files";
+  if (/^(npm|pnpm|yarn|bun)\b/.test(command)) return exitCode === 0 ? "package script summary warnings" : "package script errors failures";
+  if (/^cargo\b/.test(command)) return exitCode === 0 ? "cargo test build summary" : "rust errors warnings failed tests";
+  if (/^(rg|grep|egrep|fgrep)\b/.test(command)) return "matches files line numbers";
+  if (/^(ls|dir|tree|find)\b/.test(command)) return "files directories paths";
+  if (/^docker\s+logs\b/.test(command)) return "errors warnings fatal exceptions";
+  if (/^gh\s+/.test(command)) return "github status failures summary";
+  return exitCode === 0 ? "summary important errors warnings markers" : "errors failures exceptions";
 }
 
 function renderParsedExecuteOutput(opts: {
@@ -2413,6 +2524,95 @@ server.registerTool(
 // Tool: index
 // ─────────────────────────────────────────────────────────
 
+const INDEX_DIR_MAX_FILES = 250;
+const INDEX_DIR_MAX_FILE_BYTES = 256 * 1024;
+const INDEX_DIR_MAX_TOTAL_BYTES = 3 * 1024 * 1024;
+const INDEX_DIR_SKIP_DIRS = new Set([
+  ".git",
+  ".context-mode",
+  "node_modules",
+  "build",
+  "dist",
+  "coverage",
+  "target",
+  ".next",
+  ".turbo",
+]);
+const INDEX_DIR_EXTS = new Set([
+  ".cjs",
+  ".css",
+  ".cts",
+  ".js",
+  ".jsx",
+  ".json",
+  ".md",
+  ".mjs",
+  ".mts",
+  ".rs",
+  ".toml",
+  ".ts",
+  ".tsx",
+  ".yaml",
+  ".yml",
+]);
+
+function extensionOf(filePath: string): string {
+  const name = filePath.replace(/\\/g, "/").split("/").pop() ?? "";
+  const dot = name.lastIndexOf(".");
+  return dot >= 0 ? name.slice(dot).toLowerCase() : "";
+}
+
+function collectDirectoryIndexFiles(root: string): string[] {
+  const files: string[] = [];
+  const visit = (dir: string): void => {
+    if (files.length >= INDEX_DIR_MAX_FILES) return;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (files.length >= INDEX_DIR_MAX_FILES) return;
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!INDEX_DIR_SKIP_DIRS.has(entry.name)) visit(fullPath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (!INDEX_DIR_EXTS.has(extensionOf(entry.name))) continue;
+      try {
+        if (statSync(fullPath).size <= INDEX_DIR_MAX_FILE_BYTES) files.push(fullPath);
+      } catch {
+        // Files can disappear during indexing; skip unstable entries.
+      }
+    }
+  };
+  visit(root);
+  return files;
+}
+
+function renderDirectoryIndex(root: string, files: readonly string[]): { content: string; indexedFiles: number; truncated: boolean } {
+  const sections: string[] = [`# Directory index: ${root}`];
+  let totalBytes = Buffer.byteLength(sections[0], "utf8");
+  let indexedFiles = 0;
+  let truncated = false;
+  for (const filePath of files) {
+    let text: string;
+    try {
+      assertFilePathAllowedByDenyPolicy(filePath);
+      text = readFileSync(filePath, "utf8");
+    } catch {
+      continue;
+    }
+    const rel = relative(root, filePath).replace(/\\/g, "/");
+    const section = `\n\n## ${rel}\n\n\`\`\`${extensionOf(filePath).slice(1)}\n${text}\n\`\`\``;
+    const nextBytes = Buffer.byteLength(section, "utf8");
+    if (totalBytes + nextBytes > INDEX_DIR_MAX_TOTAL_BYTES) {
+      truncated = true;
+      break;
+    }
+    sections.push(section);
+    totalBytes += nextBytes;
+    indexedFiles++;
+  }
+  return { content: sections.join(""), indexedFiles, truncated };
+}
+
 server.registerTool(
   "ctx_index",
   {
@@ -2442,7 +2642,7 @@ server.registerTool(
         .string()
         .optional()
         .describe(
-          "File path to read and index (content never enters context). Provide this OR content.",
+          "File or directory path to read and index (content never enters context). Provide this OR content.",
         ),
       source: z
         .string()
@@ -2481,6 +2681,24 @@ server.registerTool(
         if (pathDenied) return pathDenied;
       }
       const store = getStore();
+      if (resolvedPath && statSync(resolvedPath).isDirectory()) {
+        const files = collectDirectoryIndexFiles(resolvedPath);
+        const directoryIndex = renderDirectoryIndex(resolvedPath, files);
+        const result = store.index({
+          content: directoryIndex.content,
+          source: source ?? resolvedPath,
+          attribution: currentAttribution(),
+        });
+        trackIndexed(Buffer.byteLength(directoryIndex.content, "utf8"));
+        return trackResponse("ctx_index", {
+          content: [
+            {
+              type: "text" as const,
+              text: `Indexed directory ${directoryIndex.indexedFiles}/${files.length} files as ${result.totalChunks} sections (${result.codeChunks} with code) from: ${result.label}${directoryIndex.truncated ? "\nDirectory index truncated by byte budget." : ""}\nUse ctx_search(queries: ["..."]) to query this content. Use source: "${result.label}" to scope results.`,
+            },
+          ],
+        });
+      }
       const result = store.index({
         content,
         path: resolvedPath,
@@ -2514,7 +2732,7 @@ let searchCallCount = 0;
 let searchWindowStart = Date.now();
 const SEARCH_WINDOW_MS = 60_000;
 const SEARCH_MAX_RESULTS_AFTER = 3; // after 3 calls: 1 result per query
-const SEARCH_BLOCK_AFTER = 8; // after 8 calls: refuse, demand batching
+const SEARCH_BLOCK_AFTER = 16; // after 16 calls: refuse, demand batching
 
 /**
  * Defensive coercion: parse stringified JSON arrays.
@@ -2578,6 +2796,10 @@ server.registerTool(
         .enum(["code", "prose"])
         .optional()
         .describe("Filter results by content type: 'code' or 'prose'."),
+      compact: z
+        .boolean()
+        .optional()
+        .describe("Return terse file/title/snippet lines for tiny corpora or short result sets."),
       sort: z
         .enum(["relevance", "timeline"])
         .optional()
@@ -2629,7 +2851,7 @@ server.registerTool(
         });
       }
 
-      const { limit = 3, source, contentType } = params as { limit?: number; source?: string; contentType?: "code" | "prose" };
+      const { limit = 3, source, contentType, compact } = params as { limit?: number; source?: string; contentType?: "code" | "prose"; compact?: boolean };
 
       // Progressive throttling: track calls in time window
       const now = Date.now();
@@ -2710,6 +2932,19 @@ server.registerTool(
 
         if (results.length === 0) {
           sections.push(`## ${q}\nNo results found.`);
+          continue;
+        }
+
+        if (shouldUseTinySearchFormat({
+          compact,
+          queryCount: queryList.length,
+          sort,
+          storeChunks: store.getStats().chunks,
+          results,
+        })) {
+          const formatted = formatTinySearchResults(q, results);
+          sections.push(queryList.length === 1 ? formatted : `## ${q}\n${formatted}`);
+          totalSize += formatted.length;
           continue;
         }
 
@@ -3304,6 +3539,18 @@ async function fetchOneUrl(url: string, source: string | undefined, force: boole
   }
 }
 
+function compactFetchErrorLine(r: { url: string; error: string; reason?: string }): string {
+  const reason = r.reason ?? "job";
+  const url = inlineCompactText(r.url, 160);
+  const error = inlineCompactText(r.error.split(/\r?\n/)[0] || "unknown error", 220);
+  const next = reason === "empty"
+    ? "verify content type"
+    : reason === "read"
+      ? "retry or inspect subprocess"
+      : "check URL/network or retry with force:true";
+  return `fetch-error reason=${reason} url=${url} error=${error}; next=${next}`;
+}
+
 interface IndexedFetchResult {
   label: string;
   totalChunks: number;
@@ -3522,21 +3769,15 @@ server.registerTool(
           content: [{ type: "text" as const, text }],
         });
       }
-      // fetch_error — preserve original error wording per reason
       if (r.kind === "fetch_error") {
-        const text =
-          r.reason === "empty" ? `Fetched ${r.url} but got empty content`
-          : r.reason === "read" ? `Fetched ${r.url} but could not read subprocess output`
-          : r.reason === "exit" ? `Failed to fetch ${r.url}: ${r.error}`
-          : /* throw */         `Fetch error: ${r.error}`;
         return trackResponse("ctx_fetch_and_index", {
-          content: [{ type: "text" as const, text }],
+          content: [{ type: "text" as const, text: compactFetchErrorLine(r) }],
           isError: true,
         });
       }
       // job_error
       return trackResponse("ctx_fetch_and_index", {
-        content: [{ type: "text" as const, text: `Fetch error: ${r.error}` }],
+        content: [{ type: "text" as const, text: compactFetchErrorLine(r) }],
         isError: true,
       });
     }
@@ -3568,7 +3809,7 @@ server.registerTool(
         snippets.push(`### ${r.indexed.label}\n\n${snippet}`);
       } else {
         errorCount++;
-        lines.push(`- [err]   ${r.url}: ${r.error}`);
+        lines.push(`- [err]   ${compactFetchErrorLine(r)}`);
       }
     }
 
@@ -4308,8 +4549,13 @@ registerTool(_toolCtx, makeCtxGuard({
 }));
 registerTool(_toolCtx, makeCtxEval());
 registerTool(_toolCtx, makeCtxTrace({ getProjectDir }));
-registerTool(_toolCtx, makeCtxDiff({ getProjectDir }));
+registerTool(_toolCtx, makeCtxDiff({ getProjectDir, resolveProjectDirOverride }));
 registerTool(_toolCtx, makeCtxCache({ getProjectDir }));
+registerTool(_toolCtx, makeCtxCode({
+  getProjectDir,
+  resolveProjectDirOverride,
+  checkFilePath: (path, projectDir) => filePathDenyPolicyMessage(path, projectDir),
+}));
 
 // ── ctx-purge: explicit knowledge base wipe ─────────────────────────────────
 //

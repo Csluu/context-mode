@@ -27,7 +27,7 @@ Analyze/count/filter/compare/search/parse/transform data: **write code** via `ct
 
 ## Stable Tools
 
-Default public tools: `ctx_read`, `ctx_route`, `ctx_fetch_run`, `ctx_gain`, `ctx_discover`, plus the existing execute/search/fetch/stats/admin tools. Experimental tools (`ctx_guard`, `ctx_eval`, `ctx_trace`, `ctx_diff`, `ctx_cache`) stay hidden unless `CTX_MODE_EXPERIMENTAL=1` or `CONTEXT_MODE_EXPERIMENTAL=1`.
+Default public tools: `ctx_read`, `ctx_route`, `ctx_fetch_run`, `ctx_gain`, `ctx_discover`, `ctx_diff`, plus the existing execute/search/fetch/stats/admin tools. Experimental tools (`ctx_guard`, `ctx_eval`, `ctx_trace`, `ctx_cache`) stay hidden unless `CTX_MODE_EXPERIMENTAL=1` or `CONTEXT_MODE_EXPERIMENTAL=1`.
 
 ## Output
 

@@ -21,24 +21,25 @@ describe("route explainability", () => {
 
   it("recognizes Windows npm shims, typecheck, OpenClaw, cargo, and graphify commands", () => {
     const cases = [
-      { command: "npm.cmd run test:coverage", rule: "node-test-generic", parser: "node-test-generic" },
+      { command: "npm.cmd run test:coverage", rule: "node-test-generic", parser: "npm" },
       { command: "npx.cmd vitest run --coverage", rule: "vitest-test", parser: "vitest" },
       { command: "npx.cmd playwright test", rule: "playwright-test", parser: "playwright" },
       { command: "npx.cmd tsx --test", rule: "node-test-generic", parser: "node-test-generic" },
-      { command: "npm --prefix frontend test", rule: "node-test-generic", parser: "node-test-generic" },
+      { command: "npm --prefix frontend test", rule: "node-test-generic", parser: "npm" },
       { command: "pnpm --filter web vitest run", rule: "vitest-test", parser: "vitest" },
       { command: "npm --prefix frontend run playwright:e2e", rule: "playwright-test", parser: "playwright" },
-      { command: "npm.cmd run build", rule: "node-build-generic", parser: "generic-failure" },
-      { command: "CI=1 npm --prefix frontend run build", rule: "node-build-generic", parser: "generic-failure" },
-      { command: "npm --prefix frontend run build", rule: "node-build-generic", parser: "generic-failure" },
-      { command: "npm.cmd run lint", rule: "node-lint-generic", parser: "generic-failure" },
-      { command: "npx.cmd eslint src", rule: "node-lint-generic", parser: "generic-failure" },
-      { command: "npx.cmd tsc --noEmit", rule: "node-typecheck-generic", parser: "generic-failure" },
-      { command: "CI=1 npx.cmd tsc --noEmit", rule: "node-typecheck-generic", parser: "generic-failure" },
-      { command: "npm --prefix frontend run typecheck", rule: "node-typecheck-generic", parser: "generic-failure" },
-      { command: "cargo test", rule: "cargo-test", parser: "generic-failure" },
+      { command: "npm.cmd run build", rule: "node-build-generic", parser: "npm" },
+      { command: "CI=1 npm --prefix frontend run build", rule: "node-build-generic", parser: "npm" },
+      { command: "npm --prefix frontend run build", rule: "node-build-generic", parser: "npm" },
+      { command: "npm.cmd run lint", rule: "node-lint-generic", parser: "eslint" },
+      { command: "npx.cmd eslint src", rule: "node-lint-generic", parser: "eslint" },
+      { command: "npx.cmd tsc --noEmit", rule: "node-typecheck-generic", parser: "tsc" },
+      { command: "CI=1 npx.cmd tsc --noEmit", rule: "node-typecheck-generic", parser: "tsc" },
+      { command: "npm --prefix frontend run typecheck", rule: "node-typecheck-generic", parser: "tsc" },
+      { command: "cargo test", rule: "cargo-test", parser: "cargo" },
       { command: "graphify query \"test coverage\"", rule: "graphify", parser: "generic-failure" },
       { command: "openclaw status --no-color", rule: "openclaw-status-logs", parser: "generic-failure" },
+      { command: "gh pr checks 123 --json name,conclusion", rule: "gh-read", parser: "gh" },
     ];
 
     for (const item of cases) {
@@ -51,6 +52,15 @@ describe("route explainability", () => {
     }
   });
 
+  it("routes docker logs through the log parser without lowering its danger level", () => {
+    const decision = routeCommand("docker logs api --tail 200", { mode: "recommend", adapterCanRewrite: true });
+
+    expect(decision.decision).toBe("recommend");
+    expect(decision.selectedRule).toBe("docker-logs");
+    expect(decision.route?.parser).toBe("docker-logs");
+    expect(decision.safety.reason).toContain("danger level medium");
+  });
+
   it("does not route mutating lint commands as low-risk log commands", () => {
     for (const command of [
       "npm --prefix frontend run lint:fix",
@@ -59,7 +69,7 @@ describe("route explainability", () => {
     ]) {
       const decision = routeCommand(command, { mode: "recommend", adapterCanRewrite: true });
       expect(decision.selectedRule).not.toBe("node-lint-generic");
-      expect(decision.route?.parser).not.toBe("generic-failure");
+      expect(decision.route?.parser).not.toBe("eslint");
     }
   });
 
@@ -185,9 +195,9 @@ describe("route explainability", () => {
         segmentIndex: 1,
         command: "npx.cmd tsx --test",
         selectedRule: "node-test-generic",
-        route: expect.objectContaining({
-          tool: "ctx_execute",
-          parser: "node-test-generic",
+          route: expect.objectContaining({
+            tool: "ctx_execute",
+            parser: "node-test-generic",
         }),
       }),
     ]);

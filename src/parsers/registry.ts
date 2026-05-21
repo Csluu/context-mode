@@ -4,6 +4,12 @@ export interface RenderParsedOutputOptions {
   readonly maxImportantItems?: number;
 }
 
+const ANSI_RE = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
+
+function stripAnsi(text: string): string {
+  return text.replace(ANSI_RE, "");
+}
+
 function parserConfidence(score: number, reason: string): ParserConfidence {
   const clamped = Math.max(0, Math.min(1, score));
   return {
@@ -14,7 +20,7 @@ function parserConfidence(score: number, reason: string): ParserConfidence {
 }
 
 function linesOf(input: ParserInput): string[] {
-  return `${input.stdout}\n${input.stderr}`.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  return `${stripAnsi(input.stdout)}\n${stripAnsi(input.stderr)}`.split(/\r?\n/).filter((line) => line.trim().length > 0);
 }
 
 function unwrapStructuredOutput(input: ParserInput): ParserInput {
@@ -34,7 +40,7 @@ function unwrapStructuredOutput(input: ParserInput): ParserInput {
       : typeof parsed.status === "number"
         ? parsed.status
         : input.exitCode;
-    return { ...input, stdout, stderr, exitCode };
+    return { ...input, stdout: stripAnsi(stdout), stderr: stripAnsi(stderr), exitCode };
   } catch {
     return input;
   }
@@ -143,6 +149,25 @@ function collectJsonFailureMessages(value: unknown, out: ParsedImportantItem[]):
     out.push({ message: message.split(/\r?\n/)[0] ?? message });
   }
   for (const child of Object.values(object)) collectJsonFailureMessages(child, out);
+}
+
+function itemFromLocation(message: string): ParsedImportantItem {
+  const tsLoc = message.match(/^(.+?)\((\d+),(\d+)\):\s*(.*)$/);
+  if (tsLoc) {
+    return { file: tsLoc[1], line: Number(tsLoc[2]), message };
+  }
+  const colonLoc = message.match(/^((?:[A-Za-z]:\\)?[^:\n]+?\.[A-Za-z0-9]+):(\d+)(?::\d+)?:?\s*(.*)$/);
+  if (colonLoc) {
+    return { file: colonLoc[1], line: Number(colonLoc[2]), message };
+  }
+  return { message };
+}
+
+function compactStatusParts(counts: Record<string, number>, order: readonly string[]): string {
+  return order
+    .map((key) => (counts[key] ? `${counts[key]} ${key}` : ""))
+    .filter(Boolean)
+    .join(", ");
 }
 
 const vitestJsonParser: OutputParser = {
@@ -302,9 +327,237 @@ const playwrightParser: OutputParser = {
   },
 };
 
+const pytestParser: OutputParser = {
+  name: "pytest",
+  aliases: ["pytest-output"],
+  parse(input) {
+    const lines = linesOf(input);
+    const summaryLine = [...lines].reverse().find((line) =>
+      /\b\d+\s+(?:failed|passed|skipped|xfailed|xpassed|errors?|warnings?)\b/i.test(line)
+    );
+    const counts: Record<string, number> = {};
+    if (summaryLine) {
+      for (const match of summaryLine.matchAll(/(\d+)\s+(failed|passed|skipped|xfailed|xpassed|errors?|warnings?)\b/gi)) {
+        const key = match[2].toLowerCase().replace(/s$/, "");
+        counts[key === "error" ? "failed" : key] = (counts[key === "error" ? "failed" : key] ?? 0) + Number(match[1]);
+      }
+    }
+    const important = input.exitCode === 0
+      ? []
+      : lines
+        .filter((line) => /^(FAILED|ERROR)\s+|::|E\s+AssertionError|Traceback\b/i.test(line.trim()))
+        .slice(0, 25)
+        .map((line) => itemFromLocation(line.trim()));
+    if (!summaryLine && important.length > 0) counts.failed = important.length;
+    const summary = compactStatusParts(counts, ["failed", "passed", "skipped", "xfailed", "xpassed", "warning"]);
+    return {
+      parser: "pytest",
+      status: statusFromExit(input.exitCode),
+      summary: summary || `exit ${input.exitCode}`,
+      important,
+      confidence: parserConfidence(
+        summary ? 0.88 : important.length > 0 ? 0.72 : 0.58,
+        summary ? "pytest terminal summary parsed" : important.length > 0 ? "pytest failure lines parsed" : "exit code known but pytest summary not found",
+      ),
+      omitted: { totalLines: lines.length },
+    };
+  },
+};
+
+const tscParser: OutputParser = {
+  name: "tsc",
+  aliases: ["typescript", "typescript-compiler"],
+  parse(input) {
+    const lines = linesOf(input);
+    const diagnosticLines = lines.filter((line) => /\berror\s+TS\d+:/i.test(line));
+    const reported = [...lines].reverse().find((line) => /\bFound\s+\d+\s+errors?\b/i.test(line));
+    const reportedCount = Number(reported?.match(/\bFound\s+(\d+)\s+errors?\b/i)?.[1] ?? diagnosticLines.length);
+    const codes = new Map<string, number>();
+    for (const line of diagnosticLines) {
+      const code = line.match(/\b(TS\d+):/)?.[1];
+      if (code) codes.set(code, (codes.get(code) ?? 0) + 1);
+    }
+    const codeSummary = Array.from(codes.entries()).slice(0, 6).map(([code, count]) => `${code}=${count}`).join(", ");
+    const important = diagnosticLines.slice(0, 25).map((line) => itemFromLocation(line.trim()));
+    return {
+      parser: "tsc",
+      status: statusFromExit(input.exitCode),
+      summary: reportedCount > 0
+        ? `errors=${reportedCount}${codeSummary ? ` (${codeSummary})` : ""}`
+        : `exit ${input.exitCode}`,
+      important,
+      confidence: parserConfidence(
+        diagnosticLines.length > 0 || reported ? 0.91 : 0.58,
+        diagnosticLines.length > 0 ? "TypeScript diagnostic lines parsed" : "exit code known but TypeScript diagnostics not found",
+      ),
+      omitted: { totalLines: lines.length },
+    };
+  },
+};
+
+const eslintParser: OutputParser = {
+  name: "eslint",
+  aliases: ["eslint-json", "eslint-stylish"],
+  parse(input) {
+    const payload = parseJsonPayload(input);
+    const important: ParsedImportantItem[] = [];
+    let errors = 0;
+    let warnings = 0;
+    if (Array.isArray(payload)) {
+      for (const fileResult of payload as Array<Record<string, unknown>>) {
+        const filePath = typeof fileResult.filePath === "string" ? fileResult.filePath : undefined;
+        errors += numberField(fileResult.errorCount);
+        warnings += numberField(fileResult.warningCount);
+        const messages = Array.isArray(fileResult.messages) ? fileResult.messages : [];
+        for (const item of messages as Array<Record<string, unknown>>) {
+          if (important.length >= 25) break;
+          const severity = numberField(item.severity);
+          const message = typeof item.message === "string" ? item.message : "ESLint issue";
+          const rule = typeof item.ruleId === "string" ? ` (${item.ruleId})` : "";
+          important.push({
+            file: filePath,
+            line: numberField(item.line) || undefined,
+            message: `${severity === 2 ? "error" : "warning"}: ${message}${rule}`,
+          });
+        }
+      }
+    } else {
+      const lines = linesOf(input);
+      let currentFile: string | undefined;
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (/^\/|^[A-Za-z]:\\|^[^:\s]+\.[A-Za-z0-9]+$/.test(trimmed) && !/^\d+:\d+/.test(trimmed)) {
+          currentFile = trimmed;
+          continue;
+        }
+        const match = trimmed.match(/^(\d+):(\d+)\s+(error|warning)\s+(.+)$/i);
+        if (!match) continue;
+        if (match[3].toLowerCase() === "error") errors++;
+        else warnings++;
+        if (important.length < 25) {
+          important.push({
+            file: currentFile,
+            line: Number(match[1]),
+            message: `${match[3].toLowerCase()}: ${match[4]}`,
+          });
+        }
+      }
+      const totals = lines.find((line) => /\bproblems?\b.*\berrors?\b/i.test(line));
+      if (totals) {
+        errors = Number(totals.match(/(\d+)\s+errors?\b/i)?.[1] ?? errors);
+        warnings = Number(totals.match(/(\d+)\s+warnings?\b/i)?.[1] ?? warnings);
+      }
+    }
+    const problemParts = [
+      errors > 0 ? `${errors} error${errors === 1 ? "" : "s"}` : "",
+      warnings > 0 ? `${warnings} warning${warnings === 1 ? "" : "s"}` : "",
+    ].filter(Boolean);
+    return {
+      parser: "eslint",
+      status: statusFromExit(input.exitCode),
+      summary: problemParts.length > 0 ? `problems: ${problemParts.join(", ")} (${errors + warnings})` : `exit ${input.exitCode}`,
+      important: input.exitCode === 0 ? [] : important,
+      confidence: parserConfidence(
+        errors + warnings > 0 ? 0.9 : 0.58,
+        errors + warnings > 0 ? "ESLint issue counts parsed" : "exit code known but ESLint issues not found",
+      ),
+      omitted: { totalLines: linesOf(input).length },
+    };
+  },
+};
+
+const npmParser: OutputParser = {
+  name: "npm",
+  aliases: ["npm-output", "npm-script"],
+  parse(input) {
+    const lines = linesOf(input);
+    const npmErrors = lines.filter((line) => /^\s*npm\s+(ERR!|error)\b/i.test(line));
+    const lifecycle = lines.find((line) => /\bELIFECYCLE\b|\bCommand failed\b|\bscript failed\b/i.test(line));
+    const important = input.exitCode === 0
+      ? []
+      : npmErrors.concat(failureLines(input).map((item) => item.message)).slice(0, 25).map((message) => itemFromLocation(message.trim()));
+    const code = lines.find((line) => /^\s*npm\s+(ERR!|error)\s+code\s+/i.test(line))?.trim();
+    return {
+      parser: "npm",
+      status: statusFromExit(input.exitCode),
+      summary: input.exitCode === 0
+        ? `exit 0`
+        : `${code ? `${code}; ` : ""}${important.length} failure line(s), exit ${input.exitCode}`,
+      important: lifecycle && important.length < 25 ? [{ message: lifecycle.trim() }, ...important].slice(0, 25) : important,
+      confidence: parserConfidence(
+        npmErrors.length > 0 || lifecycle ? 0.82 : important.length > 0 ? 0.68 : 0.56,
+        npmErrors.length > 0 || lifecycle ? "npm lifecycle/error markers parsed" : "exit code known with generic failure focus",
+      ),
+      omitted: { totalLines: lines.length },
+    };
+  },
+};
+
+const dockerLogsParser: OutputParser = {
+  name: "docker-logs",
+  aliases: ["docker"],
+  parse(input) {
+    const lines = linesOf(input);
+    const errorLines = lines.filter((line) => /\b(error|fatal|exception|panic|traceback)\b/i.test(line));
+    const warningLines = lines.filter((line) => /\bwarn(?:ing)?\b/i.test(line));
+    const important = input.exitCode === 0
+      ? errorLines.slice(-25).map((line) => itemFromLocation(line.trim()))
+      : failureLines(input);
+    return {
+      parser: "docker-logs",
+      status: statusFromExit(input.exitCode),
+      summary: `lines=${lines.length} errors=${errorLines.length} warnings=${warningLines.length}`,
+      important,
+      confidence: parserConfidence(
+        lines.length > 0 ? 0.78 : 0.52,
+        "docker log severity counters parsed",
+      ),
+      omitted: { totalLines: lines.length },
+    };
+  },
+};
+
+const ghParser: OutputParser = {
+  name: "gh",
+  aliases: ["github-cli"],
+  parse(input) {
+    const payload = parseJsonPayload(input);
+    const important: ParsedImportantItem[] = [];
+    let summary = `exit ${input.exitCode}`;
+    if (Array.isArray(payload)) {
+      const counts: Record<string, number> = {};
+      for (const item of payload as Array<Record<string, unknown>>) {
+        const key = String(item.conclusion ?? item.status ?? item.state ?? "item").toLowerCase();
+        counts[key] = (counts[key] ?? 0) + 1;
+        if (important.length < 25) {
+          const title = String(item.title ?? item.name ?? item.workflowName ?? item.url ?? key);
+          important.push({ message: title });
+        }
+      }
+      const parts = Object.entries(counts).map(([key, count]) => `${count} ${key}`);
+      summary = `${payload.length} item(s)${parts.length ? `: ${parts.join(", ")}` : ""}`;
+    } else {
+      const lines = linesOf(input);
+      const failures = failureLines(input);
+      summary = `lines=${lines.length}, exit ${input.exitCode}`;
+      important.push(...(input.exitCode === 0 ? lines.slice(0, 10).map((message) => ({ message: message.trim() })) : failures));
+    }
+    return {
+      parser: "gh",
+      status: statusFromExit(input.exitCode),
+      summary,
+      important,
+      confidence: parserConfidence(
+        Array.isArray(payload) ? 0.86 : important.length > 0 ? 0.68 : 0.55,
+        Array.isArray(payload) ? "GitHub CLI JSON output parsed" : "GitHub CLI text output summarized",
+      ),
+    };
+  },
+};
+
 const genericFailureParser: OutputParser = {
   name: "generic-failure",
-  aliases: ["failure-focus", "generic-test", "node-test-generic", "pytest", "test-output"],
+  aliases: ["failure-focus", "generic-test", "node-test-generic", "test-output"],
   parse(input) {
     const important = input.exitCode === 0 ? [] : failureLines(input);
     return {
@@ -434,15 +687,209 @@ const rgParser: OutputParser = {
   },
 };
 
+const gitLogParser: OutputParser = {
+  name: "git-log",
+  aliases: ["git-history"],
+  parse(input) {
+    const lines = linesOf(input);
+    const commits = lines.filter((line) => /^(commit\s+)?[0-9a-f]{7,40}\b/i.test(line) || /^[0-9a-f]{7,40}\s+/.test(line));
+    const authors = new Set<string>();
+    for (const line of lines) {
+      const author = line.match(/^Author:\s+(.+)$/i)?.[1] ?? line.match(/\bby\s+([^<]+?)(?:\s+<|$)/i)?.[1];
+      if (author) authors.add(author.trim());
+    }
+    const important = lines
+      .filter((line) => /^(commit\s+)?[0-9a-f]{7,40}\b/i.test(line) || /^\s{4}\S/.test(line) || /^[0-9a-f]{7,40}\s+/.test(line))
+      .slice(0, 20)
+      .map((message) => ({ message: message.trim() }));
+    return {
+      parser: "git-log",
+      status: statusFromExit(input.exitCode),
+      summary: `commits=${commits.length || lines.filter((line) => line.trim()).length} authors=${authors.size}`,
+      important,
+      confidence: parserConfidence(
+        commits.length > 0 || important.length > 0 ? 0.84 : 0.56,
+        "git log commit/message lines summarized",
+      ),
+      omitted: { totalLines: lines.length },
+    };
+  },
+};
+
+const fileListParser: OutputParser = {
+  name: "file-list",
+  aliases: ["ls", "find", "tree", "directory-list"],
+  parse(input) {
+    const lines = linesOf(input);
+    const fileLike = lines.filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed || /^total\s+\d+/i.test(trimmed)) return false;
+      return /[\\/.]/.test(trimmed) || /^[dl-][rwx-]{9}\b/.test(trimmed) || /^[├└│]/.test(trimmed);
+    });
+    const extCounts = new Map<string, number>();
+    let dirs = 0;
+    for (const line of fileLike) {
+      const trimmed = line.trim();
+      if (trimmed.endsWith("/") || /^d[rwx-]{9}\b/.test(trimmed) || /(?:^|[\\/])[^\\/]+[\\/]$/.test(trimmed)) dirs++;
+      const ext = trimmed.match(/\.([A-Za-z0-9]{1,12})(?:\s|$)/)?.[1]?.toLowerCase();
+      if (ext) extCounts.set(ext, (extCounts.get(ext) ?? 0) + 1);
+    }
+    const topExts = Array.from(extCounts.entries())
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, 8)
+      .map(([ext, count]) => `${ext}=${count}`)
+      .join(" ");
+    const important = fileLike.slice(0, 20).map((message) => ({ message: message.trim() }));
+    return {
+      parser: "file-list",
+      status: statusFromExit(input.exitCode),
+      summary: `entries=${fileLike.length || lines.length} dirs=${dirs}${topExts ? ` ${topExts}` : ""}`,
+      important,
+      confidence: parserConfidence(
+        fileLike.length > 0 ? 0.76 : 0.52,
+        "file listing entries counted and sampled",
+      ),
+      omitted: { totalLines: lines.length },
+    };
+  },
+};
+
+const cargoParser: OutputParser = {
+  name: "cargo",
+  aliases: ["rust", "rustc"],
+  parse(input) {
+    const lines = linesOf(input);
+    const errorLines = lines.filter((line) => /^\s*error(?:\[[^\]]+\])?:/i.test(line) || /\berror:/i.test(line));
+    const warningLines = lines.filter((line) => /^\s*warning(?:\[[^\]]+\])?:/i.test(line) || /\bwarning:/i.test(line));
+    const testSummary = lines.find((line) => /\btest result:\s+/i.test(line));
+    const important = (errorLines.length > 0 ? errorLines : warningLines.length > 0 ? warningLines : failureLines(input).map((item) => item.message))
+      .slice(0, 25)
+      .map((message) => itemFromLocation(message.trim()));
+    return {
+      parser: "cargo",
+      status: statusFromExit(input.exitCode),
+      summary: testSummary?.trim() ?? `errors=${errorLines.length} warnings=${warningLines.length} exit=${input.exitCode}`,
+      important,
+      confidence: parserConfidence(
+        errorLines.length > 0 || warningLines.length > 0 || testSummary ? 0.82 : 0.58,
+        "Cargo/Rust diagnostic and test-result lines summarized",
+      ),
+      omitted: { totalLines: lines.length },
+    };
+  },
+};
+
+const pipParser: OutputParser = {
+  name: "pip",
+  aliases: ["pip-install", "python-package"],
+  parse(input) {
+    const lines = linesOf(input);
+    const installs = lines.filter((line) => /\b(Collecting|Installing collected packages|Successfully installed|Requirement already satisfied)\b/i.test(line));
+    const failures = failureLines(input);
+    return {
+      parser: "pip",
+      status: statusFromExit(input.exitCode),
+      summary: failures.length > 0
+        ? `${failures.length} failure line(s), exit ${input.exitCode}`
+        : `package lines=${installs.length} exit=${input.exitCode}`,
+      important: failures.length > 0 ? failures : installs.slice(-20).map((message) => ({ message: message.trim() })),
+      confidence: parserConfidence(
+        installs.length > 0 || failures.length > 0 ? 0.76 : 0.54,
+        "pip package/install markers summarized",
+      ),
+      omitted: { totalLines: lines.length },
+    };
+  },
+};
+
+function countObjectKeys(value: unknown): number {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? Object.keys(value as Record<string, unknown>).length
+    : 0;
+}
+
+const packageJsonParser: OutputParser = {
+  name: "package-json",
+  aliases: ["package"],
+  parse(input) {
+    const payload = parseJsonPayload(input);
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      return {
+        parser: "package-json",
+        status: statusFromExit(input.exitCode),
+        summary: `package.json not parsed, exit ${input.exitCode}`,
+        important: failureLines(input),
+        confidence: parserConfidence(0.3, "package.json JSON payload not found"),
+      };
+    }
+    const object = payload as Record<string, unknown>;
+    const name = typeof object.name === "string" ? object.name : undefined;
+    const version = typeof object.version === "string" ? object.version : undefined;
+    const scripts = countObjectKeys(object.scripts);
+    const deps = countObjectKeys(object.dependencies);
+    const devDeps = countObjectKeys(object.devDependencies);
+    const important: ParsedImportantItem[] = [];
+    if (name) important.push({ message: `"name": ${JSON.stringify(name)}` });
+    if (version) important.push({ message: `"version": ${JSON.stringify(version)}` });
+    if (scripts > 0) important.push({ message: `scripts=${scripts}` });
+    if (deps > 0 || devDeps > 0) important.push({ message: `dependencies=${deps} devDependencies=${devDeps}` });
+    return {
+      parser: "package-json",
+      status: statusFromExit(input.exitCode),
+      summary: `name=${name ?? "unknown"} version=${version ?? "unknown"} scripts=${scripts} deps=${deps} devDeps=${devDeps}`,
+      important,
+      confidence: parserConfidence(name || scripts > 0 ? 0.9 : 0.6, "package.json metadata summarized"),
+      omitted: { totalLines: linesOf(input).length },
+    };
+  },
+};
+
+const ciLogParser: OutputParser = {
+  name: "ci-log",
+  aliases: ["gha", "github-actions", "webpack", "vite", "build-log"],
+  parse(input) {
+    const lines = linesOf(input);
+    const errors = lines.filter((line) => /\b(error|failed|failure|fatal|exception|panic)\b/i.test(line));
+    const warnings = lines.filter((line) => /\bwarn(?:ing)?\b/i.test(line));
+    const sections = lines.filter((line) => /^##\[[a-z]+\]/i.test(line) || /^(Run|Error:|FAIL|FAILED|x)\b/i.test(line.trim()));
+    const important = (errors.length > 0 ? errors : sections.length > 0 ? sections : warnings)
+      .slice(0, 25)
+      .map((message) => itemFromLocation(message.trim()));
+    return {
+      parser: "ci-log",
+      status: statusFromExit(input.exitCode),
+      summary: `lines=${lines.length} errors=${errors.length} warnings=${warnings.length} sections=${sections.length} exit=${input.exitCode}`,
+      important,
+      confidence: parserConfidence(
+        errors.length > 0 || warnings.length > 0 || sections.length > 0 ? 0.8 : 0.55,
+        "CI/build log severity and section markers summarized",
+      ),
+      omitted: { totalLines: lines.length },
+    };
+  },
+};
+
 export const OUTPUT_PARSERS: readonly OutputParser[] = [
   vitestJsonParser,
   vitestParser,
   playwrightJsonParser,
   playwrightParser,
+  pytestParser,
+  tscParser,
+  eslintParser,
+  npmParser,
+  dockerLogsParser,
+  ghParser,
   genericFailureParser,
   gitStatusParser,
   gitDiffParser,
+  gitLogParser,
   rgParser,
+  fileListParser,
+  cargoParser,
+  pipParser,
+  packageJsonParser,
+  ciLogParser,
 ];
 
 export function getOutputParser(name: string): OutputParser | undefined {

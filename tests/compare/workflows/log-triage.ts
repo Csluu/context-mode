@@ -31,16 +31,19 @@ const wf: Workflow = {
       label: "generate-logs",
       tool: "ctx_execute",
       args: { language: "javascript", code: generateLogs, intent: "ERROR lines" },
+      assert: (t) => /ERROR|INFO|indexed|line/i.test(t),
     },
     {
       label: "count-by-level",
       tool: "ctx_execute",
       args: { language: "javascript", code: countErrors },
+      assert: (t) => /INFO|WARN|ERROR|DEBUG|\d+/.test(t),
     },
     {
       label: "search-errors",
       tool: "ctx_search",
       args: { queries: ["ERROR line"] },
+      assert: (t) => /ERROR/i.test(t),
     },
   ],
 };

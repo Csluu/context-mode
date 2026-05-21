@@ -33,4 +33,6 @@ context-mode-guidance-*/
 !/docs/AGENT_PROJECT_OVERVIEW.md
 !/docs/FORK_HANDOFF.md
 !/docs/fork-vs-upstream-test-plan.md
+!/docs/serena-replacement-review-and-comparison.md
+!/docs/serena-replacement-static-code-intelligence-spec.md
 .compare/

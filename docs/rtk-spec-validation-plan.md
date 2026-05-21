@@ -73,7 +73,7 @@ New `package.json` scripts: `eval:fast`, `eval:full`, `guard:fixtures`, `skip:au
 | `ctx_read` | — | new | auto/map/outline/slice/symbols/full file reads |
 | `ctx_gain` | partial | rewritten | savings + per-tool latency, session/historical |
 | `ctx_discover` | — | new | bypass taxonomy + missed-savings |
-| `ctx_diff` | — | experimental-gated | git-text inventory, optional Difftastic fallback, risk |
+| `ctx_diff` | — | stable default | git-text inventory, optional Difftastic fallback, risk |
 | `ctx_guard` | — | experimental-gated/internal pipeline | secret/redaction scanner |
 | `ctx_eval` | — | experimental-gated/CLI gate | fixture-driven correctness harness |
 | `ctx_trace` | — | experimental-gated/local only | local span observability |

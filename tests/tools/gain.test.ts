@@ -47,12 +47,18 @@ describe("ctx_gain tool", () => {
 
       const text = await tool.handler({}, testContext());
       expect(text.content[0].text).toContain("ctx_gain current session");
+      expect(text.content[0].text).toContain(`project: ${projectDir}`);
+      expect(text.content[0].text).toContain("sidecar filter:");
       expect(text.content[0].text).toContain("sidecars: 1");
       expect(text.content[0].text).toContain("ctx_execute");
       expect(text.content[0].text).toContain("avg=40ms max=60ms");
 
       const json = await tool.handler({ json: true }, testContext());
       const payload = JSON.parse(json.content[0].text);
+      expect(payload.scope).toMatchObject({
+        label: "current runtime session",
+        projectDir,
+      });
       expect(payload.returnedBytes).toBe(1500);
       expect(payload.keptOutBytes).toBeGreaterThan(9000);
       expect(payload.sidecarCount).toBe(1);
@@ -100,6 +106,7 @@ describe("ctx_gain tool", () => {
 
       expect(payload.sidecarCount).toBe(1);
       expect(payload.sidecarBytes).toBe(Buffer.byteLength("new output"));
+      expect(payload.scope.sidecarFilter).toBe("sessionStart");
     } finally {
       rmSync(projectDir, { recursive: true, force: true });
     }
@@ -143,6 +150,7 @@ describe("ctx_gain tool", () => {
 
       expect(payload.sidecarCount).toBe(1);
       expect(payload.sidecarBytes).toBe(Buffer.byteLength("mine"));
+      expect(payload.scope.sidecarFilter).toBe("sessionId");
     } finally {
       rmSync(projectDir, { recursive: true, force: true });
     }

@@ -17,8 +17,9 @@ Analyze/count/filter/compare/search/parse/transform data: **write code** via `ct
 1. **GATHER**: `ctx_batch_execute(commands, queries)` — runs all commands, auto-indexes, searches. ONE call replaces many steps.
 2. **FOLLOW-UP**: `ctx_search(queries: ["q1", "q2", ...])` — all follow-up questions, ONE call (default relevance mode).
 3. **PROCESSING**: `ctx_execute(language, code)` | `ctx_execute_file(path, language, code)` — sandbox, only stdout enters context.
-4. **WEB**: `ctx_fetch_and_index(url)` then `ctx_search(queries)` — never dump raw HTML.
-5. **INDEX**: `ctx_index(content, source)` — store in FTS5 for later search.
+4. **DIFF**: `ctx_diff` — summarize Git changes with inventory, semantic groups, and risk reason codes.
+5. **WEB**: `ctx_fetch_and_index(url)` then `ctx_search(queries)` — never dump raw HTML.
+6. **INDEX**: `ctx_index(content, source)` — store in FTS5 for later search.
 
 ## Parallel I/O batches
 

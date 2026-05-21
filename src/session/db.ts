@@ -271,6 +271,14 @@ export function resolveSessionDbPath(opts: {
   return resolveSessionPath({ ...opts, ext: ".db" });
 }
 
+/** Resolve the per-worktree static code-index DB path. */
+export function resolveCodeIndexPath(opts: {
+  projectDir: string;
+  sessionsDir: string;
+}): string {
+  return resolveSessionPath({ ...opts, ext: ".code-index.db" });
+}
+
 /**
  * Generalized resolver: same case-fold + one-shot legacy-rename semantics
  * as {@link resolveSessionDbPath}, parameterised on the file extension so

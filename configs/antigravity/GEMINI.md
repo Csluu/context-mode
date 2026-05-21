@@ -54,12 +54,13 @@ Use `mcp__context-mode__ctx_execute(language: "shell", code: "grep ...")` in san
 | `mcp__context-mode__ctx_fetch_run` | List/fetch redacted sidecar output created by previous runs. |
 | `mcp__context-mode__ctx_gain` | Show current-session context savings from sandbox/index/cache/sidecars. |
 | `mcp__context-mode__ctx_discover` | Show missed savings, bypass categories, and noisy tool patterns. |
+| `mcp__context-mode__ctx_diff` | Summarize Git changes with inventory, semantic groups, and risk reason codes. |
 | `mcp__context-mode__ctx_execute` / `mcp__context-mode__ctx_batch_execute` | Sandbox command/data processing; only selected stdout enters context. |
 | `mcp__context-mode__ctx_search` / `mcp__context-mode__ctx_index` / `mcp__context-mode__ctx_fetch_and_index` | Knowledge-base search/index/web ingestion. |
 
 ## Experimental tools
 
-`mcp__context-mode__ctx_guard`, `mcp__context-mode__ctx_eval`, `mcp__context-mode__ctx_trace`, `mcp__context-mode__ctx_diff`, and `mcp__context-mode__ctx_cache` are hidden unless `CTX_MODE_EXPERIMENTAL=1` or `CONTEXT_MODE_EXPERIMENTAL=1`. Do not assume they exist during normal agent work. Prefer stable tools above.
+`mcp__context-mode__ctx_guard`, `mcp__context-mode__ctx_eval`, `mcp__context-mode__ctx_trace`, and `mcp__context-mode__ctx_cache` are hidden unless `CTX_MODE_EXPERIMENTAL=1` or `CONTEXT_MODE_EXPERIMENTAL=1`. Do not assume they exist during normal agent work. Prefer stable tools above.
 
 ## Parallel I/O batches
 

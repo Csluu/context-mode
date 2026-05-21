@@ -43,6 +43,60 @@ describe("ctx_route tool", () => {
     await emittingTool.handler({ command: "git status", explain: false }, testContext());
     expect(decisions).toEqual(["recommend"]);
   });
+
+  it("keeps pass-through tiny commands to a one-line native hint", async () => {
+    const tool = makeCtxRoute();
+
+    const result = await tool.handler({ command: "echo hi", explain: true }, testContext());
+    const text = result.content[0].text;
+
+    expect(text).toBe("native-ok: tiny output; use native directly");
+    expect(text.length).toBeLessThan(60);
+  });
+
+  it("keeps full diagnostics for non-trivial pass-through commands", async () => {
+    const tool = makeCtxRoute();
+
+    const result = await tool.handler({ command: "npm.cmd run compare:tokens", explain: true }, testContext());
+    const payload = JSON.parse(result.content[0].text);
+
+    expect(payload).toMatchObject({
+      decision: "pass-through",
+      safety: { reason: "no matching route rule" },
+    });
+    expect(payload.direct).toBeUndefined();
+  });
+
+  it("does not compact package-manager version objects or verbose interpreter flags", async () => {
+    const tool = makeCtxRoute();
+
+    for (const command of ["npm.cmd version", "npm version", "python -v"]) {
+      const result = await tool.handler({ command, explain: true }, testContext());
+      const payload = JSON.parse(result.content[0].text);
+
+      expect(payload).toMatchObject({
+        decision: "pass-through",
+        safety: { reason: "no matching route rule" },
+      });
+      expect(payload.direct).toBeUndefined();
+    }
+  });
+
+  it("routes common read-only shell commands to compact parsers", async () => {
+    const tool = makeCtxRoute();
+
+    const gitLog = JSON.parse((await tool.handler({ command: "git log --oneline -20", explain: true }, testContext())).content[0].text);
+    expect(gitLog.selectedRule).toBe("git-log");
+    expect(gitLog.route.parser).toBe("git-log");
+
+    const listing = JSON.parse((await tool.handler({ command: "find src -type f", explain: true }, testContext())).content[0].text);
+    expect(listing.selectedRule).toBe("file-list");
+    expect(listing.route.parser).toBe("file-list");
+
+    const cargo = JSON.parse((await tool.handler({ command: "cargo check", explain: true }, testContext())).content[0].text);
+    expect(cargo.selectedRule).toBe("cargo-build-check");
+    expect(cargo.route.parser).toBe("cargo");
+  });
 });
 
 describe("ctx_fetch_run tool", () => {
@@ -62,6 +116,7 @@ describe("ctx_fetch_run tool", () => {
       const overrideTool = makeCtxFetchRun({ getProjectDir: () => defaultProjectDir });
 
       const list = await tool.handler({ list: true }, testContext());
+      expect(list.content[0].text).toContain(`project: ${projectDir}`);
       expect(list.content[0].text).toContain(artifact.metadata.runId);
       expect(list.content[0].text).toContain("npm test");
 
@@ -70,12 +125,15 @@ describe("ctx_fetch_run tool", () => {
 
       const raw = await tool.handler({ runId: "44444444", raw: true }, testContext());
       expect(raw.content[0].text).toContain("Run artifact 44444444-4444-4444-8444-444444444444");
+      expect(raw.content[0].text).toContain(`project: ${projectDir}`);
       expect(raw.content[0].text).toContain("--- redacted raw ---");
       expect(raw.content[0].text).not.toContain("--- redacted raw preview");
       expect(raw.content[0].text).toContain("TOKEN=<redacted>");
       expect(raw.content[0].text).not.toContain("abc123");
       expect(raw.content[0].text).toContain("path: .context-mode/runs/");
-      expect(raw.content[0].text).not.toContain(projectDir);
+
+      const emptyDefaultList = await overrideTool.handler({ list: true }, testContext());
+      expect(emptyDefaultList.content[0].text).toContain(`No run artifacts found for project: ${defaultProjectDir}`);
 
       const largeArtifact = writeRunArtifact({
         projectDir,
@@ -113,6 +171,36 @@ describe("ctx_fetch_run tool", () => {
       expect(tail.content[0].text).toContain("FINAL_SUMMARY_OK");
       expect(tail.content[0].text).not.toContain("START_OF_LOG");
       expect(tail.content[0].text).toContain("...[tail preview truncated at 200 bytes]");
+
+      const queryArtifact = writeRunArtifact({
+        projectDir,
+        command: "node noisy.js",
+        stdout: [
+          "INFO boot",
+          "WARN slow path",
+          "ERROR target failure",
+          "INFO after failure",
+          "ERROR second failure",
+        ].join("\n"),
+        status: "failed",
+        runId: "99999999-9999-4999-8999-999999999999",
+        now: new Date("2026-05-17T12:03:00.000Z"),
+      });
+      const matches = await tool.handler(
+        { runId: queryArtifact.metadata.runId, query: "ERROR", contextLines: 1, maxBytes: 500 },
+        testContext(),
+      );
+      expect(matches.content[0].text).toContain("--- redacted raw matches: \"ERROR\" (2/2) ---");
+      expect(matches.content[0].text).toContain("2: WARN slow path");
+      expect(matches.content[0].text).toContain("3: ERROR target failure");
+      expect(matches.content[0].text).toContain("5: ERROR second failure");
+      expect(matches.content[0].text).not.toContain("--- redacted raw ---");
+
+      const noMatches = await tool.handler(
+        { runId: queryArtifact.metadata.runId, query: "missing" },
+        testContext(),
+      );
+      expect(noMatches.content[0].text).toContain("No matches found.");
 
       const pinned = await tool.handler({ latest: true, pin: true }, testContext());
       expect(pinned.content[0].text).toContain("pinned: true");

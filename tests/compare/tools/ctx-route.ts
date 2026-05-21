@@ -7,6 +7,7 @@ const nonEmpty = (t: string) => t.trim().length > 0 ? [] : [`empty route respons
 
 const suite: Suite = {
   name: "ctx-route",
+  forkOnly: true,
   scenarios: [
     { tool: "ctx_route", name: "git-diff",       args: { command: "git diff main", explain: true }, assert: nonEmpty },
     { tool: "ctx_route", name: "npm-test",       args: { command: "npm test", explain: true }, assert: nonEmpty },

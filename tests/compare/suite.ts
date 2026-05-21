@@ -17,4 +17,11 @@ export interface Suite {
   /** If true, only the fork client runs. Use for Dim 4 fork-only features.
    *  upstream column in the report is marked `n/a`. */
   forkOnly?: boolean;
+  /** If true, spawn fresh client(s) per scenario. Required when the tool
+   *  has cross-call state that would skew multi-iteration measurements:
+   *   - ctx_read deduplicates repeated reads within a session (iter 2+
+   *     returns a shortened "already shown" notice).
+   *   - ctx_search rate-limits to 8 calls / 60s window per session.
+   *  Cost: extra spawn/initialize per scenario (~100-300ms each). */
+  freshClientPerScenario?: boolean;
 }

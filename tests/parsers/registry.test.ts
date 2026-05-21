@@ -181,6 +181,75 @@ describe("output parser registry", () => {
     expect(parsed.important.map((item) => item.message)).toContain("!! ignored.log");
   });
 
+  it("summarizes git log output without returning the full history", () => {
+    const parsed = parseCommandOutput("git-log", {
+      command: "git log --oneline -10",
+      stdout: [
+        "a1b2c3d add parser coverage",
+        "d4e5f6a fix binary output",
+        "f7a8b9c update docs",
+      ].join("\n"),
+      stderr: "",
+      exitCode: 0,
+    });
+
+    expect(parsed.parser).toBe("git-log");
+    expect(parsed.summary).toContain("commits=3");
+    expect(parsed.important[0]?.message).toContain("add parser coverage");
+  });
+
+  it("summarizes file listings by entry and extension counts", () => {
+    const parsed = parseCommandOutput("file-list", {
+      command: "find src -type f",
+      stdout: [
+        "src/server.ts",
+        "src/read/ctx-read.ts",
+        "src/parsers/registry.ts",
+        "docs/report.md",
+      ].join("\n"),
+      stderr: "",
+      exitCode: 0,
+    });
+
+    expect(parsed.parser).toBe("file-list");
+    expect(parsed.summary).toContain("entries=4");
+    expect(parsed.summary).toContain("ts=3");
+    expect(parsed.important[0]?.message).toBe("src/server.ts");
+  });
+
+  it("summarizes package.json without treating script names as build errors", () => {
+    const parsed = parseCommandOutput("package-json", {
+      command: "cat package.json",
+      stdout: JSON.stringify({
+        name: "context-mode",
+        version: "1.0.135",
+        scripts: { build: "tsc", test: "vitest run" },
+        dependencies: { zod: "^3.25.0" },
+        devDependencies: { vitest: "^3.0.0" },
+      }, null, 2),
+      stderr: "",
+      exitCode: 0,
+    });
+
+    expect(parsed.parser).toBe("package-json");
+    expect(parsed.summary).toContain("name=context-mode");
+    expect(parsed.important.map((item) => item.message)).toContain("\"name\": \"context-mode\"");
+  });
+
+  it("strips ANSI controls before parsing log output", () => {
+    const parsed = parseCommandOutput("ci-log", {
+      command: "npm run build",
+      stdout: "\u001b[31mERROR\u001b[0m failed to compile\n\u001b[33mWARNING\u001b[0m deprecated option",
+      stderr: "",
+      exitCode: 1,
+    });
+
+    expect(parsed.parser).toBe("ci-log");
+    expect(parsed.summary).toContain("errors=1");
+    expect(parsed.summary).toContain("warnings=1");
+    expect(parsed.important[0]?.message).not.toContain("\u001b[");
+  });
+
   it("caps rendered important items and reports omitted item count", () => {
     const parsed = parseCommandOutput("rg", {
       command: "rg auth src",
@@ -224,6 +293,123 @@ describe("output parser registry", () => {
     expect(parsed.important.map((item) => item.message)).toContain(
       "src/parser.test.ts:42 Error: expected active received pending",
     );
+  });
+
+  it("summarizes pytest terminal output", () => {
+    const parsed = parseCommandOutput("pytest", {
+      command: "pytest",
+      stdout: [
+        "FAILED tests/test_auth.py::test_login - AssertionError: expected 200",
+        "================ 1 failed, 3 passed, 1 skipped in 2.31s ================",
+      ].join("\n"),
+      stderr: "",
+      exitCode: 1,
+    });
+
+    expect(parsed.parser).toBe("pytest");
+    expect(parsed.summary).toContain("1 failed");
+    expect(parsed.summary).toContain("3 passed");
+    expect(parsed.important[0]?.message).toContain("test_login");
+  });
+
+  it("summarizes TypeScript diagnostics by count and code", () => {
+    const parsed = parseCommandOutput("tsc", {
+      command: "npx tsc --noEmit",
+      stdout: [
+        "src/app.ts(12,7): error TS2322: Type 'string' is not assignable to type 'number'.",
+        "src/app.ts(20,3): error TS2304: Cannot find name 'missing'.",
+        "Found 2 errors in the same file, starting at: src/app.ts:12",
+      ].join("\n"),
+      stderr: "",
+      exitCode: 2,
+    });
+
+    expect(parsed.parser).toBe("tsc");
+    expect(parsed.summary).toContain("errors=2");
+    expect(parsed.summary).toContain("TS2322=1");
+    expect(parsed.important[0]).toMatchObject({ file: "src/app.ts", line: 12 });
+  });
+
+  it("summarizes ESLint JSON output", () => {
+    const parsed = parseCommandOutput("eslint", {
+      command: "eslint -f json src",
+      stdout: JSON.stringify([
+        {
+          filePath: "src/app.ts",
+          errorCount: 1,
+          warningCount: 1,
+          messages: [
+            { severity: 2, message: "Unexpected any", ruleId: "@typescript-eslint/no-explicit-any", line: 8 },
+            { severity: 1, message: "Missing return type", ruleId: "@typescript-eslint/explicit-function-return-type", line: 10 },
+          ],
+        },
+      ]),
+      stderr: "",
+      exitCode: 1,
+    });
+
+    expect(parsed.summary).toBe("problems: 1 error, 1 warning (2)");
+    expect(parsed.important[0]).toMatchObject({ file: "src/app.ts", line: 8 });
+    expect(parsed.important[0]?.message).toContain("Unexpected any");
+  });
+
+  it("summarizes npm lifecycle failures without dumping the full script output", () => {
+    const parsed = parseCommandOutput("npm", {
+      command: "npm run build",
+      stdout: "vite building...\n",
+      stderr: "npm ERR! code ELIFECYCLE\nnpm ERR! Command failed with exit code 1\nsrc/app.ts:5 Error: build failed",
+      exitCode: 1,
+    });
+
+    expect(parsed.parser).toBe("npm");
+    expect(parsed.summary).toContain("npm ERR! code ELIFECYCLE");
+    expect(parsed.important.map((item) => item.message).join("\n")).toContain("Command failed");
+  });
+
+  it("summarizes Docker logs by severity", () => {
+    const parsed = parseCommandOutput("docker-logs", {
+      command: "docker logs api",
+      stdout: [
+        "INFO server started",
+        "WARN retrying database connection",
+        "ERROR failed to connect to database",
+      ].join("\n"),
+      stderr: "",
+      exitCode: 0,
+    });
+
+    expect(parsed.summary).toBe("lines=3 errors=1 warnings=1");
+    expect(parsed.important[0]?.message).toContain("failed to connect");
+  });
+
+  it("summarizes Cargo diagnostics", () => {
+    const parsed = parseCommandOutput("cargo", {
+      command: "cargo test",
+      stdout: "test result: FAILED. 1 passed; 1 failed; 0 ignored",
+      stderr: "error[E0308]: mismatched types\n --> src/lib.rs:7:5",
+      exitCode: 101,
+    });
+
+    expect(parsed.parser).toBe("cargo");
+    expect(parsed.summary).toContain("test result: FAILED");
+    expect(parsed.important[0]?.message).toContain("error[E0308]");
+  });
+
+  it("summarizes GitHub CLI JSON output", () => {
+    const parsed = parseCommandOutput("gh", {
+      command: "gh pr checks --json name,conclusion",
+      stdout: JSON.stringify([
+        { name: "test", conclusion: "SUCCESS" },
+        { name: "lint", conclusion: "FAILURE" },
+      ]),
+      stderr: "",
+      exitCode: 1,
+    });
+
+    expect(parsed.summary).toContain("2 item(s)");
+    expect(parsed.summary).toContain("1 success");
+    expect(parsed.summary).toContain("1 failure");
+    expect(parsed.important.map((item) => item.message)).toContain("lint");
   });
 
   it("returns diagnostics for unknown parsers", () => {

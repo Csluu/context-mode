@@ -77,4 +77,51 @@ describe("compare workflow gating", () => {
     expect(row.upstream.ok).toBe(true);
     expect(workflowRowOk(row)).toBe(false);
   });
+
+  it("allows expected MCP isError results when the oracle accepts the error payload", async () => {
+    const workflow: Workflow = {
+      name: "expected-error-workflow",
+      description: "workflow with an expected refusal",
+      steps: [
+        { label: "binary", tool: "ctx_read", args: {}, allowError: true, assert: (text) => /binary/.test(text) },
+      ],
+    };
+    const fork = {
+      call: vi.fn().mockResolvedValueOnce(errorCall("binary file blocked")),
+    };
+    const upstream = {
+      call: vi.fn().mockResolvedValueOnce(errorCall("binary file blocked")),
+    };
+
+    const row = await runWorkflowWithClients(workflow, fork as any, upstream as any);
+
+    expect(row.fork.steps[0].ok).toBe(true);
+    expect(row.fork.steps[0].oracleOk).toBe(true);
+    expect(row.fork.ok).toBe(true);
+    expect(workflowRowOk(row)).toBe(true);
+  });
+
+  it("marks workflow rows failed when a step oracle fails", async () => {
+    const workflow: Workflow = {
+      name: "oracle-failing-workflow",
+      description: "workflow with a semantic oracle failure",
+      steps: [
+        { label: "first", tool: "ctx_first", args: {}, assert: (text) => /expected/.test(text) },
+      ],
+    };
+    const fork = {
+      call: vi.fn().mockResolvedValueOnce(okCall("wrong payload")),
+    };
+    const upstream = {
+      call: vi.fn().mockResolvedValueOnce(okCall("expected payload")),
+    };
+
+    const row = await runWorkflowWithClients(workflow, fork as any, upstream as any);
+
+    expect(row.fork.steps[0].ok).toBe(true);
+    expect(row.fork.steps[0].oracleOk).toBe(false);
+    expect(row.fork.ok).toBe(false);
+    expect(row.upstream.ok).toBe(true);
+    expect(workflowRowOk(row)).toBe(false);
+  });
 });

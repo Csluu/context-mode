@@ -16,7 +16,11 @@ const suite: Suite = {
   name: "ctx-purge",
   scenarios: [
     {
-      tool: "ctx_purge", name: "dry-run-session", args: { dryRun: true, scope: "session" }, setup: seed,
+      tool: "ctx_purge", name: "dry-run-project", args: { dryRun: true, confirm: true, scope: "project" }, setup: seed,
+      // Real behavioral divergence: fork respects dryRun (reports "would purge");
+      // upstream (v1.0.143 pin) ignores dryRun and actually purges. Document
+      // and accept — exit code does not fail on this row.
+      expectDivergence: true,
       assert: (t) => t.length > 10 ? [] : [`purge dry-run output too short`],
     },
   ],

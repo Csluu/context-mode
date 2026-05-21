@@ -93,7 +93,7 @@ Explicitly future-scoped, not required for the first implementation slice:
 - Broad semantic-diff provider coverage beyond optional Difftastic capability detection and git-text fallback.
 - OpenTelemetry export. Local trace-style observability exists, but external telemetry remains off unless separately enabled and reviewed.
 - Broad deterministic task-result caching. Only the explicit `tsc --noEmit` canary may serve cache hits; all other families remain explain/bypass until proven.
-- Public default MCP exposure for `ctx_guard`, `ctx_eval`, `ctx_trace`, `ctx_diff`, and `ctx_cache`. These exist as CLI/internal/experimental surfaces and are hidden unless `CTX_MODE_EXPERIMENTAL=1` or `CONTEXT_MODE_EXPERIMENTAL=1`.
+- Public default MCP exposure for `ctx_guard`, `ctx_eval`, `ctx_trace`, and `ctx_cache`. These exist as CLI/internal/experimental surfaces and are hidden unless `CTX_MODE_EXPERIMENTAL=1` or `CONTEXT_MODE_EXPERIMENTAL=1`.
 
 ## Current Context-Mode Fit
 
@@ -117,7 +117,7 @@ Architecture constraints:
 - Shared routing logic must be extracted from existing hook routing and policy code, then reused by hooks, MCP server handlers, tests, docs, and future CLI commands.
 - Do not create a second independent router that can drift from `hooks/core/routing.mjs` or command deny policy in `src/security.ts`.
 - New MCP tools should follow the `src/tools/*` extraction pattern and `ToolContext` registration path instead of adding more large inline handlers to `src/server.ts`.
-- Public MCP surface must stay small. Stable default tools are `ctx_read`, `ctx_fetch_run`, `ctx_gain`, `ctx_discover`, `ctx_route`, and pre-existing execution/search/fetch/stats/admin tools. `ctx_guard`, `ctx_eval`, `ctx_trace`, `ctx_diff`, and `ctx_cache` are experimental-gated until contracts and UX stabilize.
+- Public MCP surface must stay small. Stable default tools are `ctx_read`, `ctx_fetch_run`, `ctx_gain`, `ctx_discover`, `ctx_route`, `ctx_diff`, and pre-existing execution/search/fetch/stats/admin tools. `ctx_guard`, `ctx_eval`, `ctx_trace`, and `ctx_cache` are experimental-gated until contracts and UX stabilize.
 - Parser/filter integration should happen through a `FilterPipeline` seam called by `ctx_execute`, `ctx_execute_file`, and `ctx_batch_execute` after capture/redaction and before response formatting.
 - Sidecar capture must start in or immediately around `PolyglotExecutor` streaming output, not after the server has buffered all stdout/stderr.
 - Analytics must extend existing session DB and `AnalyticsEngine` event flows before adding any separate analytics store.
@@ -165,7 +165,7 @@ Existing context-mode tools must remain stable while new routing features are ad
 Rules:
 
 - `ctx_execute`, `ctx_execute_file`, `ctx_batch_execute`, `ctx_search`, `ctx_fetch_and_index`, `ctx_index`, `ctx_stats`, `ctx_doctor`, `ctx_upgrade`, and `ctx_purge` keep backward-compatible schemas.
-- New stable tools are additive: `ctx_read`, `ctx_route`, `ctx_fetch_run`, `ctx_gain`, and `ctx_discover`.
+- New stable tools are additive: `ctx_read`, `ctx_route`, `ctx_fetch_run`, `ctx_gain`, `ctx_discover`, and `ctx_diff`.
 - New response shapes must include a human-readable summary first and optional structured metadata second.
 - Tool output must remain useful in clients that ignore structured content.
 - Text output must have golden fixtures for clients that ignore structured metadata.
@@ -1942,7 +1942,7 @@ Readiness verdict:
 | `ctx_guard` | Implemented core | Highest | CLI/internal/experimental MCP only; scanner is a pipeline stage before persistence |
 | `ctx_eval` | Implemented core | Highest | CLI/internal/experimental MCP only; release gate uses CLI scripts |
 | `ctx_trace` | Implemented local views | High | CLI/internal/experimental MCP only; no external telemetry export |
-| `ctx_diff` | Implemented git-text + optional Difftastic fallback | Medium-high | CLI/internal/experimental MCP only; semantic provider failure falls open |
+| `ctx_diff` | Implemented git-text + optional Difftastic fallback | Medium-high | Public MCP/CLI; semantic provider failure falls open |
 | `ctx_run_cached` | Implemented explicit canary | Last | CLI/internal/experimental MCP only; cache serving limited to `tsc --noEmit` |
 
 Shared implementation contracts:
@@ -2604,7 +2604,7 @@ Release candidates must produce and retain these CI artifacts:
 - `guard-scan-report.json`
 - `skip-audit-report.json`
 - `trace-privacy-report.json` once `ctx_trace` ships.
-- `semantic-diff-fixture-report.json` once `ctx_diff` ships.
+- `semantic-diff-fixture-report.json` once broader semantic diff fixture reporting ships.
 - `task-cache-readiness-report.json` once `ctx_run_cached` ships.
 - `release-checklist.md`
 
@@ -2631,7 +2631,7 @@ Release checklist:
 - `ctx_eval all --json` fast pack passes before release.
 - Guard scan over sidecars, index fixtures, cache fixtures, trace fixtures, and release artifacts passes.
 - Trace schema/privacy report passes before `ctx_trace` is advertised.
-- Semantic diff fixtures prove raw Git file inventory preservation before `ctx_diff --semantic` is advertised.
+- Semantic diff fixtures prove raw Git file inventory preservation before new `ctx_diff --semantic` providers are advertised.
 - Task cache fixtures prove invalidation for every approved command family before cache serving is advertised beyond the explicit canary.
 
 ## Acceptance Metrics

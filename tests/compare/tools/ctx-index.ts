@@ -14,7 +14,7 @@ const suite: Suite = {
   scenarios: [
     {
       tool: "ctx_index", name: "index-string",
-      args: { text: corpus, source: "compare-ctx-index-corpus" },
+      args: { content: corpus, source: "compare-ctx-index-corpus" },
       assert: (t) => t.length > 0 ? [] : [`index ack empty`],
     },
   ],

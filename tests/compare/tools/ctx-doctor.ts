@@ -8,8 +8,11 @@ const suite: Suite = {
   scenarios: [
     {
       tool: "ctx_doctor", name: "default", args: {},
+      // Fork's ctx_doctor is a superset (adds hook + integration tier checks).
+      // Divergence is the expected outcome — gracefully report jaccard but
+      // don't fail.
+      expectDivergence: true,
       canonicalize: (t) =>
-        // Strip per-machine paths and version strings that legitimately differ.
         t.replace(/\bv\d+\.\d+\.\d+(?:-[a-z0-9.-]+)?\b/g, "<VER>")
          .replace(/[A-Z]:\\[^\s"']+/g, "<WINPATH>"),
       assert: (t) => t.length > 50 ? [] : [`doctor output too short (${t.length}B)`],

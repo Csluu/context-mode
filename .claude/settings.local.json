@@ -16,7 +16,31 @@
       "Bash(mv batch.ts ctx-batch.ts)",
       "Bash(mkdir -p tests/compare/fixtures)",
       "Bash(cp src/executor.ts tests/compare/fixtures/pinned-executor.ts)",
-      "Read(//c/c/Users/chris/Documents/GitHub/context-mode/tests/compare/fixtures/**)"
+      "Read(//c/c/Users/chris/Documents/GitHub/context-mode/tests/compare/fixtures/**)",
+      "Bash(where bash *)",
+      "Bash(bash --version)",
+      "Bash(node *)",
+      "Bash(claude mcp *)",
+      "Bash(cargo --version)",
+      "Bash(cargo install *)",
+      "Bash(where chop *)",
+      "Bash(chop --version)",
+      "Bash(where squeez *)",
+      "Bash(squeez --version)",
+      "Bash(where context-compress *)",
+      "Bash(where sqz *)",
+      "Bash(sqz --version)",
+      "Bash(where lean-ctx *)",
+      "Bash(lean-ctx --version)",
+      "Read(//c/Users/chris/bin/lean-ctx/**)",
+      "Bash(powershell -NoProfile -Command \"Expand-Archive -Path lean-ctx.zip -DestinationPath . -Force\")",
+      "Bash(~/.cargo/bin/lean-ctx.exe --version)",
+      "Bash(/c/Users/chris/AppData/Local/Programs/chop/chop.exe --help)",
+      "Bash(/c/Users/chris/.cargo/bin/lean-ctx.exe --help)",
+      "Bash(squeez --help)",
+      "Bash(wsl --status)",
+      "Bash(wsl --list --verbose)",
+      "Bash(wsl -d Ubuntu -- bash -c \"command -v sqz; sqz --version 2>&1 || echo NOT_INSTALLED\")"
     ]
   }
 }

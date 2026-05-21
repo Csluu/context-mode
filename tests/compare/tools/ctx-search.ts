@@ -20,6 +20,10 @@ async function seed(client: McpStdioClient): Promise<void> {
 
 const suite: Suite = {
   name: "ctx-search",
+  // Both fork and upstream rate-limit ctx_search to 8 calls / 60s window.
+  // 4 scenarios × (1 warmup + 5 iter) = 24 calls exceeds the cap. Fresh
+  // client per scenario resets the counter.
+  freshClientPerScenario: true,
   scenarios: [
     {
       tool: "ctx_search", name: "single-q-alpha", args: { queries: ["alpha"] }, setup: seed,
